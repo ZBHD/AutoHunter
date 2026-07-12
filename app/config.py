@@ -35,6 +35,18 @@ class LLMProviderConfig(BaseModel):
     enabled: bool = True
 
 
+# Backward-compat aliases (removed in Task 1, preserved for Task 3/4 transition)
+class LLMConfig(BaseModel):
+    """Legacy single-LLM config — replaced by LLMProviderConfig. Kept for transition."""
+    base_url: str = "https://api.deepseek.com/v1"
+    api_key: str = ""
+    model: str = "deepseek-chat"
+    temperature: float = 0.3
+
+
+llm_config = LLMConfig()
+
+
 class WorkerConfig(BaseModel):
     shell_timeout: int = int(os.environ.get("WORKER_SHELL_TIMEOUT", "120"))
     shell_timeout_max: int = int(os.environ.get("WORKER_SHELL_TIMEOUT_MAX", "600"))
