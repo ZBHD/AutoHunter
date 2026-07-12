@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.log
+findings/
+work/
+*.sqlite
+*.db
+!app/data_static/edu_ip.db
+.DS_Store
+web/dist/
+frontend/node_modules/
+node_modules/
