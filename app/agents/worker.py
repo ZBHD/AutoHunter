@@ -18,7 +18,7 @@ from app.agents.history import compact_messages
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
 from app.config import worker_config
 from app import dedup
-from app.llm.client import LLMClient
+from app.llm.router import LLMRouter
 from app.schemas import Finding, Verdict, WorkerResult
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import (
@@ -44,7 +44,7 @@ class Worker:
     def __init__(
         self,
         target: str,
-        llm: Optional[LLMClient] = None,
+        llm: LLMRouter,
         on_event: Optional[Callable[[str, dict], None]] = None,
         deepen_context: Optional[dict] = None,
         target_meta: Optional[dict] = None,
@@ -56,7 +56,7 @@ class Worker:
         prompt_version: str | None = None,
     ):
         self.target = target
-        self.llm = llm or LLMClient()
+        self.llm = llm
         self.cancel_event = cancel_event or threading.Event()
         self.src_type = src_type
         self._enterprise = is_enterprise_src(src_type)
@@ -235,17 +235,7 @@ class Worker:
 
             # 模型可能只回文本（思考），也可能带 tool_calls
             tool_calls = getattr(msg, "tool_calls", None)
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ]
-            messages.append(assistant_msg)
+            messages.append(msg.as_history_message())
 
             # 是否在本轮要插入 JS 工具提示。注意：若本轮带 tool_calls，这条 user 提示必须
             # 延迟到所有 tool 响应 append 之后再插入，否则会破坏 assistant(tool_calls) → tool
@@ -285,9 +275,9 @@ class Worker:
                 if self.cancel_event.is_set():
                     cancelled_mid = True
                     break
-                name = tc.function.name
+                name = tc.name
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
+                    args = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError as e:
                     args = {}
                     result = self._tool_arg_error(

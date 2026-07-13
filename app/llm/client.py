@@ -8,6 +8,7 @@ import os
 import logging
 import re
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -59,13 +60,26 @@ class LLMError(RuntimeError):
         return self.diagnostic()
 
 
-def _sanitize_error_detail(text: str, limit: int = 1200) -> str:
+def _sanitize_error_detail(
+    text: str,
+    limit: int = 1200,
+    redact_values: tuple[str, ...] = (),
+) -> str:
+    for value in redact_values:
+        if value:
+            variants = {
+                value,
+                quote(value, safe=""),
+                quote_plus(value, safe=""),
+            }
+            for variant in sorted(variants, key=len, reverse=True):
+                text = (text or "").replace(variant, "<masked>")
     text = _SECRET_RE.sub("sk-<masked>", text or "")
     text = " ".join(text.split())
     return text[:limit]
 
 
-def _classify_error(e: Exception) -> LLMError:
+def _classify_error(e: Exception, redact_values: tuple[str, ...] = ()) -> LLMError:
     response = getattr(e, "response", None)
     status = getattr(e, "status_code", None) or getattr(response, "status_code", None)
     code = getattr(e, "code", "") or ""
@@ -75,31 +89,48 @@ def _classify_error(e: Exception) -> LLMError:
             raw = f"{raw} {response.text[:500]}"
         except Exception:
             pass
-    detail = _sanitize_error_detail(raw)
+    detail = _sanitize_error_detail(raw, redact_values=redact_values)
+    safe_code = _sanitize_error_detail(str(code), redact_values=redact_values)
     text = f"{status or ''} {code} {raw}".lower()
 
+    try:
+        status_number = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_number = None
+
+    if status_number is not None and status_number >= 500:
+        return LLMError("upstream", "LLM 上游服务临时异常，请稍后重试。",
+                        e, status=status, code=safe_code, detail=detail)
     if any(k in text for k in ("insufficient_quota", "quota", "billing", "余额", "额度", "balance")):
         return LLMError("quota", "LLM 额度不足或账户余额不足，请更换/充值模型 API Key 后重试。",
-                        e, status=status, code=str(code), detail=detail)
-    if status == 401 or any(k in text for k in ("unauthorized", "invalid api key", "incorrect api key", "无效")):
+                        e, status=status, code=safe_code, detail=detail)
+    if status_number in {401, 403} or any(k in text for k in (
+        "unauthorized",
+        "invalid api key",
+        "incorrect api key",
+        "permission_error",
+        "forbidden",
+        "api key 无效",
+        "密钥无效",
+        "鉴权失败",
+        "未授权",
+        "无权限",
+    )):
         return LLMError("auth", "LLM API Key 无效或无权限，请检查任务配置或服务端 .env。",
-                        e, status=status, code=str(code), detail=detail)
-    if status == 429 or any(k in text for k in ("rate limit", "too many requests", "限流")):
+                        e, status=status, code=safe_code, detail=detail)
+    if status_number == 429 or any(k in text for k in ("rate limit", "too many requests", "限流")):
         return LLMError("rate_limit", "LLM 请求被限流，请稍后重试或降低并发。",
-                        e, status=status, code=str(code), detail=detail)
+                        e, status=status, code=safe_code, detail=detail)
     if any(k in text for k in ("timeout", "timed out", "readtimeout", "connecttimeout", "超时")):
         return LLMError("timeout", "LLM 请求超时，可能是模型服务或网络临时不可用。",
-                        e, status=status, code=str(code), detail=detail)
+                        e, status=status, code=safe_code, detail=detail)
     if any(k in text for k in ("connection", "network", "name resolution", "连接")):
         return LLMError("network", "LLM 网络连接失败，请检查服务器出网或代理。",
-                        e, status=status, code=str(code), detail=detail)
-    if status and int(status) >= 500:
-        return LLMError("upstream", "LLM 上游服务临时异常，请稍后重试。",
-                        e, status=status, code=str(code), detail=detail)
+                        e, status=status, code=safe_code, detail=detail)
     logger.warning("LLM unknown error: type=%s status=%s code=%s detail=%s",
-                   type(e).__name__, status, code, raw[:600])
+                   type(e).__name__, status, safe_code, detail[:600])
     return LLMError("unknown", "LLM 调用失败：模型服务返回未知错误。",
-                    e, status=status, code=str(code), detail=detail)
+                    e, status=status, code=safe_code, detail=detail)
 
 
 class LLMClient:
@@ -175,14 +206,14 @@ class LLMClient:
                 try:
                     resp = self._client.post(payload.url, headers=payload.headers, json=payload.body)
                 except Exception as e2:
-                    raise _classify_error(e2) from e2
+                    raise _classify_error(e2, (self.config.api_key,)) from e2
             else:
-                raise _classify_error(e) from e
+                raise _classify_error(e, (self.config.api_key,)) from e
 
         try:
             resp.raise_for_status()
         except Exception as e:
-            raise _classify_error(e) from e
+            raise _classify_error(e, (self.config.api_key,)) from e
 
         data = resp.json()
         self._record_usage(data)

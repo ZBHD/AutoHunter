@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 from pydantic import ValidationError
 
 from app.agents.prompts import normalize_src_type, reviewer_system_prompt
-from app.llm.client import LLMClient, LLMError, _is_forced_tool_choice_unsupported
+from app.llm.router import LLMRouter
 from app.schemas import Confidence, Finding, Review, ReviewVerdict, Severity
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import REVIEWER_TOOL_SCHEMAS
@@ -176,16 +176,6 @@ def _maybe_deepen_ignored(finding: Finding, review: Review, src_type: str) -> bo
     return True
 
 
-def _is_thinking_tool_choice_error(err: LLMError) -> bool:
-    """强制指定 submit_review 的 tool_choice 不被模型/网关接受时的兜底判定。
-
-    复用 client 层的宽判定：既覆盖 DeepSeek thinking 的明确报错，也覆盖部分代理网关
-    (GLM/Qwen/Gemini)对 forced tool_choice 直接返回 400(如 code=1210 "API 调用参数有误")
-    的情况——这些模型仍支持 tools+auto，故降级为 auto 重试，仍强制模型必须调用 submit_review。
-    """
-    return _is_forced_tool_choice_unsupported(err)
-
-
 def _clip_text(text: str, limit: int) -> str:
     text = str(text or "")
     if len(text) <= limit:
@@ -230,13 +220,13 @@ def _review_finding_payload(finding: Finding) -> dict[str, Any]:
 class Reviewer:
     def __init__(
         self,
-        llm: Optional[LLMClient] = None,
+        llm: LLMRouter,
         on_event: Optional[Callable[[str, dict], None]] = None,
         enable_reproduce: bool = True,
         src_type: str = "edusrc",
         cancel_event: Optional["threading.Event"] = None,
     ):
-        self.llm = llm or LLMClient()
+        self.llm = llm
         self.on_event = on_event or (lambda kind, data: None)
         self.enable_reproduce = enable_reproduce
         self.src_type = normalize_src_type(src_type)
@@ -306,37 +296,12 @@ class Reviewer:
                 f"按 {mode_name} 标准审核并调用 submit_review：\n```json\n{finding_text}\n```"
             )},
         ]
-        forced_tool_choice = True
         for _ in range(3):  # 最多 3 次让模型修正
             try:
-                tool_choice = (
-                    {"type": "function", "function": {"name": "submit_review"}}
-                    if forced_tool_choice else "auto"
-                )
                 msg = self.llm.chat(
                     messages, tools=REVIEWER_TOOL_SCHEMAS,
-                    tool_choice=tool_choice,
+                    tool_choice="auto",
                 )
-            except LLMError as e:
-                if e.kind == "quota":
-                    raise
-                self._last_llm_error = str(e)
-                if forced_tool_choice and _is_thinking_tool_choice_error(e):
-                    forced_tool_choice = False
-                    self._emit(
-                        "review_tool_choice_fallback",
-                        error="thinking 模式不支持强制 submit_review，已降级为 auto tool_choice 重试",
-                    )
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "当前模型不支持强制指定工具。请你必须主动调用 submit_review 工具，"
-                            "不要只输出自然语言；否则本次审核无法落库。"
-                        ),
-                    })
-                    continue
-                self._emit("review_error", error=self._last_llm_error)
-                return None
             except Exception as e:
                 self._last_llm_error = str(e)
                 self._emit("review_error", error=self._last_llm_error)
@@ -344,24 +309,25 @@ class Reviewer:
 
             tool_calls = getattr(msg, "tool_calls", None)
             if not tool_calls:
-                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append(msg.as_history_message())
                 messages.append({"role": "user", "content": "请调用 submit_review 工具输出结构化结论。"})
                 continue
 
             tc = tool_calls[0]
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(tc.arguments or "{}")
                 review = Review(**args)
                 # reproduced 只能由系统的复现阶段设置，不信任 LLM 自填
                 review.reproduced = False
                 return review
             except (json.JSONDecodeError, ValidationError) as e:
-                messages.append({"role": "assistant", "content": "", "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                ]})
-                messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "content": f"校验失败，请修正后重新调用 submit_review: {e}"})
+                messages.append(msg.as_history_message())
+                for call in tool_calls:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": f"校验失败，请修正后重新调用 submit_review: {e}",
+                    })
         return None
 
     def _reproduce(self, finding: Finding, review: Review) -> None:

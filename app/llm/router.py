@@ -1,124 +1,172 @@
-"""LLMRouter: weighted random provider selection with chain failover."""
+"""Weighted LLM provider routing with request-local failover."""
 from __future__ import annotations
 
 import logging
 import random
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from app.config import LLMProviderConfig
-from app.llm.client import LLMClient
-from app.llm.protocols import LLMResponse, ADAPTER_REGISTRY
+from app.llm.client import LLMClient, LLMError, _classify_error
+from app.llm.protocols import LLMResponse
 
 logger = logging.getLogger("autohunter.llm.router")
 
 
-class AllProvidersExhaustedError(RuntimeError):
-    """所有 LLM provider 均已尝试但全部失败。"""
+@dataclass(frozen=True)
+class ProviderFailure:
+    provider_name: str
+    error: LLMError
 
-    def __init__(self, errors: list[tuple[str, str]]):
-        self.errors = errors  # [(provider_name, error_message), ...]
-        detail = "；".join(f"{name}: {msg}" for name, msg in errors)
-        super().__init__(f"所有 LLM provider 暂不可用 ({len(errors)} 个): {detail}")
+
+class AllProvidersExhaustedError(RuntimeError):
+    """Every enabled provider failed during one chat request."""
+
+    def __init__(self, failures: list[ProviderFailure]):
+        self.failures = failures
+        # Compatibility for callers that consumed the early prototype shape.
+        self.errors = [(item.provider_name, str(item.error)) for item in failures]
+        detail = "；".join(f"{item.provider_name}: {item.error}" for item in failures)
+        super().__init__(f"所有 LLM provider 暂不可用 ({len(failures)} 个): {detail}")
 
 
 class LLMRouter:
-    """多 provider 加权池 + 故障链式切换。
-
-    用法：
-        router = LLMRouter(providers, usage_key=task_id)
-        response = router.chat(messages, tools=[...])
-    """
+    """Select one provider by weight, then fail over in stable ring order."""
 
     def __init__(
         self,
         providers: list[LLMProviderConfig],
         usage_key: str | None = None,
-        on_provider_disabled: callable | None = None,
+        on_provider_disabled: Callable[[str, str], None] | None = None,
+        client_factory: Callable[..., LLMClient] = LLMClient,
+        rng: random.Random | None = None,
     ):
         if not providers:
             raise RuntimeError("未配置任何 LLM provider，请在设置中添加至少一个 LLM 提供商")
         self._usage_key = usage_key
         self._on_provider_disabled = on_provider_disabled
-        # Build (config, client) pairs for enabled providers
+        self._rng = rng or random.Random()
         self._entries: list[tuple[LLMProviderConfig, LLMClient]] = []
-        for cfg in providers:
-            if not cfg.api_key:
-                logger.warning("LLM provider '%s' 未配置 api_key，已跳过", cfg.name)
+
+        for source in providers:
+            cfg = source.model_copy(deep=True)
+            if not cfg.enabled or not cfg.api_key:
                 continue
             try:
-                client = LLMClient(config=cfg, usage_key=self._usage_key)
-                self._entries.append((cfg, client))
+                client = client_factory(config=cfg, usage_key=self._usage_key)
             except Exception as exc:
-                logger.warning("LLM provider '%s' 初始化失败: %s", cfg.name, exc)
+                logger.warning(
+                    "LLM provider '%s' 初始化失败: %s",
+                    cfg.name,
+                    self._redact(str(exc), cfg.api_key),
+                )
+                continue
+            self._entries.append((cfg, client))
+
         if not self._entries:
-            raise RuntimeError("所有 LLM provider 初始化失败或无有效 api_key")
+            raise RuntimeError("没有已启用且配置有效 API Key 的 LLM provider")
 
     @property
     def enabled_providers(self) -> list[str]:
         return [cfg.name for cfg, _ in self._entries if cfg.enabled]
 
-    def _weighted_select(self, tried_indices: set[int]) -> int | None:
-        """从 enabled 且未尝试过的 provider 中加权随机选一个。"""
+    def _weighted_start(self) -> int | None:
         candidates = [
-            (i, cfg.weight)
-            for i, (cfg, _) in enumerate(self._entries)
-            if cfg.enabled and i not in tried_indices
+            (index, cfg.weight)
+            for index, (cfg, _client) in enumerate(self._entries)
+            if cfg.enabled
         ]
         if not candidates:
             return None
-        total = sum(w for _, w in candidates)
-        r = random.randint(1, total)
-        cumulative = 0
-        for idx, w in candidates:
-            cumulative += w
-            if r <= cumulative:
-                return idx
-        return candidates[-1][0]  # fallback
+        total = sum(weight for _index, weight in candidates)
+        ticket = self._rng.randint(1, total)
+        upto = 0
+        for index, weight in candidates:
+            upto += weight
+            if ticket <= upto:
+                return index
+        return candidates[-1][0]
+
+    def _request_order(self) -> list[int]:
+        """Weight affects only the first provider; failover order stays stable."""
+        start = self._weighted_start()
+        if start is None:
+            return []
+        size = len(self._entries)
+        return [
+            index
+            for offset in range(size)
+            if self._entries[index := (start + offset) % size][0].enabled
+        ]
 
     def _disable_provider(self, cfg: LLMProviderConfig, reason: str) -> None:
-        """将 provider 标记为 disabled（auth/quota 错误）并通知上层。"""
+        if not cfg.enabled:
+            return
         cfg.enabled = False
         logger.warning("LLM provider '%s' 已自动禁用: %s", cfg.name, reason)
-        if self._on_provider_disabled:
-            try:
-                self._on_provider_disabled(cfg.name, reason)
-            except Exception:
-                pass
+        if not self._on_provider_disabled:
+            return
+        try:
+            self._on_provider_disabled(cfg.name, reason)
+        except Exception:
+            logger.exception("持久化 LLM provider 自动禁用状态失败: %s", cfg.name)
+
+    @staticmethod
+    def _redact(text: str, api_key: str) -> str:
+        if api_key:
+            text = text.replace(api_key, "<masked>")
+        return text
+
+    @classmethod
+    def _safe_error(cls, error: LLMError, api_key: str) -> LLMError:
+        message = cls._redact(str(error.args[0]) if error.args else error.kind, api_key)
+        detail = cls._redact(str(error.detail or ""), api_key)
+        code = cls._redact(str(error.code or ""), api_key)
+        return LLMError(
+            error.kind,
+            message,
+            None,
+            status=error.status,
+            code=code,
+            detail=detail,
+        )
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        tool_choice: str = "auto",
+        tool_choice: Any = "auto",
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """发送 LLM 请求，失败时自动切换 provider 重试。"""
-        tried: set[int] = set()
-        errors: list[tuple[str, str]] = []
-        while True:
-            idx = self._weighted_select(tried)
-            if idx is None:
-                break
-            cfg, client = self._entries[idx]
-            tried.add(idx)
+        failures: list[ProviderFailure] = []
+        for index in self._request_order():
+            cfg, client = self._entries[index]
             try:
-                result = client.chat(
+                return client.chat(
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                return LLMResponse(content=result.content, tool_calls=result.tool_calls)
             except Exception as exc:
-                # Reuse LLMClient's error classification
-                from app.llm.client import LLMError, _classify_error
-                err = _classify_error(exc) if not isinstance(exc, LLMError) else exc
-                kind = getattr(err, "kind", "unknown")
-                msg = str(err)
-                errors.append((cfg.name, msg))
-                if kind in ("auth", "quota"):
-                    self._disable_provider(cfg, f"{kind}: {msg}")
-                # Continue to next provider
-        raise AllProvidersExhaustedError(errors)
+                classified = (
+                    exc
+                    if isinstance(exc, LLMError)
+                    else _classify_error(exc, (cfg.api_key,))
+                )
+                error = self._safe_error(classified, cfg.api_key)
+                failures.append(ProviderFailure(cfg.name, error))
+                if error.kind in {"auth", "quota"}:
+                    message = str(error.args[0]) if error.args else error.kind
+                    self._disable_provider(cfg, f"{error.kind}: {message}")
+
+        raise AllProvidersExhaustedError(failures)
+
+
+__all__ = [
+    "AllProvidersExhaustedError",
+    "LLMRouter",
+    "ProviderFailure",
+]

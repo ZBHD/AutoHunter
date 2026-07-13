@@ -15,13 +15,12 @@ const form = reactive({
   intent_mode: "",
   manual_targets: "",
   src_rules: "",
-  base_url: "", api_key: "", model: "", prompt_version: "legacy",
+  use_global_pool: true,
+  base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
+  prompt_version: "legacy",
   fofa_key: "", fofa_base_url: "", max_pages: 20, concurrency: 3,
 });
 const inherited = reactive({
-  base_url: "",
-  model: "",
-  prompt_version: "legacy",
   fofa_base_url: "",
   max_pages: 20,
   intent_mode: "",
@@ -30,11 +29,17 @@ const inherited = reactive({
 const isSiteMode = computed(() => form.target_source === "site");
 
 async function submit() {
-  const modelConfig = {};
-  if (form.api_key.trim()) modelConfig.api_key = form.api_key.trim();
-  if (form.base_url && form.base_url !== inherited.base_url) modelConfig.base_url = form.base_url;
-  if (form.model && form.model !== inherited.model) modelConfig.model = form.model;
-  if (form.prompt_version !== inherited.prompt_version) modelConfig.prompt_version = form.prompt_version;
+  const modelConfig = {
+    use_global_pool: form.use_global_pool,
+    prompt_version: form.prompt_version,
+  };
+  if (!form.use_global_pool) {
+    modelConfig.base_url = form.base_url.trim();
+    modelConfig.api_key = form.api_key.trim();
+    modelConfig.model = form.model.trim();
+    modelConfig.protocol = form.protocol;
+    modelConfig.temperature = Number(form.temperature);
+  }
 
   const maxPages = parseInt(form.max_pages) || 20;
   const fofaConfig = {};
@@ -63,16 +68,16 @@ async function submit() {
 onMounted(async () => {
   try {
     const s = await api.getSettings();
-    if (!form.base_url) form.base_url = s.llm?.base_url || "";
-    if (!form.model) form.model = s.llm?.model || "";
+    const provider = (s.llm_providers || []).find((item) => item.enabled) || s.llm || {};
+    if (!form.base_url) form.base_url = provider.base_url || "";
+    if (!form.model) form.model = provider.model || "";
+    form.protocol = provider.protocol || form.protocol;
+    form.temperature = provider.temperature ?? form.temperature;
     form.prompt_version = s.defaults?.worker_prompt_version || form.prompt_version;
     form.max_pages = s.fofa?.max_pages ?? form.max_pages;
     if (!form.intent_mode) form.intent_mode = s.fofa?.default_intent_mode || "";
     if (!form.fofa_base_url) form.fofa_base_url = s.fofa?.base_url || "";
     form.concurrency = s.defaults?.concurrency ?? form.concurrency;
-    inherited.base_url = form.base_url;
-    inherited.model = form.model;
-    inherited.prompt_version = form.prompt_version;
     inherited.fofa_base_url = form.fofa_base_url;
     inherited.max_pages = Number(form.max_pages);
     inherited.intent_mode = form.intent_mode;
@@ -137,9 +142,38 @@ onMounted(async () => {
       </label>
       <details :open="adv">
         <summary @click="adv = !adv">高级：模型 / FOFA / 并发（留空用服务端默认）</summary>
-        <label>模型 base_url <input v-model="form.base_url" placeholder="https://api.deepseek.com/v1" /></label>
-        <label>模型 api_key <input v-model="form.api_key" type="password" /></label>
-        <label>模型名 <input v-model="form.model" placeholder="deepseek-chat" /></label>
+        <div class="model-mode-switch" role="group" aria-label="任务模型来源">
+          <button type="button" :class="{ active: form.use_global_pool }" :aria-pressed="form.use_global_pool"
+            @click="form.use_global_pool = true">
+            使用全局 Provider 池
+          </button>
+          <button type="button" :class="{ active: !form.use_global_pool }" :aria-pressed="!form.use_global_pool"
+            @click="form.use_global_pool = false">
+            任务专用模型
+          </button>
+        </div>
+        <p class="model-mode-copy">
+          {{ form.use_global_pool ? "按全局权重选择并在失败时自动切换。" : "此任务固定使用下面的独立模型配置。" }}
+        </p>
+        <div v-if="!form.use_global_pool" class="task-model-grid">
+          <label>协议
+            <select v-model="form.protocol">
+              <option value="openai_chat">OpenAI Chat Completions</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+              <option value="openai_responses">OpenAI Responses</option>
+            </select>
+          </label>
+          <label>Temperature
+            <input v-model="form.temperature" type="number" min="0" max="2" step="0.1" required />
+          </label>
+          <label class="full">模型 base_url
+            <input v-model="form.base_url" type="url" placeholder="https://api.openai.com/v1" required />
+          </label>
+          <label class="full">模型 api_key
+            <input v-model="form.api_key" type="password" autocomplete="new-password" required />
+          </label>
+          <label class="full">模型名 <input v-model="form.model" placeholder="gpt-4.1-mini" required /></label>
+        </div>
         <label>Worker 提示词
           <select v-model="form.prompt_version">
             <option value="current">current（当前省 token 版）</option>

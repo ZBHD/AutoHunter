@@ -91,3 +91,42 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
         "size": data.get("size", 0),
         "page": page,
     }
+
+
+async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
+    """调用 FOFA 官方账号信息接口验证 Key，不消耗搜索额度。"""
+    if not key:
+        raise FofaError("缺少 FOFA key", account_error=True)
+    base = (base_url or BASE).rstrip("/")
+    url = f"{base}/api/v1/info/my"
+    from app.tools.netguard import SsrfBlocked, assert_safe_outbound_url
+
+    try:
+        assert_safe_outbound_url(url, allow_extra_hosts=_FOFA_ALLOWED_HOSTS)
+    except SsrfBlocked as exc:
+        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url, params={"key": key})
+        if response.status_code != 200:
+            raise FofaError(
+                f"FOFA 返回 HTTP {response.status_code}",
+                account_error=response.status_code in {401, 403},
+            )
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise FofaError("FOFA 账号接口返回非 JSON") from exc
+    except FofaError:
+        raise
+    except httpx.HTTPError as exc:
+        raise FofaError(f"FOFA 请求失败: {type(exc).__name__}") from exc
+
+    if data.get("error"):
+        message = str(data.get("errmsg") or "账号不可用")
+        raise FofaError(
+            f"FOFA 错误: {message}",
+            account_error=_is_account_error(message),
+        )
+    return data

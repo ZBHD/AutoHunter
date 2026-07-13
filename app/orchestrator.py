@@ -38,9 +38,9 @@ from app.agent_runtime import (
 from app.db.models import CST, Finding, Killsweep, Review, Target, Task, TaskEvent
 from app.db.session import SessionLocal
 from app.events import bus
-from app.llm.client import LLMClient
+from app.llm.router import LLMRouter
 from app.settings_service import (
-    llm_client_for_task,
+    llm_router_for_task,
     resolve_fofa_base_url,
     resolve_fofa_key,
     resolve_worker_prompt_version,
@@ -305,8 +305,8 @@ def _probe_target_liveness(url: str, host: str, timeout: float) -> dict:
     }
 
 
-def _llm_for_task(task: Task) -> LLMClient:
-    return llm_client_for_task(task)
+def _llm_for_task(task: Task) -> LLMRouter:
+    return llm_router_for_task(task)
 
 
 class TaskRunner:

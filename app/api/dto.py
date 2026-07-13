@@ -1,16 +1,58 @@
 """API 请求/响应 DTO。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+
+LLMProtocol = Literal["openai_chat", "anthropic_messages", "openai_responses"]
+
+
+def _validated_http_url(value: str) -> str:
+    normalized = str(value or "").strip()
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        raise ValueError("must be an absolute HTTP(S) URL without credentials or query")
+    return normalized
 
 
 class ModelConfigDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use_global_pool: bool = True
     base_url: str = "https://api.deepseek.com/v1"
     api_key: str = ""
     model: str = "deepseek-chat"
+    protocol: LLMProtocol = "openai_chat"
+    temperature: float = Field(default=0.3, ge=0, le=2)
     prompt_version: str = ""
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        return _validated_http_url(normalized) if normalized else ""
+
+    @field_validator("api_key", "model", "prompt_version")
+    @classmethod
+    def _trim_text(cls, value: str) -> str:
+        return str(value or "").strip()
 
 
 class FofaConfigDTO(BaseModel):
@@ -43,10 +85,28 @@ class CreateTaskRequest(BaseModel):
 
 
 class PartialModelConfigDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use_global_pool: Optional[bool] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None
+    protocol: Optional[LLMProtocol] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     prompt_version: Optional[str] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return _validated_http_url(normalized) if normalized else ""
+
+    @field_validator("api_key", "model", "prompt_version")
+    @classmethod
+    def _trim_text(cls, value: str | None) -> str | None:
+        return None if value is None else str(value).strip()
 
 
 class PartialFofaConfigDTO(BaseModel):
@@ -150,3 +210,92 @@ class SettingsUpdateRequest(BaseModel):
     fofa: Optional[FofaSettingsDTO] = None
     engines: Optional[dict[str, EngineSettingsDTO]] = None   # 按引擎名索引
     defaults: Optional[DefaultsSettingsDTO] = None
+
+
+class LLMProviderDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    base_url: str
+    api_key: str = ""
+    model: str
+    temperature: float = Field(default=0.3, ge=0, le=2)
+    weight: int = Field(default=5, ge=1, le=100)
+    protocol: LLMProtocol = "openai_chat"
+    enabled: bool = True
+
+    @field_validator("name", "model")
+    @classmethod
+    def _nonempty_text(cls, value: str, info: ValidationInfo) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("must not be empty")
+        if info.field_name == "name" and (
+            normalized.casefold() == "order"
+            or any(char in normalized for char in "/\\?#")
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise ValueError("provider name is reserved or cannot be used in a URL path")
+        return normalized
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str) -> str:
+        return _validated_http_url(value)
+
+    @field_validator("api_key")
+    @classmethod
+    def _api_key(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def _enabled_requires_key(self):
+        if self.enabled and not self.api_key:
+            raise ValueError("enabled provider requires api_key")
+        return self
+
+
+class LLMProviderUpdateDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    weight: Optional[int] = Field(default=None, ge=1, le=100)
+    protocol: Optional[LLMProtocol] = None
+    enabled: Optional[bool] = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validated_http_url(value)
+
+    @field_validator("model")
+    @classmethod
+    def _model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("must not be empty")
+        return normalized
+
+    @field_validator("api_key")
+    @classmethod
+    def _api_key(cls, value: str | None) -> str | None:
+        return None if value is None else str(value).strip()
+
+
+class LLMProviderOrderDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    names: list[str]
+
+    @field_validator("names")
+    @classmethod
+    def _normalized_names(cls, names: list[str]) -> list[str]:
+        normalized = [str(name or "").strip() for name in names]
+        if any(not name for name in normalized):
+            raise ValueError("provider names must not be empty")
+        return normalized

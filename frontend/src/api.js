@@ -243,7 +243,19 @@ export const api = {
   deepen: (id, directive) => req("POST", `/api/results/${id}/deepen`, { directive }),
   getSettings: () => req("GET", "/api/settings"),
   updateSettings: (data) => req("PUT", "/api/settings", data),
-  listModels: (base_url, api_key) => req("POST", "/api/settings/models", { base_url, api_key }),
+  healthCheck: () => req("POST", "/api/settings/health-check"),
+  listModels: (base_url, api_key, protocol, provider_name) =>
+    req("POST", "/api/settings/models", { base_url, api_key, protocol, provider_name }),
+  listLlmProviders: () => req("GET", "/api/settings/llm-providers"),
+  createLlmProvider: (data) => req("POST", "/api/settings/llm-providers", data),
+  updateLlmProvider: (name, data) =>
+    req("PUT", `/api/settings/llm-providers/${encodeURIComponent(name)}`, data),
+  deleteLlmProvider: (name) =>
+    req("DELETE", `/api/settings/llm-providers/${encodeURIComponent(name)}`),
+  testLlmProvider: (name) =>
+    req("POST", `/api/settings/llm-providers/${encodeURIComponent(name)}/test`),
+  orderLlmProviders: (names) =>
+    req("PUT", "/api/settings/llm-providers/order", { names }),
   // 全局情报库
   intelStats: () => req("GET", "/api/intel/stats"),
   intelList: (kind, confidence, q, limit) =>

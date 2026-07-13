@@ -201,7 +201,7 @@ body="管理" && org="China Education and Research Network Center"
 
 ### 高级选项（可留空，用服务端默认）
 
-展开「高级」可**按任务单独覆盖**：模型 `base_url`/`api_key`/模型名、Worker 提示词版本、FOFA key、FOFA 最大页数、Worker 并发数。不填就继承「设置」页的全局默认。
+展开「高级」可选择使用**全局 Provider 池**，或按任务固定 `base_url`/`api_key`/模型名/协议/温度；还可覆盖 Worker 提示词版本、FOFA key、FOFA 最大页数和 Worker 并发数。默认使用全局池。
 
 > ⚠️ **务必收窄授权范围**：只搜你有权限测试的资产。`org` / `domain` / `cert` 是最有效的归属过滤手段。
 
@@ -214,13 +214,32 @@ body="管理" && org="China Education and Research Network Center"
 | `LLM_API_KEY` | ✅ **必填** | 大模型 API Key，平台核心 | [DeepSeek](https://platform.deepseek.com/) / OpenAI / 通义 / Kimi 等 |
 | `LLM_BASE_URL` | 默认 DeepSeek | OpenAI 兼容接口地址（需含 `/v1`） | 默认 `https://api.deepseek.com/v1` |
 | `LLM_MODEL` | 默认 deepseek-chat | 模型名 | 按模型商填 |
+| `LLM_PROTOCOL` | 默认 openai_chat | legacy 回退协议：`openai_chat` / `anthropic_messages` / `openai_responses` | 按模型商接口填 |
 | `FOFA_KEY` | ⭐ 推荐 | 资产测绘，用于自动搜集目标 | [FOFA 个人中心](https://fofa.info/) |
 | `FOFA_BASE_URL` | 可选，默认官方地址 | 自定义 FOFA API 端点（私有部署/镜像/代理网关） | 默认 `https://fofa.info` |
 | `AUTOHUNTER_API_TOKEN` | ⭐ 强烈建议 | 控制台全权限访问令牌，**不设则任何人可访问** | `install.sh` 自动生成，或自填随机串 |
 | `AUTOHUNTER_HOST_PORT` | 默认 18800 | 对外访问端口 | 按需 |
 
 > 其余全部参数（Worker 预算、并发、超时、WAF 等）都有合理默认值，见 `.env.example` 内注释，按需微调即可。
-> 也支持**不填 `.env`、直接在控制台「设置」页填 LLM/FOFA Key**——设置会存进数据库，优先级高于 `.env`。
+> 也支持**不填 `.env`、直接在控制台「设置」页配置 LLM Provider/FOFA Key**。Provider 池会持久化到数据库。
+
+### 多 LLM Provider 池
+
+控制台「设置」支持同时维护多个 Provider，每项可选择以下协议：
+
+- `OpenAI Chat Completions`（`openai_chat`）
+- `Anthropic Messages`（`anthropic_messages`）
+- `OpenAI Responses`（`openai_responses`）
+
+每次 LLM 调用先按已启用 Provider 的权重选择首个节点；若调用失败，会从该节点开始按配置顺序环形切换，每个 Provider 最多尝试一次。超时、网络错误、限流和上游 5xx 只跳过当前调用；鉴权失败或额度不足会自动禁用对应 Provider，并持久化到设置中，修复 Key 后可在设置页重新启用。
+
+配置解析优先级为：
+
+1. 任务选择「专用模型」时固定使用任务配置。
+2. 否则使用数据库中的全局 Provider 池。
+3. 数据库池为空时，兼容回退到旧的数据库单模型设置和 `LLM_*` 环境变量。
+
+数据库池只要非空，即使其中所有 Provider 都被禁用，也不会偷偷回退到旧环境变量。此时应在设置页修复并重新启用 Provider，或删除全部 Provider 后恢复 legacy 回退。API 和界面只返回脱敏 Key；编辑时留空或保留脱敏占位不会覆盖已保存的真实 Key。
 
 ---
 
@@ -291,7 +310,7 @@ hunt.example.com {
 
 - 后端：Python 3.12 · FastAPI · SQLAlchemy(SQLite) · asyncio
 - 前端：Vue 3 · Vite
-- 模型：任意 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / Kimi …）
+- 模型：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses，以及兼容这些协议的网关
 - 工具链（容器内置）：nmap · nuclei · sqlmap · httpx · whatweb · curl/wget/jq 等
 
 ---

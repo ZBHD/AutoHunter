@@ -15,9 +15,19 @@ from app.db.session import get_session
 from app.llm.usage import usage_snapshot
 from app.orchestrator import manager
 from app.security import resolve_role, token_from_headers
-from app.settings_service import resolve_engine_config, resolve_llm_config, resolve_worker_prompt_version
+from app.settings_service import (
+    is_masked_secret,
+    resolve_engine_config,
+    resolve_llm_config,
+    resolve_worker_prompt_version,
+    task_uses_global_pool,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+_TASK_LLM_PROVIDER_FIELDS = (
+    "base_url", "api_key", "model", "protocol", "temperature",
+)
 
 
 # Activity Stream 历史回放：过滤高频低价值事件（与前端 BoardView 规则对齐）。
@@ -45,7 +55,15 @@ def _is_observer(request: Request | None) -> bool:
 
 
 def _observer_model_config() -> dict:
-    return {"base_url": "", "model": "hidden", "api_key_set": False}
+    return {
+        "use_global_pool": True,
+        "base_url": "",
+        "model": "hidden",
+        "protocol": "openai_chat",
+        "temperature": 0.0,
+        "api_key_set": False,
+        "prompt_version": "",
+    }
 
 
 def _observer_fofa_config() -> dict:
@@ -121,11 +139,59 @@ def _observer_ip(ip: str) -> str:
 def _public_model_config(task: Task) -> dict:
     cfg = resolve_llm_config(task)
     return {
+        "use_global_pool": task_uses_global_pool(task),
         "base_url": cfg.base_url,
         "model": cfg.model,
+        "protocol": cfg.protocol,
+        "temperature": cfg.temperature,
         "api_key_set": bool(cfg.api_key),
         "prompt_version": resolve_worker_prompt_version(task),
     }
+
+
+def _new_task_model_config(model_config) -> dict:
+    data = model_config.model_dump()
+    prompt_version = data.pop("prompt_version", "")
+    if data["use_global_pool"]:
+        stored = {"use_global_pool": True}
+    else:
+        stored = data
+        if is_masked_secret(stored.get("api_key", "")):
+            stored["api_key"] = ""
+    if prompt_version:
+        stored["prompt_version"] = prompt_version
+    return stored
+
+
+def _patch_task_model_config(current: dict | None, patch: dict) -> dict:
+    config = dict(current or {})
+
+    if "prompt_version" in patch and patch["prompt_version"] is not None:
+        prompt_version = str(patch["prompt_version"] or "").strip()
+        if prompt_version:
+            config["prompt_version"] = prompt_version
+        else:
+            config.pop("prompt_version", None)
+
+    if patch.get("use_global_pool") is True:
+        for key in _TASK_LLM_PROVIDER_FIELDS:
+            config.pop(key, None)
+        config["use_global_pool"] = True
+        return config
+
+    if patch.get("use_global_pool") is False:
+        config["use_global_pool"] = False
+
+    for key in ("base_url", "model", "protocol", "temperature"):
+        if key in patch and patch[key] is not None:
+            config[key] = patch[key]
+
+    if "api_key" in patch and patch["api_key"] is not None:
+        api_key = str(patch["api_key"] or "").strip()
+        if api_key and not is_masked_secret(api_key):
+            config["api_key"] = api_key
+
+    return config
 
 
 def _public_fofa_config(task: Task) -> dict:
@@ -250,7 +316,7 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
         name=req.name, src_type=normalize_src_type(req.src_type), vuln_types=req.vuln_types,
         src_rules=req.src_rules, target_source=req.target_source,
         engine=engine_name, fofa_query=req.fofa_query, manual_targets=req.manual_targets,
-        model_config_json=req.model_config_data.model_dump(exclude_defaults=True),
+        model_config_json=_new_task_model_config(req.model_config_data),
         fofa_config=fofa_cfg, concurrency=req.concurrency,
         status="created",
     )
@@ -396,13 +462,9 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
 
     if req.model_config_data is not None:
         patch = req.model_config_data.model_dump(exclude_unset=True)
-        cfg = dict(task.model_config_json or {})
-        for key in ("base_url", "model"):
-            if key in patch and patch[key] is not None:
-                cfg[key] = str(patch[key]).strip()
-        if str(patch.get("api_key") or "").strip():
-            cfg["api_key"] = str(patch["api_key"]).strip()
-        task.model_config_json = cfg
+        task.model_config_json = _patch_task_model_config(
+            task.model_config_json, patch
+        )
 
     if req.engine_config is not None:
         ec_patch = req.engine_config.model_dump(exclude_unset=True)

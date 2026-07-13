@@ -1,6 +1,6 @@
 """搜集 Agent 的 LLM 辅助：意图→FOFA 语法生成 + edu 归属批量判定。
 
-这两个函数都是同步的（内部调 LLMClient.chat），由 collector 在线程池里调用，
+这两个函数都是同步的（内部调 LLMRouter.chat），由 collector 在线程池里调用，
 避免阻塞 orchestrator 的事件循环。任何异常都返回降级结果，不阻断主循环。
 """
 from __future__ import annotations
@@ -14,21 +14,21 @@ from app.agents.prompts import (
     collector_query_prompt,
     collector_scope_note,
 )
-from app.llm.client import LLMClient
+from app.llm.router import LLMRouter
 from app.tools.schemas import COLLECTOR_EDU_SCHEMAS, COLLECTOR_QUERY_SCHEMAS
 
 
 def _tool_args(msg, name: str) -> Optional[dict]:
     for tc in (getattr(msg, "tool_calls", None) or []):
-        if tc.function.name == name:
+        if tc.name == name:
             try:
-                return json.loads(tc.function.arguments)
+                return json.loads(tc.arguments)
             except Exception:
                 return None
     return None
 
 
-def generate_query(llm: LLMClient, intent: str, vuln_types: list[str],
+def generate_query(llm: LLMRouter, intent: str, vuln_types: list[str],
                    history: list[str], src_type: str = "edusrc") -> Optional[dict]:
     """把搜集意图翻译成一条新的 FOFA 语法。返回 {query, reason} 或 None。"""
     user = (
@@ -43,7 +43,7 @@ def generate_query(llm: LLMClient, intent: str, vuln_types: list[str],
         [{"role": "system", "content": collector_query_prompt(src_type)},
          {"role": "user", "content": user}],
         tools=COLLECTOR_QUERY_SCHEMAS,
-        tool_choice={"type": "function", "function": {"name": "gen_query"}},
+        tool_choice="auto",
         temperature=0.5,
     )
     args = _tool_args(msg, "gen_query")
@@ -52,7 +52,7 @@ def generate_query(llm: LLMClient, intent: str, vuln_types: list[str],
     return None
 
 
-def judge_edu_batch(llm: LLMClient, assets: list[dict]) -> dict[int, dict]:
+def judge_edu_batch(llm: LLMRouter, assets: list[dict]) -> dict[int, dict]:
     """批量判定资产是否 edu + 归属学校。assets: [{host, ip, org, title}]。
     返回 {index: {is_edu: bool, school: str}}。"""
     if not assets:
@@ -68,7 +68,7 @@ def judge_edu_batch(llm: LLMClient, assets: list[dict]) -> dict[int, dict]:
         [{"role": "system", "content": COLLECTOR_EDU_PROMPT_COMPACT},
          {"role": "user", "content": user}],
         tools=COLLECTOR_EDU_SCHEMAS,
-        tool_choice={"type": "function", "function": {"name": "judge_edu"}},
+        tool_choice="auto",
         temperature=0.0,
     )
     args = _tool_args(msg, "judge_edu")

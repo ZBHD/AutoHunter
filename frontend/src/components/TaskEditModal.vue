@@ -14,10 +14,19 @@ const modelsError = ref("");
 const useCustomModel = ref(false); // 列表外手输模式
 
 async function loadModels() {
+  if (form.use_global_pool) {
+    models.value = [];
+    modelsError.value = "";
+    return;
+  }
   modelsLoading.value = true;
   modelsError.value = "";
   try {
-    const res = await api.listModels(form.base_url || undefined, form.api_key || undefined);
+    const res = await api.listModels(
+      form.base_url || undefined,
+      form.api_key || undefined,
+      form.protocol,
+    );
     if (res?.ok && res.models?.length) {
       models.value = res.models;
       // 当前模型不在列表里 → 默认进入手输模式，避免选错
@@ -46,9 +55,13 @@ const form = reactive({
   intent_mode: "",
   manual_targets: "",
   src_rules: "",
+  use_global_pool: true,
   base_url: "",
   api_key: "",
+  api_key_set: false,
   model: "",
+  protocol: "openai_chat",
+  temperature: 0.3,
   prompt_version: "legacy",
   fofa_key: "",
   fofa_base_url: "",
@@ -57,15 +70,16 @@ const form = reactive({
   concurrency: 3,
 });
 const original = reactive({
-  base_url: "",
-  model: "",
-  prompt_version: "legacy",
+  use_global_pool: true,
   intent_mode: "",
   fofa_base_url: "",
   max_pages: 20,
   page_size: 100,
 });
 const isSiteMode = computed(() => form.target_source === "site");
+const dedicatedKeyRequired = computed(() => (
+  !form.use_global_pool && (original.use_global_pool || !form.api_key_set)
+));
 
 function fill(task) {
   if (!task) return;
@@ -80,18 +94,20 @@ function fill(task) {
   form.intent_mode = fofaCfg.intent_mode || "";
   form.manual_targets = (task.manual_targets || []).join("\n");
   form.src_rules = task.src_rules || "";
+  form.use_global_pool = modelCfg.use_global_pool !== false;
   form.base_url = modelCfg.base_url || "";
   form.api_key = "";
+  form.api_key_set = Boolean(modelCfg.api_key_set);
   form.model = modelCfg.model || "";
+  form.protocol = modelCfg.protocol || "openai_chat";
+  form.temperature = Number(modelCfg.temperature ?? 0.3);
   form.prompt_version = modelCfg.prompt_version || "legacy";
   form.fofa_key = "";
   form.fofa_base_url = fofaCfg.base_url || "";
   form.max_pages = fofaCfg.max_pages ?? 20;
   form.page_size = fofaCfg.page_size ?? 100;
   form.concurrency = task.concurrency || 3;
-  original.base_url = form.base_url;
-  original.model = form.model;
-  original.prompt_version = form.prompt_version;
+  original.use_global_pool = form.use_global_pool;
   original.intent_mode = form.intent_mode;
   original.fofa_base_url = form.fofa_base_url;
   original.max_pages = Number(form.max_pages);
@@ -106,16 +122,22 @@ watch(() => props.task, fill, { immediate: true });
 watch(() => props.open, (open) => {
   if (open) {
     fill(props.task);
-    loadModels();  // 打开即自动拉好可用模型列表，默认下拉选择
+    if (!form.use_global_pool) loadModels();
   }
 });
 
 async function save() {
-  const modelConfig = {};
-  if (form.base_url !== original.base_url) modelConfig.base_url = form.base_url;
-  if (form.model !== original.model) modelConfig.model = form.model;
-  if (form.prompt_version !== original.prompt_version) modelConfig.prompt_version = form.prompt_version;
-  if (form.api_key.trim()) modelConfig.api_key = form.api_key.trim();
+  const modelConfig = {
+    use_global_pool: form.use_global_pool,
+    prompt_version: form.prompt_version,
+  };
+  if (!form.use_global_pool) {
+    modelConfig.base_url = form.base_url.trim();
+    modelConfig.model = form.model.trim();
+    modelConfig.protocol = form.protocol;
+    modelConfig.temperature = Number(form.temperature);
+    if (form.api_key.trim()) modelConfig.api_key = form.api_key.trim();
+  }
 
   const maxPages = parseInt(form.max_pages) || 20;
   const pageSize = parseInt(form.page_size) || 100;
@@ -202,9 +224,34 @@ async function save() {
 
       <details open>
         <summary>高级：模型 / FOFA</summary>
+        <div class="model-mode-switch" role="group" aria-label="任务模型来源">
+          <button type="button" :class="{ active: form.use_global_pool }" :aria-pressed="form.use_global_pool"
+            @click="form.use_global_pool = true">
+            使用全局 Provider 池
+          </button>
+          <button type="button" :class="{ active: !form.use_global_pool }" :aria-pressed="!form.use_global_pool"
+            @click="form.use_global_pool = false">
+            任务专用模型
+          </button>
+        </div>
+        <p class="model-mode-copy">
+          {{ form.use_global_pool ? "后续调用使用全局权重与故障切换。" : "后续调用固定使用此任务的独立模型。" }}
+        </p>
         <div class="settings-grid">
-          <label>模型 base_url <input v-model="form.base_url" placeholder="https://api.deepseek.com/v1" /></label>
-          <label class="model-field">
+          <label v-if="!form.use_global_pool">协议
+            <select v-model="form.protocol">
+              <option value="openai_chat">OpenAI Chat Completions</option>
+              <option value="anthropic_messages">Anthropic Messages</option>
+              <option value="openai_responses">OpenAI Responses</option>
+            </select>
+          </label>
+          <label v-if="!form.use_global_pool">Temperature
+            <input v-model="form.temperature" type="number" min="0" max="2" step="0.1" required />
+          </label>
+          <label v-if="!form.use_global_pool" class="full">模型 base_url
+            <input v-model="form.base_url" type="url" placeholder="https://api.openai.com/v1" required />
+          </label>
+          <label v-if="!form.use_global_pool" class="model-field full">
             模型名
             <div class="model-picker">
               <select v-if="models.length && !useCustomModel" v-model="form.model">
@@ -226,14 +273,18 @@ async function save() {
             <small v-if="modelsError" class="model-hint">{{ modelsError }}</small>
             <small v-else-if="models.length" class="model-hint">已获取 {{ models.length }} 个可用模型</small>
           </label>
-          <label>Worker 提示词
+          <label class="full">Worker 提示词
             <select v-model="form.prompt_version">
               <option value="current">current（当前省 token 版）</option>
               <option value="legacy">legacy（旧版 23/25 风格）</option>
               <option value="modern">modern（当前完整版）</option>
             </select>
           </label>
-          <label>模型 api_key <input v-model="form.api_key" type="password" placeholder="留空保留原值" /></label>
+          <label v-if="!form.use_global_pool" class="full">模型 api_key
+            <input v-model="form.api_key" type="password" autocomplete="new-password"
+              :required="dedicatedKeyRequired"
+              :placeholder="dedicatedKeyRequired ? '切换到专用模型时必须填写' : '已配置，留空保留原值'" />
+          </label>
           <label v-if="!isSiteMode">FOFA key <input v-model="form.fofa_key" type="password" placeholder="留空保留原值" /></label>
           <label v-if="!isSiteMode">FOFA API 端点 <input v-model="form.fofa_base_url" placeholder="https://fofa.info" /></label>
           <label v-if="!isSiteMode">FOFA 最大页数 <input v-model="form.max_pages" type="number" min="1" max="200" /></label>

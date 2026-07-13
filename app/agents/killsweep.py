@@ -21,7 +21,7 @@ import httpx
 
 from app.agents.history import compact_messages
 from app.agents.prompts import is_enterprise_src, killsweep_system_prompt
-from app.llm.client import LLMClient
+from app.llm.router import LLMRouter
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import KILLSWEEP_TOOL_SCHEMAS
 
@@ -129,7 +129,7 @@ class KillsweepHunter:
         self,
         finding: dict,
         fofa_key: str,
-        llm: Optional[LLMClient] = None,
+        llm: LLMRouter,
         on_event: Optional[Callable[[str, dict], None]] = None,
         src_type: str = "edusrc",
         cancel_event: Optional[threading.Event] = None,
@@ -138,7 +138,7 @@ class KillsweepHunter:
         self.finding = finding
         self.fofa_key = fofa_key
         self.fofa_base_url = fofa_base_url
-        self.llm = llm or LLMClient()
+        self.llm = llm
         self.cancel_event = cancel_event or threading.Event()
         self.executor = ToolExecutor(f"killsweep_{finding.get('target_url','x')}", cancel_event=self.cancel_event)
         self.on_event = on_event or (lambda kind, data: None)
@@ -183,14 +183,7 @@ class KillsweepHunter:
                 return KillsweepResult({"error": f"LLM 调用失败: {e}"})
 
             tool_calls = getattr(msg, "tool_calls", None)
-            am: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                am["tool_calls"] = [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in tool_calls
-                ]
-            messages.append(am)
+            messages.append(msg.as_history_message())
 
             if not tool_calls:
                 messages.append({"role": "user", "content": "请继续，或调用 submit_killsweep 给出结论。"})
@@ -201,13 +194,13 @@ class KillsweepHunter:
                     self.executor.cancel_running()
                     return KillsweepResult({"error": "通杀分析已被取消"})
                 try:
-                    args = json.loads(tc.function.arguments or "{}")
+                    args = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                result = self._dispatch(tc.function.name, args)
+                result = self._dispatch(tc.name, args)
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps(result, ensure_ascii=False),
-                                 "_round": rounds, "_tool": tc.function.name})
+                                 "_round": rounds, "_tool": tc.name})
 
             if self._result is not None:
                 break

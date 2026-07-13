@@ -1,28 +1,51 @@
 """Protocol adapters for OpenAI Chat, Anthropic Messages, and OpenAI Responses APIs."""
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 from typing import Any
+
+
+_CONTINUATION_KEY = "_llm_continuation"
 
 
 @dataclass
 class ToolCall:
     id: str
     name: str
-    arguments: str  # JSON string
+    arguments: str
+
+    def as_history_dict(self) -> dict[str, Any]:
+        """Serialize to the canonical OpenAI-style history shape."""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
 
 
 @dataclass
 class LLMResponse:
     content: str = ""
     tool_calls: list[ToolCall] | None = None
+    continuation: dict[str, Any] | None = field(default=None, repr=False)
+
+    def as_history_message(self) -> dict[str, Any]:
+        """Build canonical history while retaining opaque provider continuation data."""
+        message: dict[str, Any] = {"role": "assistant", "content": self.content or ""}
+        if self.tool_calls:
+            message["tool_calls"] = [call.as_history_dict() for call in self.tool_calls]
+        if self.continuation:
+            message[_CONTINUATION_KEY] = deepcopy(self.continuation)
+        return message
 
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from types import SimpleNamespace
-import json
-from typing import Any
+def _argument_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
 
 
 @dataclass
@@ -89,7 +112,14 @@ class OpenAIChatAdapter(ProtocolAdapter):
                 url += "/v1/chat/completions"
         body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": [
+                {
+                    key: deepcopy(value)
+                    for key, value in message.items()
+                    if not str(key).startswith("_")
+                }
+                for message in messages
+            ],
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -103,23 +133,21 @@ class OpenAIChatAdapter(ProtocolAdapter):
         return RequestPayload(url=url, headers=headers, body=body)
 
     def parse_response(self, raw):
-        choice = raw.get("choices", [{}])[0]
+        choices = raw.get("choices") or []
+        choice = choices[0] if choices else {}
         msg = choice.get("message") or {}
         content = msg.get("content") or ""
-        calls = None
         raw_calls = msg.get("tool_calls") or []
-        if raw_calls:
-            calls = [
-                ToolCall(
-                    id=c.get("id", ""),
-                    name=(c.get("function") or {}).get("name", ""),
-                    arguments=json.dumps(
-                        json.loads((c.get("function") or {}).get("arguments", "{}")),
-                        ensure_ascii=False,
-                    ),
-                )
-                for c in raw_calls
-            ]
+        calls = [
+            ToolCall(
+                id=call.get("id", ""),
+                name=(call.get("function") or {}).get("name", ""),
+                arguments=_argument_string(
+                    (call.get("function") or {}).get("arguments", "{}")
+                ),
+            )
+            for call in raw_calls
+        ]
         return LLMResponse(content=content or "", tool_calls=calls or None)
 
     def extract_usage(self, raw):
@@ -182,6 +210,15 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
     def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
         system_parts: list[str] = []
         out: list[dict[str, Any]] = []
+
+        def append_blocks(role: str, blocks: list[dict[str, Any]]) -> None:
+            if not blocks:
+                return
+            if out and out[-1]["role"] == role:
+                out[-1]["content"].extend(blocks)
+                return
+            out.append({"role": role, "content": blocks})
+
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content") or ""
@@ -190,14 +227,11 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
                     system_parts.append(str(content))
                 continue
             if role == "tool":
-                out.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": str(content),
-                    }],
-                })
+                append_blocks("user", [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": str(content),
+                }])
                 continue
             if role == "assistant":
                 blocks: list[dict[str, Any]] = []
@@ -205,19 +239,21 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
                     blocks.append({"type": "text", "text": str(content)})
                 for call in msg.get("tool_calls") or []:
                     fn = call.get("function") or {}
+                    raw_arguments = fn.get("arguments") or "{}"
                     try:
-                        tool_input = json.loads(fn.get("arguments") or "{}")
+                        tool_input = json.loads(raw_arguments)
                     except Exception:
-                        tool_input = {}
+                        tool_input = raw_arguments
                     blocks.append({
                         "type": "tool_use",
                         "id": call.get("id", ""),
                         "name": fn.get("name", ""),
                         "input": tool_input,
                     })
-                out.append({"role": "assistant", "content": blocks or str(content)})
+                append_blocks("assistant", blocks)
                 continue
-            out.append({"role": "user", "content": str(content)})
+            if content:
+                append_blocks("user", [{"type": "text", "text": str(content)}])
         return "\n\n".join(system_parts), out
 
     def build_request(self, base_url, api_key, model, messages,
@@ -238,7 +274,7 @@ class AnthropicMessagesAdapter(ProtocolAdapter):
             if choice:
                 body["tool_choice"] = choice
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
         }
@@ -301,8 +337,24 @@ class OpenAIResponsesAdapter(ProtocolAdapter):
                     "output": str(content),
                 })
             elif role == "assistant":
-                item: dict[str, Any] = {"role": "assistant", "content": str(content)}
-                input_items.append(item)
+                continuation = msg.get(_CONTINUATION_KEY)
+                if (
+                    isinstance(continuation, dict)
+                    and continuation.get("protocol") == self.protocol_name
+                    and isinstance(continuation.get("output"), list)
+                ):
+                    input_items.extend(deepcopy(continuation["output"]))
+                    continue
+                if content:
+                    input_items.append({"role": "assistant", "content": str(content)})
+                for call in msg.get("tool_calls") or []:
+                    fn = call.get("function") or {}
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": call.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": _argument_string(fn.get("arguments", "{}")),
+                    })
             else:
                 input_items.append({"role": "user", "content": str(content)})
 
@@ -323,11 +375,12 @@ class OpenAIResponsesAdapter(ProtocolAdapter):
                 for t in tools
                 if (t.get("function") or {}).get("name")
             ]
-            if tool_choice and tool_choice != "auto":
-                if isinstance(tool_choice, dict):
-                    fn = (tool_choice.get("function") or {}).get("name")
-                    if fn:
-                        body["tool_choice"] = {"type": "function", "name": fn}
+            if tool_choice == "none":
+                body["tool_choice"] = "none"
+            elif isinstance(tool_choice, dict):
+                fn = (tool_choice.get("function") or {}).get("name")
+                if fn:
+                    body["tool_choice"] = {"type": "function", "name": fn}
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -336,17 +389,36 @@ class OpenAIResponsesAdapter(ProtocolAdapter):
         return RequestPayload(url=url, headers=headers, body=body)
 
     def parse_response(self, raw):
+        output = raw.get("output") or []
         content = raw.get("output_text", "") or ""
+        if not content:
+            text_parts: list[str] = []
+            for item in output:
+                if item.get("type") != "message":
+                    continue
+                for block in item.get("content") or []:
+                    if block.get("type") == "output_text":
+                        text_parts.append(block.get("text") or "")
+            content = "".join(text_parts)
         calls = []
-        for item in raw.get("output", []):
+        for item in output:
             if item.get("type") == "function_call":
                 calls.append(ToolCall(
                     id=item.get("call_id", ""),
                     name=item.get("name", ""),
-                    arguments=json.dumps(json.loads(item.get("arguments", "{}")), ensure_ascii=False)
-                    if isinstance(item.get("arguments"), str) else json.dumps(item.get("arguments", {}), ensure_ascii=False),
+                    arguments=_argument_string(item.get("arguments", "{}")),
                 ))
-        return LLMResponse(content=content, tool_calls=calls or None)
+        continuation = None
+        if output:
+            continuation = {
+                "protocol": self.protocol_name,
+                "output": deepcopy(output),
+            }
+        return LLMResponse(
+            content=content,
+            tool_calls=calls or None,
+            continuation=continuation,
+        )
 
     def extract_usage(self, raw):
         usage = raw.get("usage") or {}

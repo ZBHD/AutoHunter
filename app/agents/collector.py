@@ -28,8 +28,8 @@ from app.agents.prompts import is_enterprise_src
 from app.db.models import Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
 from app.tools.leakcreds import query_leaked_creds
-from app.llm.client import LLMClient, LLMError
-from app.settings_service import llm_client_for_task_optional, resolve_engine_config, resolve_skip_score_threshold
+from app.llm.router import AllProvidersExhaustedError, LLMRouter
+from app.settings_service import llm_router_for_task_optional, resolve_engine_config, resolve_skip_score_threshold
 
 _EDUSRC_ORG_FILTER = 'org="China Education and Research Network Center"'
 _PREFILTER_CONCURRENCY = int(os.environ.get("COLLECTOR_PREFILTER_CONCURRENCY", "12"))
@@ -222,11 +222,11 @@ def _is_cluster_deadish(t: Target) -> bool:
     return any(marker in reason for marker in ("无可利用", "无果", "自动收敛", "打不穿", "timeout", "超时"))
 
 
-def _llm_for_task(task: Task) -> LLMClient | None:
-    return llm_client_for_task_optional(task)
+def _llm_for_task(task: Task) -> LLMRouter | None:
+    return llm_router_for_task_optional(task)
 
 
-async def _resolve_query(task: Task, llm: LLMClient | None) -> tuple[str, str]:
+async def _resolve_query(task: Task, llm: LLMRouter | None) -> tuple[str, str]:
     """确定本轮 FOFA 语法。
     - intent_mode='syntax'：用户给的就是 FOFA 语法，直用。
     - intent_mode='intent' 或自然语言：LLM 翻译成语法并逐轮演化。
@@ -283,8 +283,8 @@ async def _resolve_query(task: Task, llm: LLMClient | None) -> tuple[str, str]:
             )
             if gen and gen["query"] and gen["query"] not in history:
                 return _apply_scope(gen["query"]), gen.get("reason", "LLM 生成")
-        except LLMError as e:
-            if e.kind == "quota":
+        except AllProvidersExhaustedError as e:
+            if e.failures and all(item.error.kind == "quota" for item in e.failures):
                 raise
             cfg["last_llm_error"] = str(e)[:300]
             task.fofa_config = cfg
@@ -847,7 +847,7 @@ async def _enrich_leaked_creds(survivors: list[dict]) -> None:
     await asyncio.gather(*[one(r, m) for r, m in roots.items()])
 
 
-async def _annotate_assets(assets: list[dict], llm: LLMClient | None, src_type: str) -> None:
+async def _annotate_assets(assets: list[dict], llm: LLMRouter | None, src_type: str) -> None:
     if is_enterprise_src(src_type):
         _annotate_enterprise(assets)
         return
@@ -861,7 +861,7 @@ def _annotate_enterprise(assets: list[dict]) -> None:
         a["school"] = (a.get("org") or a.get("title") or "").strip()[:200]
 
 
-async def _annotate_edu(assets: list[dict], llm: LLMClient | None) -> None:
+async def _annotate_edu(assets: list[dict], llm: LLMRouter | None) -> None:
     """给资产标 is_edu + 候选归属学校 school。规则能判的直接标，剩下的交 LLM 批量判。"""
     pending = []
     for a in assets:
@@ -886,8 +886,8 @@ async def _annotate_edu(assets: list[dict], llm: LLMClient | None) -> None:
                         a["school"] = v["school"]
                 else:
                     a["is_edu"] = None
-        except LLMError as e:
-            if e.kind == "quota":
+        except AllProvidersExhaustedError as e:
+            if e.failures and all(item.error.kind == "quota" for item in e.failures):
                 raise
         except Exception:
             pass

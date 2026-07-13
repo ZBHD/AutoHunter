@@ -17,11 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime import AGENT_EXECUTOR, agent_semaphore
 from app.agents.deepen import apply_deepen
-from app.settings_service import llm_client_for_task
+from app.settings_service import llm_router_for_task
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
 from app.events import bus
-from app.llm.client import LLMClient, LLMError
+from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.tools.executor import ToolExecutor
 
 
@@ -503,8 +503,18 @@ REPORT_ASSISTANT_TOOLS = [
 ]
 
 
-def _llm_for_task(task: Task) -> LLMClient:
-    return llm_client_for_task(task)
+def _llm_for_task(task: Task) -> LLMRouter:
+    return llm_router_for_task(task)
+
+
+def _report_assistant_llm(task: Task) -> LLMRouter:
+    try:
+        return _llm_for_task(task)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="报告助手暂不可用：请检查 LLM Provider 配置",
+        ) from exc
 
 
 def _assistant_context(f: Finding, r: Review | None) -> str:
@@ -658,15 +668,14 @@ def _build_assistant_messages(f: Finding, r: Review | None, req: ReportAssistant
 
 
 def _run_report_assistant(
+    llm: LLMRouter,
     f: Finding,
     r: Review | None,
-    task: Task,
     req: ReportAssistantRequest,
     cancel_event: threading.Event,
     emit=None,
 ) -> dict:
     """运行报告助手；emit(event:dict) 可选回调，每完成一步就推一条事件用于流式展示。"""
-    llm = _llm_for_task(task)
     executor = ToolExecutor(f"report_assistant_{f.target_url or f.id}", cancel_event=cancel_event)
     messages = _build_assistant_messages(f, r, req)
     tool_logs: list[dict] = []
@@ -685,7 +694,7 @@ def _run_report_assistant(
 
 
 def _run_report_assistant_loop(
-    llm: LLMClient,
+    llm: LLMRouter,
     executor: ToolExecutor,
     messages: list[dict],
     tool_logs: list[dict],
@@ -718,17 +727,7 @@ def _run_report_assistant_loop(
         if msg.content and msg.content.strip():
             emit({"type": "assistant_partial", "text": msg.content.strip()})
 
-        assistant_msg = {"role": "assistant", "content": msg.content or ""}
-        if tool_calls and not last_round:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                }
-                for tc in tool_calls
-            ]
-        messages.append(assistant_msg)
+        messages.append(msg.as_history_message())
 
         if not tool_calls or last_round:
             answer = (msg.content or "").strip()
@@ -757,15 +756,15 @@ def _run_report_assistant_loop(
             if cancel_event.is_set():
                 return {"answer": "报告助手操作已超时或被取消。", "tool_logs": tool_logs}
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(tc.arguments or "{}")
             except Exception:
                 args = {}
             emit({
                 "type": "tool_call",
-                "tool": tc.function.name,
-                "summary": _tool_call_summary(tc.function.name, args),
+                "tool": tc.name,
+                "summary": _tool_call_summary(tc.name, args),
             })
-            if tc.function.name == "http_request":
+            if tc.name == "http_request":
                 url = _clean_assistant_url(args.get("url") or "")
                 args["url"] = url
                 if not url:
@@ -777,7 +776,7 @@ def _run_report_assistant_loop(
                         json_body=args.get("json_body"), follow_redirects=args.get("follow_redirects", False),
                         timeout=20,
                     )
-            elif tc.function.name == "run_shell":
+            elif tc.name == "run_shell":
                 command = _clean_shell_command(args.get("command") or "")
                 args["command"] = command
                 timeout = _safe_timeout(args.get("timeout"), default=30, upper=90)
@@ -787,12 +786,12 @@ def _run_report_assistant_loop(
                 else:
                     result = executor.run_shell(command, timeout=timeout)
             else:
-                result = {"ok": False, "error": f"未知工具: {tc.function.name}"}
-            tool_logs.append({"tool": tc.function.name, "args": args, "result": result})
+                result = {"ok": False, "error": f"未知工具: {tc.name}"}
+            tool_logs.append({"tool": tc.name, "args": args, "result": result})
             emit({
                 "type": "tool_result",
-                "tool": tc.function.name,
-                "summary": _tool_result_summary(tc.function.name, result),
+                "tool": tc.name,
+                "summary": _tool_result_summary(tc.name, result),
             })
             messages.append({
                 "role": "tool",
@@ -840,6 +839,7 @@ async def report_assistant(finding_id: str, req: ReportAssistantRequest,
     llm_req = ReportAssistantRequest(message=msg, history=persisted[-_ASSISTANT_HISTORY_TURNS:])
 
     loop = asyncio.get_running_loop()
+    llm = _report_assistant_llm(task)
     tool_logs = []
     cancel_event = threading.Event()
     # 并发信号量：报告助手与 worker/reviewer/killsweep 共用 AGENT_EXECUTOR，
@@ -848,7 +848,7 @@ async def report_assistant(finding_id: str, req: ReportAssistantRequest,
     await assistant_sem.acquire()
     try:
         future = loop.run_in_executor(
-            AGENT_EXECUTOR, lambda: _run_report_assistant(f, r, task, llm_req, cancel_event),
+            AGENT_EXECUTOR, lambda: _run_report_assistant(llm, f, r, llm_req, cancel_event),
         )
     except BaseException:
         assistant_sem.release()
@@ -868,7 +868,7 @@ async def report_assistant(finding_id: str, req: ReportAssistantRequest,
         cancel_event.set()
         future.add_done_callback(_consume_future_exception)
         assistant_content = f"报告助手执行超时（>{int(_ASSISTANT_WALL_TIMEOUT)}s），已触发底层工具清理。"
-    except LLMError as e:
+    except AllProvidersExhaustedError as e:
         assistant_content = f"报告助手暂不可用：{e}"
     except Exception:
         assistant_content = "报告助手暂不可用：内部执行异常，已保护底层错误细节。"
@@ -908,6 +908,7 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
     llm_req = ReportAssistantRequest(message=msg, history=persisted[-_ASSISTANT_HISTORY_TURNS:])
 
     loop = asyncio.get_running_loop()
+    llm = _report_assistant_llm(task)
     queue: asyncio.Queue = asyncio.Queue()
     cancel_event = threading.Event()
 
@@ -921,7 +922,7 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
         try:
             future = loop.run_in_executor(
                 AGENT_EXECUTOR,
-                lambda: _run_report_assistant(f, r, task, llm_req, cancel_event, emit=_emit),
+                lambda: _run_report_assistant(llm, f, r, llm_req, cancel_event, emit=_emit),
             )
         except BaseException:
             assistant_sem.release()
@@ -937,6 +938,7 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
         final_answer = ""
         tool_count = 0
         timed_out = False
+        execution_error = ""
         try:
             yield _sse({"type": "start"})
             while True:
@@ -959,8 +961,16 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
                 result = await asyncio.wait_for(asyncio.shield(future), timeout=5)
                 final_answer = result.get("answer") or final_answer
                 tool_count = len(result.get("tool_logs") or []) or tool_count
+            except asyncio.TimeoutError:
+                if not timed_out:
+                    execution_error = "报告助手暂不可用：内部执行超时。"
+                    final_answer = execution_error
+            except AllProvidersExhaustedError as exc:
+                execution_error = f"报告助手暂不可用：{exc}"
+                final_answer = execution_error
             except Exception:
-                pass
+                execution_error = "报告助手暂不可用：内部执行异常，已保护底层错误细节。"
+                final_answer = execution_error
             if timed_out and not final_answer:
                 final_answer = f"报告助手执行超时（>{int(_ASSISTANT_WALL_TIMEOUT)}s），已触发底层工具清理。"
             if not final_answer:
@@ -977,6 +987,9 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
                 await session.commit()
             except Exception:
                 await session.rollback()
+            if execution_error:
+                yield _sse({"type": "error", "text": execution_error})
+                yield _sse({"type": "final", "text": execution_error})
             yield _sse({"type": "done", "answer": stored, "tool_count": tool_count})
 
     return StreamingResponse(
