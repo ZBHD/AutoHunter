@@ -9,6 +9,7 @@ PORT="${AUTOHUNTER_HOST_PORT:-$(grep -E '^AUTOHUNTER_HOST_PORT=' .env 2>/dev/nul
 [ -n "$PORT" ] || PORT="18800"
 HEALTH_URL="${AUTOHUNTER_HEALTH_URL:-http://127.0.0.1:${PORT}/health}"
 IMAGE_TAG="${IMAGE_TAG:-autohunter:latest}"
+SOURCE_BUNDLE="${SOURCE_BUNDLE:-}"
 
 cd "$ROOT_DIR"
 
@@ -17,8 +18,17 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-git fetch origin main
-git pull --ff-only origin main
+if [ -n "$SOURCE_BUNDLE" ]; then
+  git fetch "$SOURCE_BUNDLE" main
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    git reset --ff-only FETCH_HEAD
+  else
+    git checkout -B main FETCH_HEAD
+  fi
+else
+  git fetch origin main
+  git pull --ff-only origin main
+fi
 docker compose -f "$COMPOSE_FILE" config --quiet
 
 PREVIOUS_IMAGE_ID="$(docker inspect "$SERVICE" --format '{{.Image}}' 2>/dev/null || true)"
