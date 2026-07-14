@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+from copy import copy
 from pathlib import Path
 from typing import Any, BinaryIO, Optional
 
@@ -206,6 +207,7 @@ class ToolExecutor:
         # 每个 target 独立 executor 实例、session jar 相互隔离，不会串号。
         # 全模式启用（登录后同样必须带登录态深入）。
         self._session_cookies: dict[str, str] = {}
+        self._session_cookie_jar = httpx.Cookies()
         self._session_headers: dict[str, str] = {}
 
     def _new_capture(self, tool: str) -> Optional[_CaptureSpool]:
@@ -398,10 +400,10 @@ class ToolExecutor:
         supplied = _normalize_headers(values.get("headers"))
         merged = dict(self._session_headers)
         merged.update(supplied)
-        if self._session_cookies and not any(key.lower() == "cookie" for key in merged):
-            merged["Cookie"] = "; ".join(
-                f"{name}={value}" for name, value in self._session_cookies.items()
-            )
+        cookie_url = str(values.get("url") or values.get("target") or self.target)
+        cookie_header = self._session_cookie_header(cookie_url)
+        if cookie_header and not any(key.lower() == "cookie" for key in merged):
+            merged["Cookie"] = cookie_header
         if merged:
             values["headers"] = merged
         return values
@@ -545,13 +547,18 @@ class ToolExecutor:
         # 这里统一规范化成 dict，容错所有 agent 的 http_request 调用。
         headers = _normalize_headers(headers)
         # 会话保持：把已维持的 cookie/header 合并进本次请求（用户传的同名键优先）。
-        merged_headers, session_applied = self._apply_session(headers)
+        merged_headers, session_applied = self._apply_session(headers, url)
 
         capture = self._new_capture("http_request")
         req: httpx.Request | None = None
         resp: httpx.Response | None = None
         try:
-            with httpx.Client(verify=False, follow_redirects=follow_redirects, timeout=timeout) as client:
+            with httpx.Client(
+                verify=False,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                cookies=self._session_cookie_jar,
+            ) as client:
                 req = client.build_request(
                     method.upper(), url, headers=merged_headers, content=data, json=json_body
                 )
@@ -562,6 +569,7 @@ class ToolExecutor:
                 if response_capture is not None:
                     response_capture.write(self._raw_response_head(resp))
                 body, truncated = self._read_limited_response(resp, response_capture)
+                session_updated = self._absorb_cookie_jar(client)
         except Exception as e:
             result: dict[str, Any] = {
                 "ok": False,
@@ -577,9 +585,6 @@ class ToolExecutor:
             return result
 
         assert resp is not None
-
-        # 自动吸收响应 Set-Cookie，后续请求自动续上登录态（全模式）。
-        session_updated = self._absorb_set_cookie(resp)
 
         # 原始请求行（取证/格式参考）。响应报文不再单独回传：状态码 + response_headers +
         # body 已结构化提供，raw_response 会与它们 100% 重复，是当轮就纯冗余的双份大文本。
@@ -600,6 +605,13 @@ class ToolExecutor:
         }
         if set_cookie_headers:
             result["set_cookie_headers"] = set_cookie_headers
+        history = list(resp.history or [])
+        if history:
+            result["redirect_chain"] = [
+                f"{item.status_code} {item.request.method} {item.url}" for item in history
+            ] + [f"{resp.status_code} {resp.request.method} {resp.url}"]
+            result["redirect_chain"] = result["redirect_chain"][:12]
+            result["final_url"] = str(resp.url)
         if session_applied:
             result["session_applied"] = session_applied
         if session_updated:
@@ -616,23 +628,49 @@ class ToolExecutor:
         return result
 
     # ---- 会话状态管理（全模式）----
-    def _apply_session(self, headers: Optional[dict[str, str]]) -> tuple[dict[str, str], list[str]]:
+    def _session_cookie_header(self, url: str) -> str:
+        """返回仅适用于当前 URL 的自动 Cookie，并叠加 session_set 的显式 Cookie。"""
+        scoped_parts: list[str] = []
+        try:
+            cookie_url = str(url or self.target).strip()
+            if "://" not in cookie_url:
+                cookie_url = f"https://{cookie_url.lstrip('/')}"
+            request = httpx.Request("GET", cookie_url)
+            self._session_cookie_jar.set_cookie_header(request)
+            scoped_parts = [
+                part.strip() for part in request.headers.get("cookie", "").split(";") if part.strip()
+            ]
+        except Exception:
+            scoped_parts = []
+
+        manual_names = set(self._session_cookies)
+        filtered = [
+            part for part in scoped_parts if part.split("=", 1)[0].strip() not in manual_names
+        ]
+        filtered.extend(f"{name}={value}" for name, value in self._session_cookies.items())
+        return "; ".join(filtered)
+
+    def _apply_session(
+        self,
+        headers: Optional[dict[str, str]],
+        url: str = "",
+    ) -> tuple[dict[str, str], list[str]]:
         """把维持的 session cookie/header 合并进请求头。返回 (合并后headers, 应用了哪些)。
 
         合并规则：用户本次显式传入的头优先（不被 session 覆盖），保证可手动覆写。
         会话为空时原样返回、零开销；全模式启用。
         """
-        if not self._session_cookies and not self._session_headers:
+        if not self._session_cookies and not self._session_cookie_jar.jar and not self._session_headers:
             return (dict(headers) if headers else {}), []
         try:
             merged: dict[str, str] = {}
             applied: list[str] = []
             for k, v in self._session_headers.items():
                 merged[k] = v
-            if self._session_cookies:
-                cookie_str = "; ".join(f"{k}={v}" for k, v in self._session_cookies.items())
-                merged["Cookie"] = cookie_str
-                applied.append(f"Cookie({len(self._session_cookies)})")
+            cookie_header = self._session_cookie_header(url or self.target)
+            if cookie_header:
+                merged["Cookie"] = cookie_header
+                applied.append(f"Cookie({len(cookie_header.split(';'))})")
             if self._session_headers:
                 applied.append(f"headers({len(self._session_headers)})")
             # 用户本次传入的头覆盖 session（显式优先）。
@@ -643,18 +681,28 @@ class ToolExecutor:
         except Exception:
             return (dict(headers) if headers else {}), []
 
-    def _absorb_set_cookie(self, resp: httpx.Response) -> list[str]:
-        """从响应吸收 Set-Cookie 进 session jar（带数量上限防爆内存）。"""
+    @staticmethod
+    def _cookie_jar_state(cookies: httpx.Cookies) -> dict[tuple[str, str, str], str]:
+        return {
+            (cookie.name, cookie.domain or "", cookie.path or "/"): cookie.value
+            for cookie in cookies.jar
+        }
+
+    def _absorb_cookie_jar(self, client: httpx.Client) -> list[str]:
+        """持久化整个 Client jar，保留重定向链中 Cookie 的 domain/path 作用域。"""
         try:
-            updated: list[str] = []
-            for name, value in resp.cookies.items():
-                if name in self._session_cookies:
-                    self._session_cookies[name] = value
-                    updated.append(name)
-                elif len(self._session_cookies) < _SESSION_MAX_COOKIES:
-                    self._session_cookies[name] = value
-                    updated.append(name)
-            return updated
+            previous = self._cookie_jar_state(self._session_cookie_jar)
+            persisted = httpx.Cookies()
+            for cookie in client.cookies.jar:
+                if len(persisted.jar) >= _SESSION_MAX_COOKIES:
+                    break
+                persisted.jar.set_cookie(copy(cookie))
+            current = self._cookie_jar_state(persisted)
+            self._session_cookie_jar = persisted
+            changed_keys = {
+                key for key in previous.keys() | current.keys() if previous.get(key) != current.get(key)
+            }
+            return sorted({key[0] for key in changed_keys})
         except Exception:
             return []
 
@@ -668,6 +716,7 @@ class ToolExecutor:
         try:
             if clear:
                 self._session_cookies.clear()
+                self._session_cookie_jar.clear()
                 self._session_headers.clear()
             if isinstance(cookies, dict):
                 for k, v in cookies.items():
@@ -683,7 +732,10 @@ class ToolExecutor:
                         self._session_headers[k] = str(v)[:4096]
             return {
                 "ok": True,
-                "active_cookies": sorted(self._session_cookies.keys()),
+                "active_cookies": sorted(
+                    set(self._session_cookies)
+                    | {cookie.name for cookie in self._session_cookie_jar.jar}
+                ),
                 "active_headers": sorted(self._session_headers.keys()),
                 "guidance": "已更新会话态，后续 http_request 会自动携带；继续以此据点深挖受限接口。",
             }
