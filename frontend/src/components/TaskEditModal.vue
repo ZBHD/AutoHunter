@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
+import VulnerabilityTypeSelector from "./VulnerabilityTypeSelector.vue";
 
 const props = defineProps({
   open: Boolean,
@@ -48,7 +49,7 @@ async function loadModels() {
 const form = reactive({
   name: "",
   src_type: "edusrc",
-  vuln_types: "",
+  vuln_types: [],
   hunt_direction: "",
   target_source: "fofa",
   engine: "",
@@ -88,7 +89,7 @@ function fill(task) {
   const fofaCfg = task.fofa_config || {};
   form.name = task.name || "";
   form.src_type = task.src_type || "edusrc";
-  form.vuln_types = (task.vuln_types || []).join(",");
+  form.vuln_types = [...(task.vuln_types || [])];
   form.hunt_direction = task.hunt_direction || "";
   form.target_source = task.target_source || "fofa";
   form.engine = task.engine || "";
@@ -153,7 +154,7 @@ async function save() {
   const updated = await api.updateTask(props.task.id, {
     name: form.name,
     src_type: form.src_type,
-    vuln_types: form.vuln_types.split(",").map((s) => s.trim()).filter(Boolean),
+    vuln_types: [...form.vuln_types],
     hunt_direction: form.hunt_direction.trim(),
     target_source: form.target_source,
     engine: form.engine,
@@ -216,7 +217,7 @@ async function save() {
         </label>
       </div>
 
-      <label>漏洞类型（逗号分隔） <input v-model="form.vuln_types" /></label>
+      <VulnerabilityTypeSelector v-model="form.vuln_types" />
       <label>指定挖掘方向（可选）
         <textarea v-model="form.hunt_direction" rows="3" maxlength="2000"
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>

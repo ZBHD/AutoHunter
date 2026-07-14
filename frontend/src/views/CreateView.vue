@@ -2,13 +2,15 @@
 import { computed, reactive, ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "../api.js";
+import VulnerabilityTypeSelector from "../components/VulnerabilityTypeSelector.vue";
+import { defaultVulnerabilityTypes } from "../vulnerabilityTypes.js";
 
 const router = useRouter();
 const adv = ref(false);
 const form = reactive({
   name: "",
   src_type: "edusrc",
-  vuln_types: "sql_injection,rce,unauthorized_access,idor,file_upload,captcha_bypass",
+  vuln_types: defaultVulnerabilityTypes(),
   hunt_direction: "",
   target_source: "fofa",
   engine: "",
@@ -52,7 +54,7 @@ async function submit() {
   const body = {
     name: form.name,
     src_type: form.src_type,
-    vuln_types: form.vuln_types.split(",").map((s) => s.trim()).filter(Boolean),
+    vuln_types: [...form.vuln_types],
     hunt_direction: form.hunt_direction.trim(),
     target_source: form.target_source,
     engine: form.engine,
@@ -102,7 +104,7 @@ onMounted(async () => {
           <option value="enterprise">企业SRC（企业资产/业务口径）</option>
         </select>
       </label>
-      <label>漏洞类型（逗号分隔） <input v-model="form.vuln_types" /></label>
+      <VulnerabilityTypeSelector v-model="form.vuln_types" />
       <label>指定挖掘方向（可选）
         <textarea v-model="form.hunt_direction" rows="3" maxlength="2000"
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
