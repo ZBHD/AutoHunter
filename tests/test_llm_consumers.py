@@ -30,6 +30,25 @@ class RecordingBackend:
         return response
 
 
+def _capture_first_worker_messages(monkeypatch, **worker_kwargs):
+    class FakeExecutor:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(worker_module, "ToolExecutor", FakeExecutor)
+    backend = RecordingBackend([RuntimeError("stop after first message capture")])
+    worker = worker_module.Worker(
+        "https://example.test",
+        llm=backend,
+        **worker_kwargs,
+    )
+
+    worker.run()
+
+    assert len(backend.calls) == 1
+    return backend.calls[0]["messages"]
+
+
 def test_collector_reads_normalized_tool_arguments_and_uses_auto_choice() -> None:
     backend = RecordingBackend([
         LLMResponse(tool_calls=[
@@ -68,6 +87,56 @@ def test_worker_preserves_response_continuation_in_next_round(monkeypatch) -> No
 
     assert len(backend.calls) == 2
     assert first.as_history_message() in backend.calls[1]["messages"]
+
+
+def test_worker_places_hunt_direction_once_in_task_user_message(monkeypatch) -> None:
+    direction = "优先测试后台 API 的对象级越权"
+
+    directed = _capture_first_worker_messages(
+        monkeypatch,
+        hunt_direction=direction,
+    )
+    undirected = _capture_first_worker_messages(monkeypatch)
+
+    task_message = directed[2]["content"]
+    assert task_message.count("# 用户指定的任务挖掘方向") == 1
+    assert task_message.count(direction) == 1
+    assert "不得因此降低证据标准、越出授权范围" in task_message
+    assert directed[0] == undirected[0]
+    assert "# 用户指定的任务挖掘方向" not in undirected[2]["content"]
+
+
+def test_worker_keeps_target_level_direction_ahead_of_task_direction(monkeypatch) -> None:
+    messages = _capture_first_worker_messages(
+        monkeypatch,
+        hunt_direction="任务级方向 sentinel-task-direction",
+        deepen_context={
+            "directive": "目标级指令 sentinel-deepen-directive",
+            "original_title": "待打穿线索",
+        },
+        target_meta={
+            "source": "site-api",
+            "site_collab_block": "目标级协作路线 sentinel-site-route\n\n",
+        },
+    )
+
+    task_message = messages[2]["content"]
+    direction_index = task_message.index("# 用户指定的任务挖掘方向")
+    assert task_message.index("sentinel-site-route") < direction_index
+    assert task_message.index("sentinel-deepen-directive") < direction_index
+    assert "以更具体的目标级指令为先" in task_message
+
+
+def test_non_worker_agents_do_not_reference_task_hunt_direction() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for relative in (
+        "app/agents/collector.py",
+        "app/agents/reviewer.py",
+        "app/agents/escalate.py",
+        "app/agents/killsweep.py",
+    ):
+        source = (root / relative).read_text(encoding="utf-8")
+        assert "hunt_direction" not in source, relative
 
 
 def test_reviewer_answers_every_declared_tool_call_before_retrying() -> None:

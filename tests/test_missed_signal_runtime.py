@@ -526,6 +526,107 @@ def test_stop_waits_when_worker_is_draining_private_persistence(
     _run(scenario())
 
 
+def test_later_worker_dispatch_reads_updated_task_hunt_direction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from app import orchestrator
+
+    captured_directions: list[str] = []
+
+    class ImmediateWorkerSlot:
+        async def acquire(self):
+            return None
+
+        def release(self):
+            return None
+
+    class FakeExecutor:
+        def kill_processes(self):
+            return None
+
+    class FakeWorker:
+        def __init__(self, *_args, hunt_direction, **_kwargs):
+            captured_directions.append(hunt_direction)
+            self.executor = FakeExecutor()
+
+        def run(self):
+            return SimpleNamespace(model_dump=lambda mode="json": {
+                "verdict": "no_vuln",
+                "findings": [],
+                "summary": "captured task direction",
+            })
+
+    async def scenario():
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'direction-worker.db'}")
+        sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(Task(
+                id="task-direction",
+                name="Direction",
+                status="running",
+                hunt_direction="第一轮方向",
+            ))
+            session.add_all([
+                Target(
+                    id="target-direction-1",
+                    task_id="task-direction",
+                    url="https://one.example.test",
+                    host="one.example.test",
+                    source="manual",
+                    status="assigned",
+                ),
+                Target(
+                    id="target-direction-2",
+                    task_id="task-direction",
+                    url="https://two.example.test",
+                    host="two.example.test",
+                    source="manual",
+                    status="assigned",
+                ),
+            ])
+            await session.commit()
+
+        monkeypatch.setattr(orchestrator, "SessionLocal", sessions)
+        monkeypatch.setattr(orchestrator, "Worker", FakeWorker)
+        monkeypatch.setattr(orchestrator, "agent_semaphore", lambda _kind: ImmediateWorkerSlot())
+        monkeypatch.setattr(orchestrator, "_llm_for_task", lambda _task: object())
+        runner = orchestrator.TaskRunner("task-direction")
+
+        async def no_heartbeat(_target_id):
+            await asyncio.sleep(3600)
+
+        async def no_persist(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(runner, "_heartbeat_target", no_heartbeat)
+        monkeypatch.setattr(runner, "_persist_worker_result", no_persist)
+
+        await runner._run_worker(
+            "task-direction",
+            "target-direction-1",
+            "https://one.example.test",
+            threading.Event(),
+        )
+        async with sessions() as session:
+            task = await session.get(Task, "task-direction")
+            task.hunt_direction = "第二轮更新方向"
+            await session.commit()
+        await runner._run_worker(
+            "task-direction",
+            "target-direction-2",
+            "https://two.example.test",
+            threading.Event(),
+        )
+
+        assert captured_directions == ["第一轮方向", "第二轮更新方向"]
+        await engine.dispose()
+
+    _run(scenario())
+
+
 def test_stop_waits_for_worker_that_outlives_its_timeout_cleanup_window(
     tmp_path,
     monkeypatch,

@@ -1695,6 +1695,7 @@ class TaskRunner:
         target_meta: dict = {}
         duplicate_history: list[dict] = []
         src_type = "edusrc"
+        hunt_direction = ""
         fofa_key = ""
         fofa_base_url = ""
         async with SessionLocal() as session:
@@ -1702,6 +1703,7 @@ class TaskRunner:
             task_obj = await session.get(Task, task_id)
             if task_obj:
                 src_type = task_obj.src_type or "edusrc"
+                hunt_direction = (task_obj.hunt_direction or "").strip()
                 fofa_key = resolve_fofa_key(task_obj)
                 fofa_base_url = resolve_fofa_base_url(task_obj)
             if tgt:
@@ -1777,7 +1779,8 @@ class TaskRunner:
 
         def do_work() -> dict:
             worker = Worker(url, llm=llm, on_event=emit,
-                            deepen_context=deepen_context, target_meta=target_meta,
+                            deepen_context=deepen_context, hunt_direction=hunt_direction,
+                            target_meta=target_meta,
                             duplicate_history=duplicate_history,
                             cancel_event=cancel_event, src_type=src_type,
                             fofa_key=fofa_key, fofa_base_url=fofa_base_url,

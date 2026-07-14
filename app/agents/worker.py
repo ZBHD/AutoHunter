@@ -48,6 +48,7 @@ class Worker:
         llm: LLMRouter,
         on_event: Optional[Callable[[str, dict], None]] = None,
         deepen_context: Optional[dict] = None,
+        hunt_direction: str = "",
         target_meta: Optional[dict] = None,
         duplicate_history: Optional[list[dict]] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -72,6 +73,8 @@ class Worker:
         self._finished: Optional[dict] = None
         # 审核打回的定向深挖任务：{directive, vuln_type, original_title, original_summary}
         self.deepen_context = deepen_context or None
+        # 任务级挖掘偏好：只作为当前 Worker 的启动快照，不改变授权/审核边界。
+        self.hunt_direction = str(hunt_direction or "").strip()
         # 资产情报：候选归属学校/org/title，供 worker 核实并写进报告 owner
         self.target_meta = target_meta or {}
         # 同一 target 历史已提交漏洞摘要，用于 worker 提交前查重（superseded 不传入）
@@ -187,15 +190,33 @@ class Worker:
             lines.append(f"- 其余 {len(self.duplicate_history) - 6} 条仅在后台查重池中。")
         return "\n".join(lines) + "\n\n"
 
+    def _hunt_direction_block(self) -> str:
+        direction = self.hunt_direction
+        if not direction:
+            return ""
+        return (
+            "# 用户指定的任务挖掘方向\n"
+            f"{direction}\n\n"
+            "正常挖掘时优先并深入覆盖此方向；它不预设漏洞一定存在。\n"
+            "若当前目标带有定向回炉或单站协作路线，以更具体的目标级指令为先。\n"
+            "不得因此降低证据标准、越出授权范围或忽略明显的高价值实证。\n\n"
+        )
+
     def run(self) -> WorkerResult:
         if self.deepen_context:
-            user_content = self._intel_block() + self._duplicate_block() + self._deepen_brief()
+            user_content = (
+                self._intel_block()
+                + self._duplicate_block()
+                + self._deepen_brief()
+                + self._hunt_direction_block()
+            )
             self._emit("worker_start", target=self.target, mode="deepen", prompt_version=self.prompt_version)
         else:
             user_content = (
                 self._intel_block()
                 + self._duplicate_block()
                 + f"目标：{self.target}\n\n"
+                + self._hunt_direction_block()
                 + "只挖此目标；自主侦察取证，结束调用 finish。"
             )
             self._emit("worker_start", target=self.target, prompt_version=self.prompt_version)
