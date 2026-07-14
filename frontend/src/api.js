@@ -219,6 +219,11 @@ export const api = {
     req("GET", `/api/tasks/${id}/targets${qs({ status: "terminal", compact: true, ...opts })}`),
   targetDetail: (taskId, targetId) =>
     req("GET", `/api/tasks/${taskId}/targets/${targetId}`),
+  queuedTargets: (id) => req("GET", `/api/tasks/${id}/queue-targets`),
+  orderQueuedTargets: (id, targetIds) =>
+    req("PUT", `/api/tasks/${id}/queue-targets/order`, { target_ids: targetIds }),
+  deleteQueuedTarget: (taskId, targetId) =>
+    req("DELETE", `/api/tasks/${taskId}/queue-targets/${targetId}`),
   rawFindings: (id, opts = {}) =>
     req("GET", `/api/tasks/${id}/findings${qs({ compact: true, ...opts })}`),
   hardTargets: (status, q, opts = {}) => req("GET", `/api/tasks/hard-targets${qs({ status, q, ...opts })}`),

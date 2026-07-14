@@ -43,6 +43,18 @@ def operations_api(tmp_path):
                     id="target-active", task_id="task-ops", url="https://active.example",
                     host="active.example", source="fofa", status="scanning",
                 ),
+                Target(
+                    id="target-queue-high", task_id="task-ops", url="https://high.example",
+                    host="high.example", source="fofa", status="queued", priority_score=90,
+                ),
+                Target(
+                    id="target-queue-low", task_id="task-ops", url="https://low.example",
+                    host="low.example", source="fofa", status="queued", priority_score=10,
+                ),
+                Target(
+                    id="target-queue-manual", task_id="task-ops", url="https://manual.example",
+                    host="manual.example", source="manual", status="queued", priority_score=100,
+                ),
             ])
             session.add_all([
                 Finding(
@@ -116,6 +128,63 @@ def test_target_detail_includes_related_current_findings(operations_api: TestCli
     assert payload["id"] == "target-done"
     assert [item["id"] for item in payload["findings"]] == ["finding-current"]
     assert "raw_response" not in payload["findings"][0]
+
+
+def test_queued_search_targets_are_listed_in_dispatch_order(operations_api: TestClient) -> None:
+    response = operations_api.get("/api/tasks/task-ops/queue-targets")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 2
+    assert [item["id"] for item in payload["items"]] == [
+        "target-queue-high",
+        "target-queue-low",
+    ]
+    assert payload["items"][0]["queue_position"] is None
+
+
+def test_queue_order_is_persisted_and_requires_a_fresh_complete_snapshot(
+    operations_api: TestClient,
+) -> None:
+    reordered = operations_api.put(
+        "/api/tasks/task-ops/queue-targets/order",
+        json={"target_ids": ["target-queue-low", "target-queue-high"]},
+    )
+
+    assert reordered.status_code == 200
+    assert [item["id"] for item in reordered.json()["items"]] == [
+        "target-queue-low",
+        "target-queue-high",
+    ]
+    assert [item["queue_position"] for item in reordered.json()["items"]] == [1, 2]
+
+    stale = operations_api.put(
+        "/api/tasks/task-ops/queue-targets/order",
+        json={"target_ids": ["target-queue-low"]},
+    )
+    assert stale.status_code == 409
+
+
+def test_deleting_a_queued_search_target_tombstones_it_and_rejects_claimed_targets(
+    operations_api: TestClient,
+) -> None:
+    deleted = operations_api.delete(
+        "/api/tasks/task-ops/queue-targets/target-queue-low"
+    )
+    assert deleted.status_code == 204
+
+    queue = operations_api.get("/api/tasks/task-ops/queue-targets")
+    assert [item["id"] for item in queue.json()["items"]] == ["target-queue-high"]
+
+    removed = operations_api.get(
+        "/api/tasks/task-ops/targets", params={"status": "removed", "compact": "true"}
+    )
+    assert [item["id"] for item in removed.json()["items"]] == ["target-queue-low"]
+
+    claimed = operations_api.delete(
+        "/api/tasks/task-ops/queue-targets/target-active"
+    )
+    assert claimed.status_code == 409
 
 
 def test_compact_raw_findings_exclude_superseded_and_omit_large_evidence(

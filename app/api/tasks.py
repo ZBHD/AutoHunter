@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import case, delete, func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dto import CreateTaskRequest, TaskResponse, TaskStats, UpdateTaskRequest
+from app.api.dto import (
+    CreateTaskRequest, QueueOrderRequest, TaskResponse, TaskStats, UpdateTaskRequest,
+)
 from app.agents import site_collab
 from app.agents.prompts import normalize_src_type
 from app.db.models import (
@@ -18,6 +20,7 @@ from app.db.models import (
 from app.db.session import get_session
 from app.llm.usage import usage_snapshot
 from app.orchestrator import manager
+from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import CaptureCleanupError, cleanup_evidence_spool
 from app.security import resolve_role, token_from_headers
 from app.settings_service import (
@@ -689,7 +692,8 @@ def _target_dict(t: Target, observer: bool, finding_count: int = 0) -> dict:
         "source": t.source,
         "status": t.status, "verdict": t.verdict,
         "is_edu": t.is_edu, "priority_score": t.priority_score,
-        "priority_reason": "" if observer else t.priority_reason, "retry_count": t.retry_count,
+        "priority_reason": "" if observer else t.priority_reason,
+        "queue_position": t.queue_position, "retry_count": t.retry_count,
         "deepen_count": t.deepen_count, "dead_reason": "" if observer else t.dead_reason,
         "last_error": "" if observer else t.last_error,
         "finding_count": finding_count,
@@ -738,6 +742,105 @@ async def list_targets(task_id: str, request: Request, status: str | None = None
             "has_more": offset + len(items) < total,
         }
     return items
+
+
+async def _queued_search_targets(session: AsyncSession, task_id: str) -> list[Target]:
+    return list((await session.scalars(
+        select(Target).where(
+            Target.task_id == task_id,
+            Target.source == "fofa",
+            Target.status == "queued",
+        ).order_by(*queue_dispatch_order())
+    )).all())
+
+
+def _queue_payload(rows: list[Target], observer: bool = False) -> dict:
+    return {
+        "items": [_target_dict(target, observer) for target in rows],
+        "total": len(rows),
+    }
+
+
+@router.get("/{task_id}/queue-targets")
+async def list_queue_targets(
+    task_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    if await session.get(Task, task_id) is None:
+        raise HTTPException(404, "任务不存在")
+    rows = await _queued_search_targets(session, task_id)
+    return _queue_payload(rows, _is_observer(request))
+
+
+@router.put("/{task_id}/queue-targets/order")
+async def order_queue_targets(
+    task_id: str,
+    req: QueueOrderRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    if await session.get(Task, task_id) is None:
+        raise HTTPException(404, "任务不存在")
+    rows = await _queued_search_targets(session, task_id)
+    current_ids = [target.id for target in rows]
+    if len(req.target_ids) != len(current_ids) or set(req.target_ids) != set(current_ids):
+        raise HTTPException(409, "队列已变化，请刷新后重试")
+
+    for position, target_id in enumerate(req.target_ids, start=1):
+        result = await session.execute(
+            update(Target)
+            .where(
+                Target.id == target_id,
+                Target.task_id == task_id,
+                Target.source == "fofa",
+                Target.status == "queued",
+            )
+            .values(queue_position=position)
+        )
+        if result.rowcount != 1:
+            await session.rollback()
+            raise HTTPException(409, "队列已变化，请刷新后重试")
+    await session.commit()
+    manager.invalidate_queue(task_id)
+    return _queue_payload(await _queued_search_targets(session, task_id))
+
+
+@router.delete("/{task_id}/queue-targets/{target_id}", status_code=204)
+async def delete_queue_target(
+    task_id: str,
+    target_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    target = await session.get(Target, target_id)
+    if target is None or target.task_id != task_id or target.source != "fofa":
+        raise HTTPException(404, "队列目标不存在")
+    if target.status != "queued":
+        raise HTTPException(409, "目标已被领取，不再允许删除")
+
+    result = await session.execute(
+        update(Target)
+        .where(
+            Target.id == target_id,
+            Target.task_id == task_id,
+            Target.source == "fofa",
+            Target.status == "queued",
+        )
+        .values(
+            status="removed",
+            verdict="removed_by_user",
+            queue_position=None,
+            assigned_worker="",
+            heartbeat_at=None,
+            last_error="",
+            dead_reason="人工从队列删除",
+        )
+    )
+    if result.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(409, "目标已被领取，不再允许删除")
+    await session.commit()
+    manager.invalidate_queue(task_id)
+    return Response(status_code=204)
 
 
 @router.get("/{task_id}/targets/{target_id}")

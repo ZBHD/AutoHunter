@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,6 +69,7 @@ from app.missed_signals import (
     register_signal_evidence,
     upsert_signal,
 )
+from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import import_capture
 
 logger = logging.getLogger("autohunter.orchestrator")
@@ -429,6 +430,10 @@ class TaskRunner:
         self._queue_liveness_ok_until: dict[str, float] = {}
         # 5xx 等临时预筛失败不进终态 skipped，只做短冷却，稍后再探。
         self._queue_prefilter_retry_after: dict[str, float] = {}
+        self._queue_revision = 0
+
+    def invalidate_queue(self) -> None:
+        self._queue_revision += 1
 
     def live_workers(self) -> list[dict]:
         return list(self._live.values())
@@ -690,6 +695,7 @@ class TaskRunner:
         )).scalar() or 0
 
     async def _pop_queued(self, session: AsyncSession) -> Target | None:
+        queue_revision = self._queue_revision
         # 按 EduSRC 优先级评分降序派发：高价值目标先挖。
         # 多取一批是为了遇到同款系统正在跑/已冷却时，能跳到其它 cluster。
         loop = asyncio.get_running_loop()
@@ -700,10 +706,11 @@ class TaskRunner:
             }
         candidates = (await session.execute(
             select(Target).where(Target.task_id == self.task_id, Target.status == "queued")
-            .order_by(Target.priority_score.desc(), Target.created_at).limit(QUEUE_DISPATCH_CANDIDATE_LIMIT)
+            .order_by(*queue_dispatch_order()).limit(QUEUE_DISPATCH_CANDIDATE_LIMIT)
         )).scalars().all()
         if not candidates:
             return None
+        candidate_positions = {target.id: target.queue_position for target in candidates}
 
         all_targets = (await session.execute(
             select(Target).where(
@@ -766,6 +773,9 @@ class TaskRunner:
         for i in range(0, len(eligible), QUEUE_LIVENESS_BATCH_SIZE):
             batch = eligible[i:i + QUEUE_LIVENESS_BATCH_SIZE]
             liveness = await self._probe_queued_liveness(batch)
+            if queue_revision != self._queue_revision:
+                await session.rollback()
+                return None
             for target in batch:
                 probe = liveness.get(target.id) or {"alive": False}
                 if not probe.get("alive"):
@@ -810,15 +820,38 @@ class TaskRunner:
         if selected:
             target, probe = selected
             self._queue_prefilter_retry_after.pop(target.id, None)
-            target.status = "assigned"
-            target.assigned_worker = f"w-{target.id[:8]}"
-            target.heartbeat_at = _now()
-            target.dead_reason = ""
-            target.last_error = ""
             alive_url = probe.get("url") or ""
+            expected_position = candidate_positions.get(target.id)
+            position_clause = (
+                Target.queue_position.is_(None)
+                if expected_position is None
+                else Target.queue_position == expected_position
+            )
+            values = {
+                "status": "assigned",
+                "assigned_worker": f"w-{target.id[:8]}",
+                "heartbeat_at": _now(),
+                "dead_reason": "",
+                "last_error": "",
+            }
             if alive_url and alive_url != target.url:
-                target.url = alive_url
+                values["url"] = alive_url
+            claimed = await session.execute(
+                update(Target)
+                .where(
+                    Target.id == target.id,
+                    Target.task_id == self.task_id,
+                    Target.status == "queued",
+                    position_clause,
+                )
+                .values(**values)
+                .execution_options(synchronize_session=False)
+            )
+            if queue_revision != self._queue_revision or claimed.rowcount != 1:
+                await session.rollback()
+                return None
             await session.commit()
+            await session.refresh(target)
             if removed_unreachable:
                 await self._log(
                     session, "orchestrator", "target_unreachable",
@@ -3526,6 +3559,11 @@ class OrchestratorManager:
 
     def get_runner(self, task_id: str) -> "TaskRunner | None":
         return self._runners.get(task_id)
+
+    def invalidate_queue(self, task_id: str) -> None:
+        runner = self._runners.get(task_id)
+        if runner:
+            runner.invalidate_queue()
 
     def diagnostic_snapshot(self) -> dict:
         return {

@@ -23,6 +23,7 @@ const SENSITIVE_TASK_VIEWS = new Set([
   "killsweeps",
   "rejected",
   "archived",
+  "queued",
 ]);
 
 export function taskViewForRole(view, role) {

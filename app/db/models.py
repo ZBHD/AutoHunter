@@ -89,7 +89,9 @@ class Target(Base):
     # EduSRC 目标优先级评分（决定 worker 先打谁，高分先派；只排序不过滤）
     priority_score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
     priority_reason: Mapped[str] = mapped_column(String(300), default="")
-    # queued / assigned / scanning / done / skipped / dead
+    # 人工队列顺序；NULL 表示仍使用 AI priority_score 自动排序。
+    queue_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # queued / assigned / scanning / done / skipped / dead / removed
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
     verdict: Mapped[str] = mapped_column(String(20), default="")       # found / no_vuln / error
     retry_count: Mapped[int] = mapped_column(Integer, default=0)

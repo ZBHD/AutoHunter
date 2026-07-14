@@ -167,6 +167,12 @@ class TaskStats(BaseModel):
     archived: int = 0
 
 
+class QueueOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_ids: list[str] = Field(max_length=5000)
+
+
 class TaskResponse(BaseModel):
     id: str
     name: str

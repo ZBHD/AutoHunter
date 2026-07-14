@@ -54,6 +54,7 @@ _MIGRATIONS = [
     ("reviews", "user_reviewed_at", "DATETIME"),
     ("targets", "priority_score", "FLOAT DEFAULT 0"),
     ("targets", "priority_reason", "VARCHAR(300) DEFAULT ''"),
+    ("targets", "queue_position", "INTEGER"),
     ("reviews", "deepen_directive", "TEXT DEFAULT ''"),
     ("targets", "deepen_context", "JSON"),
     ("targets", "deepen_count", "INTEGER DEFAULT 0"),
@@ -127,6 +128,9 @@ _SECONDARY_INDEXES = [
     ("ix_targets_task_status_priority_created",
      "CREATE INDEX IF NOT EXISTS ix_targets_task_status_priority_created "
      "ON targets(task_id, status, priority_score, created_at)"),
+    ("ix_targets_task_status_queue_position",
+     "CREATE INDEX IF NOT EXISTS ix_targets_task_status_queue_position "
+     "ON targets(task_id, status, queue_position, priority_score, created_at)"),
     # 审核派发：_dispatch_reviews 按 (task_id, status='pending_review') 取。
     ("ix_findings_task_status",
      "CREATE INDEX IF NOT EXISTS ix_findings_task_status ON findings(task_id, status)"),

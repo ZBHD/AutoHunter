@@ -9,6 +9,7 @@ import TaskEditModal from "../components/TaskEditModal.vue";
 import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
 import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
 import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
+import QueuedTargetsPanel from "../components/task/QueuedTargetsPanel.vue";
 import { taskProgressSummary, taskViewForRole } from "../taskViews.js";
 
 const props = defineProps({ id: String });
@@ -19,7 +20,7 @@ const requestedQueryView = ["scanned", "findings"].includes(String(route.query.v
   : "board";
 const queryView = taskViewForRole(requestedQueryView, authRoleRef.value);
 const task = ref(null);
-const tab = ref(queryView);         // board | scanned | findings | review | submit | killsweep | rejected
+const tab = ref(queryView);         // board | scanned | findings | review | submit | killsweep | rejected | archived | queued
 const boardPanel = ref("workers"); // workers | stream（手机端看板切换）
 const events = ref([]);
 const liveWorkers = ref([]);       // 在跑 worker 活态
@@ -29,6 +30,7 @@ const submitItems = ref([]);       // 待提交
 const rejectedItems = ref([]);     // 已驳回
 const archivedItems = ref([]);     // AI 未采纳归档（ignored/deepen，可救回）
 const taskKillsweepTotal = ref(0);
+const queuedTargetCount = ref(null);
 const searchDraft = ref("");
 const searchText = ref("");
 const submittedFilter = ref(false);
@@ -493,6 +495,7 @@ watch(authRoleRef, (role) => {
     submitHasMore.value = false;
     archivedHasMore.value = false;
     taskKillsweepTotal.value = 0;
+    queuedTargetCount.value = null;
     drawerId.value = null;
     clearSearch();
   }
@@ -668,6 +671,7 @@ const rejectedCount = computed(() =>
   Math.max(stats.value.rejected ?? 0, loadedTabs.value.has("rejected") ? rejectedItems.value.length : 0));
 const archivedCount = computed(() =>
   Math.max(stats.value.archived ?? 0, loadedTabs.value.has("archived") ? archivedItems.value.length : 0));
+const queuedCount = computed(() => queuedTargetCount.value ?? Math.max(0, Number(stats.value.queued || 0)));
 const targetProgress = computed(() => taskProgressSummary(stats.value));
 const totalTargets = computed(() => targetProgress.value.total);
 const resolvedTargets = computed(() => targetProgress.value.resolved);
@@ -1010,6 +1014,11 @@ function parseEventTs(ts) {
         <span class="tab-long">AI 未采纳</span><span class="tab-short">AI 未采纳</span>
         <i v-if="archivedCount">{{ archivedCount }}</i>
       </button>
+      <button type="button" role="tab" :aria-selected="tab === 'queued'" :class="{ active: tab === 'queued' }"
+        @click="selectTaskView('queued')">
+        <span class="tab-long">队列中</span><span class="tab-short">队列</span>
+        <i v-if="queuedCount">{{ queuedCount }}</i>
+      </button>
       </template>
     </div>
 
@@ -1170,6 +1179,10 @@ function parseEventTs(ts) {
         {{ archivedLoading ? "加载中..." : "加载更多未采纳漏洞" }}
       </button>
     </div>
+
+    <QueuedTargetsPanel v-if="authRoleRef !== 'observer'" v-show="tab === 'queued'"
+      :task-id="props.id" :active="tab === 'queued'" :readonly="readonly" :progress="targetProgress"
+      @count="queuedTargetCount = $event" />
 
     <ReportDrawer v-if="authRoleRef !== 'observer'" :finding-id="drawerId" :mode="drawerMode" :src-type="task.src_type"
       @close="drawerId = null" @updated="onDrawerUpdated" @toast="toast" />
