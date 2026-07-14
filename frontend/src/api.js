@@ -1,5 +1,6 @@
 // 简易 API 客户端
 import { ref } from "vue";
+import { buildListQuery } from "./listQuery.js";
 
 const base = "";
 const TOKEN_KEY = "ah-api-token";
@@ -204,14 +205,7 @@ async function streamSSE(url, body, onEvent, retriedAuth = false) {
   }
 }
 
-function qs(params = {}) {
-  const s = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") s.set(k, v);
-  }
-  const out = s.toString();
-  return out ? `?${out}` : "";
-}
+const qs = buildListQuery;
 
 export const api = {
   listTasks: () => req("GET", "/api/tasks"),
@@ -221,6 +215,12 @@ export const api = {
   // 删除任务：必须带 full 令牌（作为二次身份校验，独立于当前登录令牌）。
   deleteTask: (id, token) => req("DELETE", `/api/tasks/${id}`, undefined, false, sanitizeToken(token)),
   board: (id) => req("GET", `/api/tasks/${id}/board`),
+  terminalTargets: (id, opts = {}) =>
+    req("GET", `/api/tasks/${id}/targets${qs({ status: "terminal", compact: true, ...opts })}`),
+  targetDetail: (taskId, targetId) =>
+    req("GET", `/api/tasks/${taskId}/targets/${targetId}`),
+  rawFindings: (id, opts = {}) =>
+    req("GET", `/api/tasks/${id}/findings${qs({ compact: true, ...opts })}`),
   hardTargets: (status, q, opts = {}) => req("GET", `/api/tasks/hard-targets${qs({ status, q, ...opts })}`),
   start: (id) => req("POST", `/api/tasks/${id}/start`),
   pause: (id) => req("POST", `/api/tasks/${id}/pause`),
@@ -256,6 +256,31 @@ export const api = {
     req("POST", `/api/settings/llm-providers/${encodeURIComponent(name)}/test`),
   orderLlmProviders: (names) =>
     req("PUT", "/api/settings/llm-providers/order", { names }),
+  // 跨任务疑似漏洞池
+  missedSignalStats: (opts = {}) => req("GET", `/api/missed-signals/stats${qs(opts)}`),
+  missedSignals: (opts = {}) => req("GET", `/api/missed-signals${qs(opts)}`),
+  missedSignal: (id) => req("GET", `/api/missed-signals/${id}`),
+  missedSignalEvidence: (id) => req("GET", `/api/missed-signals/${id}/evidence`),
+  missedSignalEvidenceContent: (id, evidenceId, channel) =>
+    req("GET", `/api/missed-signals/${id}/evidence/${evidenceId}/content${qs({ channel })}`),
+  deepenMissedSignal: (id, data = {}) => req("POST", `/api/missed-signals/${id}/deepen`, data),
+  rejectMissedSignal: (id, reason) => req("POST", `/api/missed-signals/${id}/reject`, { reason }),
+  restoreMissedSignal: (id) => req("POST", `/api/missed-signals/${id}/restore`),
+  missedSignalDraft: (id) => req("GET", `/api/missed-signals/${id}/draft`),
+  generateMissedSignalDraft: (id) => req("POST", `/api/missed-signals/${id}/draft/generate`),
+  updateMissedSignalDraft: (id, data) => req("PATCH", `/api/missed-signals/${id}/draft`, data),
+  confirmMissedSignalDraft: (id, data = {}) =>
+    req("POST", `/api/missed-signals/${id}/draft/confirm`, data),
+  // 跨任务通杀运行中心
+  killsweepStats: (opts = {}) => req("GET", `/api/killsweeps/stats${qs(opts)}`),
+  killsweepCases: (opts = {}) => req("GET", `/api/killsweeps${qs(opts)}`),
+  killsweepCase: (id) => req("GET", `/api/killsweeps/${id}`),
+  killsweepEvents: (id, opts = {}) => req("GET", `/api/killsweeps/${id}/events${qs(opts)}`),
+  killsweepEvidenceContent: (caseId, eventId, evidenceId, channel) =>
+    req("GET", `/api/killsweeps/${caseId}/events/${eventId}/evidence/${evidenceId}/content${qs({ channel })}`),
+  reviewKillsweep: (id, data) => req("POST", `/api/killsweeps/${id}/manual-review`, data),
+  reanalyzeKillsweep: (id) => req("POST", `/api/killsweeps/${id}/reanalyze`),
+  reanalyzeKillsweeps: (data) => req("POST", "/api/killsweeps/reanalysis-batches", data),
   // 全局情报库
   intelStats: () => req("GET", "/api/intel/stats"),
   intelList: (kind, confidence, q, limit) =>

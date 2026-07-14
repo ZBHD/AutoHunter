@@ -6,15 +6,15 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
-import selectors
-import shlex
 import signal
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, BinaryIO, Optional
 
 import httpx
 
@@ -37,6 +37,77 @@ _SESSION_MAX_HEADERS = 30
 _WORKDIR_MAX_BYTES = int(os.environ.get("WORKER_WORKDIR_MAX_BYTES", str(50 * 1024 * 1024)))
 _SHELL_CAPTURE_MAX_BYTES = int(os.environ.get("WORKER_SHELL_CAPTURE_MAX_BYTES", str(512 * 1024)))
 _HTTP_MAX_BYTES = int(os.environ.get("WORKER_HTTP_MAX_BYTES", str(1024 * 1024)))
+
+
+class _CaptureWriter:
+    """Write one raw evidence channel without retaining its bytes in memory."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._file: BinaryIO = path.open("wb")
+        self._hash = hashlib.sha256()
+        self.size = 0
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        self._file.write(data)
+        self._hash.update(data)
+        self.size += len(data)
+
+    def close(self) -> dict[str, Any]:
+        if not self._closed:
+            self._file.flush()
+            self._file.close()
+            self._closed = True
+        return {
+            "path": str(self.path),
+            "size": self.size,
+            "sha256": self._hash.hexdigest(),
+        }
+
+
+class _CaptureSpool:
+    """Private, file-backed capture descriptor consumed by persistence code."""
+
+    def __init__(self, work_dir: Path, tool: str):
+        self.id = uuid.uuid4().hex
+        self.tool = tool
+        self.directory = work_dir / ".captures" / self.id
+        self.directory.mkdir(parents=True, exist_ok=False)
+        self._writers: dict[str, _CaptureWriter] = {}
+
+    def open_channel(self, name: str) -> _CaptureWriter:
+        writer = self._writers.get(name)
+        if writer is not None:
+            return writer
+        writer = _CaptureWriter(self.directory / f"{name}.bin")
+        self._writers[name] = writer
+        return writer
+
+    def write_channel(self, name: str, data: bytes) -> None:
+        self.open_channel(name).write(data)
+
+    def descriptor(
+        self,
+        *,
+        status: str,
+        error: str = "",
+        meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        channels = []
+        for name, writer in self._writers.items():
+            channels.append({"name": name, **writer.close()})
+        return {
+            "id": self.id,
+            "tool": self.tool,
+            "status": status,
+            "error": error,
+            "meta": dict(meta or {}),
+            "directory": str(self.directory),
+            "channels": channels,
+        }
 
 
 def _truncate(text: str, limit: Optional[int] = None) -> str:
@@ -100,6 +171,7 @@ class ToolExecutor:
         enterprise: bool = False,
         fofa_key: str = "",
         fofa_base_url: str = "",
+        capture_full: bool = False,
     ):
         self.target = target
         self.cancel_event = cancel_event or threading.Event()
@@ -107,6 +179,7 @@ class ToolExecutor:
         self.enterprise = enterprise
         self.fofa_key = fofa_key or ""
         self.fofa_base_url = (fofa_base_url or _FOFA_BASE).rstrip("/")
+        self.capture_full = bool(capture_full)
         # 每个目标独立工作目录
         safe_name = "".join(c if c.isalnum() else "_" for c in target)[:60]
         self.work_dir = Path(work_dir or worker_config.work_root) / safe_name
@@ -119,6 +192,11 @@ class ToolExecutor:
         # 全模式启用（登录后同样必须带登录态深入）。
         self._session_cookies: dict[str, str] = {}
         self._session_headers: dict[str, str] = {}
+
+    def _new_capture(self, tool: str) -> Optional[_CaptureSpool]:
+        if not self.capture_full:
+            return None
+        return _CaptureSpool(self.work_dir, tool)
 
     def cancel_running(self) -> None:
         """协作取消：置取消信号 + 杀子进程。仅用于控制面真取消（pause/stop/超时）。
@@ -152,11 +230,18 @@ class ToolExecutor:
         except CommandBlocked as e:
             return {"ok": False, "blocked": True, "error": str(e)}
 
+        capture = self._new_capture("run_shell")
+        capture_output: Optional[_CaptureWriter] = None
+        if capture is not None:
+            capture.write_channel("command", command.encode("utf-8", "surrogatepass"))
+            capture_output = capture.open_channel("output")
+
         start = time.time()
         proc: subprocess.Popen | None = None
         timed_out = False
         cancelled = False
         omitted_bytes = 0
+        preview_size = 0
         chunks: list[bytes] = []
         try:
             proc = subprocess.Popen(
@@ -172,46 +257,62 @@ class ToolExecutor:
             if proc.stdout is None:
                 rc = proc.wait(timeout=timeout)
             else:
-                selector = selectors.DefaultSelector()
-                selector.register(proc.stdout, selectors.EVENT_READ)
-                try:
-                    while True:
-                        if self.cancel_event.is_set():
-                            cancelled = True
-                            self._kill_process_group(proc)
-                        elif time.time() >= deadline:
-                            timed_out = True
-                            self._kill_process_group(proc)
+                read_errors: list[Exception] = []
 
-                        for key, _ in selector.select(timeout=0.2):
-                            data = key.fileobj.read1(8192)
+                def _drain_stdout() -> None:
+                    nonlocal preview_size, omitted_bytes
+                    try:
+                        while True:
+                            data = proc.stdout.read1(8192)
                             if not data:
-                                continue
-                            room = max(0, _SHELL_CAPTURE_MAX_BYTES - sum(len(c) for c in chunks))
+                                break
+                            if capture_output is not None:
+                                capture_output.write(data)
+                            room = max(0, _SHELL_CAPTURE_MAX_BYTES - preview_size)
                             if room:
-                                chunks.append(data[:room])
+                                kept = data[:room]
+                                chunks.append(kept)
+                                preview_size += len(kept)
                             if len(data) > room:
                                 omitted_bytes += len(data) - room
+                    except Exception as exc:
+                        read_errors.append(exc)
 
-                        rc = proc.poll()
-                        if rc is not None:
-                            # 进程退出后再 drain 一次，保证 wait/reap 前尽量拿到尾部输出。
-                            while True:
-                                data = proc.stdout.read1(8192)
-                                if not data:
-                                    break
-                                room = max(0, _SHELL_CAPTURE_MAX_BYTES - sum(len(c) for c in chunks))
-                                if room:
-                                    chunks.append(data[:room])
-                                if len(data) > room:
-                                    omitted_bytes += len(data) - room
-                            break
-                    rc = proc.wait(timeout=3)
-                finally:
-                    selector.close()
+                reader = threading.Thread(target=_drain_stdout, daemon=True)
+                reader.start()
+                kill_sent = False
+                while proc.poll() is None:
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                        if not kill_sent:
+                            self._kill_process_group(proc)
+                            kill_sent = True
+                    elif time.time() >= deadline:
+                        timed_out = True
+                        if not kill_sent:
+                            self._kill_process_group(proc)
+                            kill_sent = True
+                    time.sleep(0.05)
+                rc = proc.wait(timeout=3)
+                reader.join(timeout=3)
+                if reader.is_alive():
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                    reader.join(timeout=1)
+                if read_errors and not (cancelled or timed_out):
+                    raise read_errors[0]
             cancelled = cancelled or self.cancel_event.is_set()
         except Exception as e:
-            return {"ok": False, "error": f"命令执行异常: {e}"}
+            result: dict[str, Any] = {"ok": False, "error": f"命令执行异常: {e}"}
+            if capture is not None:
+                result["_capture"] = capture.descriptor(
+                    status="partial" if proc is not None else "failed",
+                    error=str(e),
+                    meta={"command_started": proc is not None},
+                )
+            return result
         finally:
             if proc is not None:
                 self._active_procs.discard(proc)
@@ -225,11 +326,15 @@ class ToolExecutor:
         elapsed = round(time.time() - start, 2)
         full_out = b"".join(chunks).decode("utf-8", "replace")
         if omitted_bytes:
-            full_out += f"\n\n...[输出超过 {_SHELL_CAPTURE_MAX_BYTES} 字节，已丢弃约 {omitted_bytes} 字节以保护内存]..."
-        # 完整输出落地，避免截断丢证据（带体积上限，防 24x7 撞盘）
+            suffix = "完整字节已保存到原始证据" if capture is not None else "超出部分未保留"
+            full_out += (
+                f"\n\n...[输出超过 {_SHELL_CAPTURE_MAX_BYTES} 字节，"
+                f"预览省略约 {omitted_bytes} 字节，{suffix}]..."
+            )
+        # 人类可读预览仍写工作目录；完整字节由私有 capture spool 单独保存。
         log_file = self._write_log(f"$ {command}\n\n{full_out}")
 
-        return {
+        result = {
             "ok": rc == 0 and not timed_out and not cancelled,
             "return_code": rc,
             "timed_out": timed_out,
@@ -238,9 +343,39 @@ class ToolExecutor:
             "output": _truncate(full_out),
             "output_file": str(log_file) if log_file else "",
         }
+        if capture is not None:
+            capture_status = "partial" if timed_out or cancelled else "complete"
+            capture_error = "cancelled" if cancelled else "timed_out" if timed_out else ""
+            result["_capture"] = capture.descriptor(
+                status=capture_status,
+                error=capture_error,
+                meta={
+                    "return_code": rc,
+                    "timed_out": timed_out,
+                    "cancelled": cancelled,
+                    "elapsed_sec": elapsed,
+                },
+            )
+        return result
 
     @staticmethod
     def _kill_process_group(proc: subprocess.Popen) -> None:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
+                return
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
@@ -287,16 +422,36 @@ class ToolExecutor:
         # 会话保持：把已维持的 cookie/header 合并进本次请求（用户传的同名键优先）。
         merged_headers, session_applied = self._apply_session(headers)
 
+        capture = self._new_capture("http_request")
         req: httpx.Request | None = None
+        resp: httpx.Response | None = None
         try:
             with httpx.Client(verify=False, follow_redirects=follow_redirects, timeout=timeout) as client:
                 req = client.build_request(
                     method.upper(), url, headers=merged_headers, content=data, json=json_body
                 )
+                if capture is not None:
+                    capture.write_channel("request", self._raw_request_bytes(req))
                 resp = client.send(req, stream=True)
-                body, truncated = self._read_limited_response(resp)
+                response_capture = capture.open_channel("response") if capture is not None else None
+                if response_capture is not None:
+                    response_capture.write(self._raw_response_head(resp))
+                body, truncated = self._read_limited_response(resp, response_capture)
         except Exception as e:
-            return {"ok": False, "error": f"HTTP 请求异常: {e}", "url": url}
+            result: dict[str, Any] = {
+                "ok": False,
+                "error": f"HTTP 请求异常: {e}",
+                "url": url,
+            }
+            if capture is not None:
+                result["_capture"] = capture.descriptor(
+                    status="partial" if resp is not None else "failed",
+                    error=str(e),
+                    meta={"method": method.upper(), "url": url},
+                )
+            return result
+
+        assert resp is not None
 
         # 自动吸收响应 Set-Cookie，后续请求自动续上登录态（全模式）。
         session_updated = self._absorb_set_cookie(resp)
@@ -320,6 +475,15 @@ class ToolExecutor:
             result["session_applied"] = session_applied
         if session_updated:
             result["session_cookies_updated"] = session_updated
+        if capture is not None:
+            result["_capture"] = capture.descriptor(
+                status="complete",
+                meta={
+                    "method": method.upper(),
+                    "url": str(resp.url),
+                    "status_code": resp.status_code,
+                },
+            )
         return result
 
     # ---- 会话状态管理（全模式）----
@@ -460,7 +624,10 @@ class ToolExecutor:
         }
 
     @staticmethod
-    def _read_limited_response(resp: httpx.Response) -> tuple[str, bool]:
+    def _read_limited_response(
+        resp: httpx.Response,
+        capture: Optional[_CaptureWriter] = None,
+    ) -> tuple[str, bool]:
         chunks: list[bytes] = []
         total = 0
         truncated = False
@@ -468,14 +635,17 @@ class ToolExecutor:
             for chunk in resp.iter_bytes():
                 if not chunk:
                     continue
-                if total + len(chunk) > _HTTP_MAX_BYTES:
-                    room = max(0, _HTTP_MAX_BYTES - total)
-                    if room:
-                        chunks.append(chunk[:room])
+                if capture is not None:
+                    capture.write(chunk)
+                room = max(0, _HTTP_MAX_BYTES - total)
+                if room:
+                    kept = chunk[:room]
+                    chunks.append(kept)
+                    total += len(kept)
+                if len(chunk) > room:
                     truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
+                    if capture is None:
+                        break
         finally:
             resp.close()
         body = b"".join(chunks).decode(resp.encoding or "utf-8", "replace")
@@ -485,19 +655,27 @@ class ToolExecutor:
 
     @staticmethod
     def _raw_request(req: httpx.Request, data: Optional[str], json_body: Any) -> str:
-        lines = [f"{req.method} {req.url.raw_path.decode('latin-1')} HTTP/1.1"]
-        lines.append(f"Host: {req.url.host}")
-        for k, v in req.headers.items():
-            if k.lower() == "host":
-                continue
-            lines.append(f"{k}: {v}")
-        body = ""
-        if req.content:
-            try:
-                body = req.content.decode("utf-8", "replace")
-            except Exception:
-                body = "<binary>"
-        return "\n".join(lines) + "\n\n" + body
+        return ToolExecutor._raw_request_bytes(req).decode("utf-8", "replace")
+
+    @staticmethod
+    def _raw_request_bytes(req: httpx.Request) -> bytes:
+        start = b" ".join(
+            (
+                req.method.encode("ascii", "replace"),
+                req.url.raw_path,
+                b"HTTP/1.1",
+            )
+        )
+        header_lines = [name + b": " + value for name, value in req.headers.raw]
+        return b"\r\n".join([start, *header_lines]) + b"\r\n\r\n" + req.content
+
+    @staticmethod
+    def _raw_response_head(resp: httpx.Response) -> bytes:
+        version = (resp.http_version or "HTTP/1.1").encode("ascii", "replace")
+        reason = httpx.codes.get_reason_phrase(resp.status_code).encode("ascii", "replace")
+        start = b" ".join((version, str(resp.status_code).encode("ascii"), reason))
+        header_lines = [name + b": " + value for name, value in resp.headers.raw]
+        return b"\r\n".join([start, *header_lines]) + b"\r\n\r\n"
 
     # ---- analyze_javascript（条件开放给 worker）----
     def analyze_javascript(

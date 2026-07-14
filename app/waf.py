@@ -30,7 +30,8 @@ _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _MAX_HEADER_VALUE = 8192
 _MAX_PATH_LEN = 2048
 _SEARCH_ENDPOINTS = re.compile(
-    r"^/api/tasks/[^/]+/(?:results|review-queue|submit-list|rejected|killsweeps)$"
+    r"^(?:/api/tasks/[^/]+/(?:results|findings|targets|review-queue|submit-list|rejected|killsweeps)"
+    r"|/api/(?:missed-signals|killsweeps))$"
 )
 
 _BAD_UA = re.compile(

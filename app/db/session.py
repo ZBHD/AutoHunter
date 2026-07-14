@@ -68,6 +68,22 @@ _MIGRATIONS = [
     ("system_settings", "engines", "JSON DEFAULT '{}'"),
     ("system_settings", "llm_providers", "JSON DEFAULT '[]'"),
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
+    ("targets", "killsweep_case_id", "VARCHAR(32)"),
+    ("killsweeps", "automatic_verdict", "VARCHAR(20) DEFAULT 'pending_validation'"),
+    ("killsweeps", "manual_verdict", "VARCHAR(20)"),
+    ("killsweeps", "manual_reason", "TEXT DEFAULT ''"),
+    ("killsweeps", "manual_actor", "VARCHAR(40) DEFAULT ''"),
+    ("killsweeps", "manual_reviewed_at", "DATETIME"),
+    ("killsweeps", "failure_kind", "VARCHAR(60) DEFAULT ''"),
+    ("killsweeps", "failure_message", "TEXT DEFAULT ''"),
+    ("killsweeps", "attempt_count", "INTEGER DEFAULT 0"),
+    ("killsweeps", "queued_at", "DATETIME"),
+    ("killsweeps", "started_at", "DATETIME"),
+    ("killsweeps", "finished_at", "DATETIME"),
+    ("killsweeps", "legacy_without_timeline", "BOOLEAN DEFAULT 0"),
+    ("killsweeps", "current_attempt_id", "VARCHAR(32)"),
+    ("killsweeps", "latest_success_attempt_id", "VARCHAR(32)"),
+    ("raw_evidence", "spool_directory", "TEXT"),
 ]
 
 # 唯一索引：目标库(host)/漏洞库(dedup_key)的 DB 级查重兜底。
@@ -78,6 +94,24 @@ _UNIQUE_INDEXES = [
     ("ux_findings_dedup_global",
      "CREATE UNIQUE INDEX IF NOT EXISTS ux_findings_dedup_global ON findings(dedup_key) "
      "WHERE dedup_key <> ''"),
+    ("ux_missed_signals_dedup_key",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_missed_signals_dedup_key ON missed_signals(dedup_key)"),
+    ("ux_missed_signal_drafts_signal",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_missed_signal_drafts_signal "
+     "ON missed_signal_drafts(signal_id)"),
+    ("ux_raw_evidence_chunks_channel_seq",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_evidence_chunks_channel_seq "
+     "ON raw_evidence_chunks(evidence_id, channel, seq)"),
+    ("ux_killsweep_attempts_case_number",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_killsweep_attempts_case_number "
+     "ON killsweep_attempts(case_id, attempt_no)"),
+    ("ux_killsweep_attempts_active_case",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_killsweep_attempts_active_case "
+     "ON killsweep_attempts(case_id) WHERE status IN ('queued', 'running')"),
+    ("ux_killsweeps_origin_finding",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_killsweeps_origin_finding "
+     "ON killsweeps(origin_finding_id) "
+     "WHERE origin_finding_id <> '' AND legacy_without_timeline = 0"),
 ]
 
 # 普通索引：跨 host 查重按归一化类型别名集合做 IN 预筛时走索引，避免全表扫。
@@ -130,6 +164,24 @@ _SECONDARY_INDEXES = [
     ("ix_killsweeps_task_hit_rank",
      "CREATE INDEX IF NOT EXISTS ix_killsweeps_task_hit_rank "
      "ON killsweeps(task_id, is_killsweep, verified, asset_count, created_at)"),
+    ("ix_killsweeps_task_product",
+     "CREATE INDEX IF NOT EXISTS ix_killsweeps_task_product "
+     "ON killsweeps(task_id, product_key)"),
+    ("ix_killsweeps_status_finished",
+     "CREATE INDEX IF NOT EXISTS ix_killsweeps_status_finished "
+     "ON killsweeps(status, finished_at)"),
+    ("ix_missed_signals_status_risk_seen",
+     "CREATE INDEX IF NOT EXISTS ix_missed_signals_status_risk_seen "
+     "ON missed_signals(status, risk_score, last_seen_at)"),
+    ("ix_missed_signals_task_status",
+     "CREATE INDEX IF NOT EXISTS ix_missed_signals_task_status "
+     "ON missed_signals(task_id, status)"),
+    ("ix_missed_signal_evidence_evidence",
+     "CREATE INDEX IF NOT EXISTS ix_missed_signal_evidence_evidence "
+     "ON missed_signal_evidence(evidence_id)"),
+    ("ix_killsweep_attempts_task_status",
+     "CREATE INDEX IF NOT EXISTS ix_killsweep_attempts_task_status "
+     "ON killsweep_attempts(task_id, status)"),
     # 运行异常日志：按 level/agent 过滤 + ts DESC 排序。
     ("ix_task_events_level_ts",
      "CREATE INDEX IF NOT EXISTS ix_task_events_level_ts ON task_events(level, ts)"),
@@ -195,6 +247,18 @@ async def _ensure_unique_indexes(conn) -> None:
         except Exception:
             pass
 
+    # 旧版把 (task_id, product_key) 当作通杀案例身份。新版一条源 Finding
+    # 对应一个案例，同产品允许产生多条独立案例，因此先移除旧唯一索引。
+    rows = await conn.exec_driver_sql(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='killsweeps'"
+    )
+    killsweep_indexes = {r[0] for r in rows.fetchall()}
+    if "ux_killsweeps_task_product" in killsweep_indexes:
+        try:
+            await conn.exec_driver_sql("DROP INDEX IF EXISTS ux_killsweeps_task_product")
+        except Exception:
+            pass
+
     for name, sql in _UNIQUE_INDEXES:
         try:
             await conn.exec_driver_sql(sql)
@@ -232,6 +296,68 @@ async def _auto_migrate(conn) -> None:
                 except Exception:
                     # 旧 SQLite 不支持 DROP COLUMN 时不阻断启动；线上镜像用新版 SQLite 会正常清理。
                     pass
+
+    await _run_schema_migrations(conn)
+    await _backfill_missed_signal_evidence_links(conn)
+
+
+async def _backfill_missed_signal_evidence_links(conn) -> None:
+    """Promote the legacy one-signal foreign key into the shared link table."""
+    await conn.exec_driver_sql(
+        """
+        INSERT OR IGNORE INTO missed_signal_evidence
+            (missed_signal_id, evidence_id, created_at)
+        SELECT missed_signal_id, id, COALESCE(created_at, CURRENT_TIMESTAMP)
+        FROM raw_evidence
+        WHERE missed_signal_id IS NOT NULL
+        """
+    )
+
+
+async def _run_schema_migrations(conn) -> None:
+    """执行需要改写历史数据的一次性、可重入迁移。"""
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name VARCHAR(120) PRIMARY KEY,
+            applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    migration = "20260714_killsweep_operations_v1"
+    row = await conn.exec_driver_sql(
+        "SELECT 1 FROM schema_migrations WHERE name = ?", (migration,)
+    )
+    if row.first() is not None:
+        return
+
+    # 此函数在列迁移之后运行。此刻表中的行全部来自旧 schema，标成历史记录
+    # 后即可在不丢数据的前提下启用“一个源 Finding 一个新案例”的部分唯一索引。
+    await conn.exec_driver_sql(
+        """
+        UPDATE killsweeps
+        SET automatic_verdict = CASE
+                WHEN is_killsweep = 1 AND verified = 1 THEN 'killsweep'
+                WHEN is_killsweep = 1 THEN 'pending_validation'
+                ELSE 'not_killsweep'
+            END,
+            manual_verdict = CASE
+                WHEN status = 'invalid' THEN 'invalid'
+                ELSE manual_verdict
+            END,
+            status = CASE
+                WHEN status = 'done' THEN 'succeeded'
+                WHEN status = 'analyzing' THEN 'running'
+                WHEN status = 'invalid' THEN 'succeeded'
+                ELSE status
+            END,
+            legacy_without_timeline = 1
+        """
+    )
+    await conn.exec_driver_sql(
+        "INSERT INTO schema_migrations (name) VALUES (?)", (migration,)
+    )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

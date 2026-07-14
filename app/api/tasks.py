@@ -10,10 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dto import CreateTaskRequest, TaskResponse, TaskStats, UpdateTaskRequest
 from app.agents import site_collab
 from app.agents.prompts import normalize_src_type
-from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
+from app.db.models import (
+    Finding, Killsweep, KillsweepAttempt, KillsweepEvent, KillsweepReanalysisBatch,
+    MissedSignal, MissedSignalDraft, MissedSignalEvent, MissedSignalEvidence,
+    RawEvidence, RawEvidenceChunk, Review, Target, Task, TaskEvent, to_cst_iso,
+)
 from app.db.session import get_session
 from app.llm.usage import usage_snapshot
 from app.orchestrator import manager
+from app.raw_evidence import CaptureCleanupError, cleanup_evidence_spool
 from app.security import resolve_role, token_from_headers
 from app.settings_service import (
     is_masked_secret,
@@ -247,8 +252,10 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
         elif status == "done":
             stats.done += cnt
         elif status == "dead":
+            stats.done += cnt
             stats.dead += cnt
         elif status == "skipped":
+            stats.done += cnt
             stats.skipped += cnt
 
     # findings 两项计数合并为一次扫表（conditional aggregation）：
@@ -517,8 +524,57 @@ async def delete_task(task_id: str, session: AsyncSession = Depends(get_session)
     # 1) 先彻底停掉该任务的运行时，确保没有后台协程再往这些表写数据。
     await manager.stop(task_id)
 
-    # 2) 手动删除没有 ORM 级联关系的关联表（Killsweep / TaskEvent）。
+    # 2) Explicit child-first cleanup keeps deletion deterministic even for
+    # test/custom engines that do not enable SQLite foreign-key cascades.
+    evidence_rows = (await session.scalars(
+        select(RawEvidence).where(RawEvidence.task_id == task_id)
+    )).all()
+    for evidence in evidence_rows:
+        try:
+            cleanup_evidence_spool(evidence)
+        except CaptureCleanupError as exc:
+            # Keep the database ownership row so a later delete can retry safely.
+            raise HTTPException(409, "任务原始证据临时文件清理失败，请重试") from exc
+
+    evidence_ids = select(RawEvidence.id).where(RawEvidence.task_id == task_id)
+    signal_ids = select(MissedSignal.id).where(MissedSignal.task_id == task_id)
+    await session.execute(
+        delete(MissedSignalEvidence).where(
+            or_(
+                MissedSignalEvidence.evidence_id.in_(evidence_ids),
+                MissedSignalEvidence.missed_signal_id.in_(signal_ids),
+            )
+        )
+    )
+    await session.execute(
+        delete(RawEvidenceChunk).where(RawEvidenceChunk.evidence_id.in_(evidence_ids))
+    )
+    await session.execute(delete(RawEvidence).where(RawEvidence.task_id == task_id))
+    await session.execute(delete(MissedSignalDraft).where(MissedSignalDraft.task_id == task_id))
+    await session.execute(delete(MissedSignalEvent).where(MissedSignalEvent.task_id == task_id))
+    await session.execute(delete(MissedSignal).where(MissedSignal.task_id == task_id))
+
+    batch_ids = set(
+        await session.scalars(
+            select(KillsweepAttempt.batch_id).where(
+                KillsweepAttempt.task_id == task_id,
+                KillsweepAttempt.batch_id.is_not(None),
+            )
+        )
+    )
+    await session.execute(delete(KillsweepEvent).where(KillsweepEvent.task_id == task_id))
+    await session.execute(delete(KillsweepAttempt).where(KillsweepAttempt.task_id == task_id))
     await session.execute(delete(Killsweep).where(Killsweep.task_id == task_id))
+    if batch_ids:
+        remaining_attempt = select(KillsweepAttempt.id).where(
+            KillsweepAttempt.batch_id == KillsweepReanalysisBatch.id
+        ).exists()
+        await session.execute(
+            delete(KillsweepReanalysisBatch).where(
+                KillsweepReanalysisBatch.id.in_(batch_ids),
+                ~remaining_attempt,
+            )
+        )
     await session.execute(delete(TaskEvent).where(TaskEvent.task_id == task_id))
 
     # 3) 删除任务本体：Target -> Finding -> Review 通过 ORM cascade 一并删除。
@@ -618,33 +674,93 @@ async def task_board(task_id: str, request: Request, session: AsyncSession = Dep
     }
 
 
-@router.get("/{task_id}/targets")
-async def list_targets(task_id: str, request: Request, status: str | None = None, limit: int = 200,
-                       session: AsyncSession = Depends(get_session)):
-    """目标库查询。status 过滤：
-       不传=全部 / queued+assigned+scanning=在挖 / dead=硬骨头库 / skipped=低分跳过 / done=已完成。"""
-    q = select(Target).where(Target.task_id == task_id)
-    if status == "alive":
-        q = q.where(Target.status.in_(["queued", "assigned", "scanning"]))
-    elif status:
-        q = q.where(Target.status == status)
-    q = q.order_by(Target.priority_score.desc(), Target.created_at.desc()).limit(min(limit, 1000))
-    rows = (await session.execute(q)).scalars().all()
-    observer = _is_observer(request)
-    return [{
+def _target_dict(t: Target, observer: bool, finding_count: int = 0) -> dict:
+    return {
         "id": t.id, "url": _observer_url(t.url, t.host) if observer else t.url,
         "host": _observer_host(t.host) if observer else t.host,
         "ip": _observer_ip(t.ip) if observer else t.ip,
         "org": _observer_text(t.org) if observer else t.org,
         "school": _observer_text(t.school) if observer else t.school,
         "title": _observer_text(t.title) if observer else t.title,
+        "source": t.source,
         "status": t.status, "verdict": t.verdict,
         "is_edu": t.is_edu, "priority_score": t.priority_score,
         "priority_reason": "" if observer else t.priority_reason, "retry_count": t.retry_count,
         "deepen_count": t.deepen_count, "dead_reason": "" if observer else t.dead_reason,
         "last_error": "" if observer else t.last_error,
+        "finding_count": finding_count,
         "created_at": to_cst_iso(t.created_at),
-    } for t in rows]
+        "updated_at": to_cst_iso(t.updated_at),
+    }
+
+
+@router.get("/{task_id}/targets")
+async def list_targets(task_id: str, request: Request, status: str | None = None,
+                       search: str | None = Query(None, alias="q"), compact: bool = False,
+                       limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0),
+                       session: AsyncSession = Depends(get_session)):
+    """目标库查询。status 过滤：
+       不传=全部 / queued+assigned+scanning=在挖 / dead=硬骨头库 / skipped=低分跳过 / done=已完成。"""
+    q = select(Target).where(Target.task_id == task_id)
+    if status == "alive":
+        q = q.where(Target.status.in_(["queued", "assigned", "scanning"]))
+    elif status == "terminal":
+        q = q.where(Target.status.in_(["done", "dead", "skipped"]))
+    elif status:
+        q = q.where(Target.status == status)
+    if search:
+        pattern = f"%{search.strip()}%"
+        q = q.where(or_(
+            Target.url.ilike(pattern), Target.host.ilike(pattern), Target.org.ilike(pattern),
+            Target.school.ilike(pattern), Target.title.ilike(pattern), Target.status.ilike(pattern),
+            Target.verdict.ilike(pattern),
+        ))
+    total = (await session.execute(select(func.count()).select_from(q.order_by(None).subquery()))).scalar() or 0
+    q = q.order_by(Target.updated_at.desc(), Target.created_at.desc()).offset(offset).limit(limit)
+    rows = (await session.execute(q)).scalars().all()
+    observer = _is_observer(request)
+    counts: dict[str, int] = {}
+    if rows:
+        count_rows = (await session.execute(
+            select(Finding.target_id, func.count())
+            .where(Finding.target_id.in_([t.id for t in rows]), Finding.status != "superseded")
+            .group_by(Finding.target_id)
+        )).all()
+        counts = {target_id: count for target_id, count in count_rows}
+    items = [_target_dict(t, observer, counts.get(t.id, 0)) for t in rows]
+    if compact or status == "terminal" or search or offset:
+        return {
+            "items": items, "total": total, "limit": limit, "offset": offset,
+            "has_more": offset + len(items) < total,
+        }
+    return items
+
+
+@router.get("/{task_id}/targets/{target_id}")
+async def get_target_detail(task_id: str, target_id: str, request: Request,
+                            session: AsyncSession = Depends(get_session)):
+    target = await session.get(Target, target_id)
+    if not target or target.task_id != task_id:
+        raise HTTPException(404, "目标不存在")
+    observer = _is_observer(request)
+    rows = (await session.execute(
+        select(Finding).where(
+            Finding.task_id == task_id,
+            Finding.target_id == target_id,
+            Finding.status != "superseded",
+        ).order_by(Finding.created_at.desc())
+    )).scalars().all()
+    payload = _target_dict(target, observer, len(rows))
+    payload["findings"] = [] if observer else [{
+        "id": finding.id,
+        "title": finding.title,
+        "vuln_type": finding.vuln_type,
+        "severity_claimed": finding.severity_claimed,
+        "target_url": finding.target_url,
+        "status": finding.status,
+        "created_at": to_cst_iso(finding.created_at),
+    } for finding in rows]
+    return payload
 
 @router.post("/{task_id}/start", response_model=TaskResponse)
 async def start_task(task_id: str, session: AsyncSession = Depends(get_session)):

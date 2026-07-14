@@ -20,6 +20,7 @@ from app.config import worker_config
 from app import dedup
 from app.llm.router import LLMRouter
 from app.schemas import Finding, Verdict, WorkerResult
+from app.raw_evidence import detach_capture
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import (
     JS_ANALYZER_TOOL_SCHEMAS,
@@ -64,6 +65,7 @@ class Worker:
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
+            capture_full=True,
         )
         self.findings: list[Finding] = []
         self.on_event = on_event or (lambda kind, data: None)
@@ -295,6 +297,24 @@ class Worker:
                             "guidance": "不要重复触发同一异常。请换成最小可验证请求；若无明确路径就 finish(no_vuln)。",
                         }
                         self._emit("tool_exception", round=rounds, tool=name, error=str(e))
+                if isinstance(result, dict):
+                    capture = detach_capture(result)
+                    if capture is not None:
+                        preview = self._private_tool_preview(result)
+                        self._emit(
+                            "tool_capture_private",
+                            round=rounds,
+                            tool=name,
+                            method=str(args.get("method") or "GET").upper(),
+                            url=str(result.get("url") or args.get("url") or "")[:1000],
+                            args={
+                                "method": str(args.get("method") or "GET").upper(),
+                                "url": str(args.get("url") or "")[:1000],
+                            },
+                            result=preview,
+                            preview=preview,
+                            capture=capture,
+                        )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -400,6 +420,38 @@ class Worker:
             reported_intel=self._reported_intel,
             reported_coverage=self._reported_coverage,
         )
+
+    @staticmethod
+    def _private_tool_preview(result: dict[str, Any]) -> dict[str, Any]:
+        """Keep detector fields bounded while full bytes stay in the capture spool."""
+        allowed = {
+            "ok", "status_code", "url", "response_headers", "body", "body_len",
+            "body_truncated", "raw_request", "error", "return_code", "output",
+            "stdout", "stderr", "timed_out", "cancelled", "session_applied",
+            "session_cookies_updated",
+        }
+
+        def bounded(value: Any, limit: int = 4000) -> Any:
+            if isinstance(value, str):
+                return value[:limit]
+            if isinstance(value, dict):
+                return {
+                    str(key)[:100]: bounded(item, 1000)
+                    for key, item in list(value.items())[:100]
+                }
+            if isinstance(value, list):
+                return [bounded(item, 1000) for item in value[:100]]
+            if value is None or isinstance(value, (bool, int, float)):
+                return value
+            return str(value)[:limit]
+
+        preview: dict[str, Any] = {}
+        for key in allowed:
+            if key not in result:
+                continue
+            limit = 16000 if key in {"body", "output", "stdout", "stderr"} else 4000
+            preview[key] = bounded(result[key], limit)
+        return preview
 
     def _route_rounds(self, max_rounds: int, soft_rounds: int) -> tuple[int, int]:
         """按打法路线微调软收敛节奏。

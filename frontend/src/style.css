@@ -1,4 +1,5 @@
 @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
+@import "./styles/operations.css";
 
 /* ============================================================
    AutoHunter — 作战终端 / product register
@@ -251,6 +252,13 @@ nav { display: flex; gap: 2px; }
 }
 .navbtn:hover { background: var(--surface); color: var(--ink); text-decoration: none; }
 .navbtn.active { background: var(--accent-bg); color: var(--accent-ink); }
+.nav-count {
+  min-width: 18px; height: 18px; display: inline-grid; place-items: center;
+  padding: 0 5px; border-radius: 999px;
+  background: var(--danger); color: white;
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 
 /* 主题切换：标准图标按钮 */
 .theme-toggle {
@@ -371,6 +379,15 @@ main {
   color: var(--ink); font-weight: 600; font-size: 12.5px;
 }
 .head-action:hover { text-decoration: none; border-color: var(--faint); background: var(--surface); }
+.new-task-action {
+  gap: 6px;
+  background: var(--accent); border-color: var(--accent); color: white;
+}
+.new-task-action:hover {
+  background: color-mix(in oklch, var(--accent) 88%, white);
+  border-color: color-mix(in oklch, var(--accent) 88%, white);
+  color: white;
+}
 .view h2 { margin-bottom: 20px; }
 .empty {
   color: var(--muted); padding: 48px 24px; text-align: center; font-size: 13.5px;
@@ -529,6 +546,7 @@ main {
     box-shadow: 0 -4px 24px oklch(0% 0 0 / 0.22);
   }
   .bottom-nav-item {
+    position: relative;
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -566,6 +584,14 @@ main {
     font-weight: 600;
     line-height: 1.1;
     letter-spacing: .01em;
+  }
+  .bottom-nav-count {
+    position: absolute; top: 3px; left: calc(50% + 7px);
+    min-width: 17px; height: 17px; display: inline-grid; place-items: center;
+    padding: 0 4px; border-radius: 999px;
+    background: var(--danger); color: white;
+    font-family: "IBM Plex Mono", monospace; font-size: 9px; font-weight: 700;
+    font-variant-numeric: tabular-nums;
   }
   main {
     padding: 14px 12px calc(72px + env(safe-area-inset-bottom, 0px));
@@ -840,6 +866,66 @@ main {
 .settings-view .page-sub {
   max-width: 72ch;
 }
+.settings-personal {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.settings-personal > header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-personal h3 { font-size: 14px; }
+.settings-personal header p {
+  margin: 3px 0 0; color: var(--muted); font-size: 12px;
+}
+.settings-personal header p b { color: var(--ink-2); }
+.settings-personal-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.personal-setting-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.personal-setting-icon {
+  width: 34px; height: 34px; display: inline-grid; place-items: center;
+  border-radius: var(--radius-sm); background: var(--surface-2); color: var(--accent-ink);
+}
+.personal-setting-item > div:not(.settings-theme-switch) { min-width: 0; display: grid; gap: 2px; }
+.personal-setting-item b { color: var(--ink); font-size: 12.5px; }
+.personal-setting-item small {
+  overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap;
+}
+.personal-setting-action {
+  min-height: 44px; display: inline-flex; align-items: center; justify-content: center;
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--ink); font: inherit; font-size: 11.5px; font-weight: 600;
+  cursor: pointer;
+}
+.personal-setting-action:hover { border-color: var(--faint); text-decoration: none; }
+.settings-theme-switch {
+  display: inline-flex; align-items: center; gap: 3px; padding: 3px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2);
+}
+.settings-theme-switch button {
+  min-width: 44px; min-height: 44px; padding: 5px 8px;
+  border: 0; border-radius: 5px; background: transparent; color: var(--muted);
+  font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.settings-theme-switch button.active { background: var(--accent-bg); color: var(--accent-ink); font-weight: 700; }
 .settings-layout {
   display: grid;
   grid-template-columns: minmax(240px, 300px) minmax(0, 760px);
@@ -2011,9 +2097,13 @@ main {
 .metric-card {
   position: relative; overflow: hidden; min-height: 92px;
   background: color-mix(in oklch, var(--surface) 92%, var(--bg));
-  border: 1px solid var(--border); border-radius: 14px; padding: 13px 14px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 13px 14px;
   transition: transform .16s ease, border-color .16s ease, background-color .16s ease;
 }
+.metric-action { width: 100%; text-align: left; color: inherit; font-weight: inherit; }
+.metric-action.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-bg); }
+.metric-action:disabled { cursor: not-allowed; }
+.metric-action:disabled:hover { transform: none; border-color: var(--border); }
 .metric-card:hover { transform: translateY(-1px); border-color: var(--faint); background: var(--surface); }
 .metric-card::after {
   content: ""; position: absolute; right: 12px; top: 12px; width: 7px; height: 7px;
@@ -2600,7 +2690,7 @@ main {
     align-items: start;
     gap: 10px;
   }
-  .head-action { width: max-content; max-width: 100%; }
+  .head-action { width: max-content; max-width: 100%; min-height: 44px; }
   .page-head h2 { font-size: 1.25rem; margin-bottom: 4px; }
   .page-sub { font-size: 12.5px; }
   .view h2 { margin-bottom: 12px; font-size: 1.25rem; }
@@ -2650,6 +2740,11 @@ main {
     display: grid;
     gap: 6px;
   }
+  .settings-personal { margin-bottom: 16px; padding-bottom: 16px; }
+  .settings-personal-grid { grid-template-columns: 1fr; }
+  .personal-setting-item { min-height: 60px; }
+  .personal-setting-action { min-height: 44px; }
+  .settings-theme-switch button { min-height: 44px; }
   .settings-layout {
     grid-template-columns: 1fr;
     gap: 12px;

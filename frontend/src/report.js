@@ -28,7 +28,7 @@ function eff(f, key) {
 }
 
 export function effectiveSeverity(f) {
-  return f.review?.user_severity || f.review?.severity_final || "-";
+  return f.review?.user_severity || f.review?.severity_final || f.severity_claimed || "-";
 }
 
 function slugPart(value) {

@@ -124,6 +124,13 @@ watch(authReadyRef, (ready) => {
         <p class="page-sub">点击进入指挥台，查看实时看板与复审队列</p>
       </div>
       <div class="head-actions">
+        <router-link v-if="writable" class="head-action primary new-task-action" to="/create">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          新建任务
+        </router-link>
         <router-link v-if="authRoleRef !== 'observer'" class="head-action vuln-entry" to="/vulns">
           全局漏洞库
         </router-link>
@@ -160,7 +167,8 @@ watch(authReadyRef, (ready) => {
     </div>
     <div v-else-if="!tasks.length" class="empty">
       还没有任务
-      <span class="hint">点顶栏「新建」创建第一个挖掘任务</span>
+      <span v-if="writable" class="hint">使用右上角「新建任务」创建第一个挖掘任务</span>
+      <span v-else class="hint">当前令牌没有创建任务的权限</span>
     </div>
     <div v-else class="task-list">
       <div v-for="t in tasks" :key="t.id" class="task-card" :class="{ live: t.status === 'running' }"

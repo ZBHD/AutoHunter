@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import traceback
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -35,9 +36,20 @@ from app.agent_runtime import (
     AGENT_EXECUTOR, COLLECTOR_IO_EXECUTOR, WORKER_MAX_CONCURRENCY,
     agent_semaphore, shutdown_agent_executor,
 )
-from app.db.models import CST, Finding, Killsweep, Review, Target, Task, TaskEvent
+from app.db.models import (
+    CST, Finding, Killsweep, KillsweepAttempt, MissedSignal, Review, Target, Task, TaskEvent,
+)
 from app.db.session import SessionLocal
 from app.events import bus
+from app.killsweep_service import (
+    NEGATIVE_MANUAL_VERDICTS,
+    append_event as append_killsweep_event,
+    claim_attempt as claim_killsweep_attempt,
+    finalize_attempt as finalize_killsweep_attempt,
+    persist_tool_event,
+    queue_initial_attempt,
+    recover_attempts as recover_killsweep_attempts,
+)
 from app.llm.router import LLMRouter
 from app.settings_service import (
     llm_router_for_task,
@@ -47,8 +59,83 @@ from app.settings_service import (
 )
 from app.schemas import Finding as FindingSchema
 from app.schemas import Verdict
+from app.missed_signals import (
+    detect_tool_signals,
+    finish_signal_deepening,
+    mark_matching_signals_converted,
+    record_archived_review,
+    record_coverage_gap,
+    record_deepen_lead,
+    register_signal_evidence,
+    upsert_signal,
+)
+from app.raw_evidence import import_capture
 
 logger = logging.getLogger("autohunter.orchestrator")
+
+
+def public_worker_event(kind: str, data: dict) -> dict:
+    """Project private tool-capture events before they reach the live event bus."""
+    if kind != "tool_capture_private":
+        return dict(data or {})
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    return {
+        "kind": "tool_result",
+        "tool": str(data.get("tool") or "")[:40],
+        "method": str(data.get("method") or "")[:16],
+        "url": str(data.get("url") or "")[:1000],
+        "ok": preview.get("ok"),
+        "status_code": preview.get("status_code", data.get("status_code")),
+        "summary": (
+            f"HTTP {preview.get('status_code')} {str(data.get('url') or '')[:180]}"
+            if data.get("tool") == "http_request"
+            else f"{data.get('tool') or '工具'} 执行完成"
+        ),
+    }
+
+
+def schedule_private_persistence(
+    loop: asyncio.AbstractEventLoop,
+    coroutine,
+    futures: set,
+    lock: threading.Lock,
+):
+    """Submit a private persistence coroutine and register its future immediately.
+
+    This function is called from the Worker thread before that thread returns,
+    avoiding the event-loop callback race where a finished worker could drain
+    an empty set before ``call_soon_threadsafe`` creates the task.
+    """
+    future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+    with lock:
+        futures.add(future)
+    return future
+
+
+async def drain_private_tasks(tasks: set, lock: threading.Lock | None = None) -> None:
+    """Await and clear private persistence tasks before worker teardown."""
+    while True:
+        if lock is None:
+            pending = list(tasks)
+        else:
+            with lock:
+                pending = list(tasks)
+        if not pending:
+            return
+        await asyncio.gather(
+            *[
+                item
+                if isinstance(item, asyncio.Future)
+                else asyncio.wrap_future(item)
+                for item in pending
+            ],
+            return_exceptions=True,
+        )
+        if lock is None:
+            tasks.difference_update(pending)
+        else:
+            with lock:
+                tasks.difference_update(pending)
 
 
 def _now_iso() -> str:
@@ -317,13 +404,15 @@ class TaskRunner:
         self._stop = asyncio.Event()
         self._active_workers: dict[str, asyncio.Task] = {}
         self._worker_cancel_events: dict[str, threading.Event] = {}
+        self._worker_executor_started: set[str] = set()
         self._cancelled_targets: set[str] = set()
         self._review_inflight: set[str] = set()
         self._review_tasks: dict[str, asyncio.Task] = {}
         self._review_backoff: dict[str, float] = {}
-        self._killsweep_inflight: set[str] = set()  # 正在做通杀分析的 finding_id
+        self._killsweep_inflight: set[str] = set()  # 正在做通杀分析的 attempt_id
         self._killsweep_tasks: dict[str, asyncio.Task] = {}
         self._killsweep_cancel_events: dict[str, threading.Event] = {}
+        self._killsweep_event_locks: dict[str, asyncio.Lock] = {}
         self._escalation_inflight: set[str] = set()  # 正在做扩大危害深挖的 finding_id
         self._escalation_tasks: dict[str, asyncio.Task] = {}
         self._escalation_cancel_events: dict[str, threading.Event] = {}
@@ -350,6 +439,7 @@ class TaskRunner:
             "stopped": self._stop.is_set(),
             "active_workers": len(self._active_workers),
             "worker_cancel_events": len(self._worker_cancel_events),
+            "worker_executor_started": len(self._worker_executor_started),
             "review_inflight": len(self._review_inflight),
             "review_tasks": len(self._review_tasks),
             "killsweep_inflight": len(self._killsweep_inflight),
@@ -381,7 +471,53 @@ class TaskRunner:
                                          "message": message, "ts": _now_iso(), **payload})
 
     async def recover(self, session: AsyncSession) -> None:
-        """重启恢复：assigned/scanning → queued；不动已有 Finding/Review。"""
+        """重启恢复运行中目标及已持久化但尚未派发的人工深挖。"""
+        deepening_rows = list(
+            await session.scalars(
+                select(MissedSignal)
+                .where(
+                    MissedSignal.task_id == self.task_id,
+                    MissedSignal.status == "deepening",
+                    MissedSignal.target_id.is_not(None),
+                )
+                .order_by(MissedSignal.updated_at.asc(), MissedSignal.id.asc())
+            )
+        )
+        deepening_recovered = 0
+        recovered_target_ids: set[str] = set()
+        for signal in deepening_rows:
+            if not signal.target_id or signal.target_id in recovered_target_ids:
+                continue
+            target = await session.get(Target, signal.target_id)
+            if target is None or target.task_id != self.task_id:
+                continue
+            context = dict(target.deepen_context or {})
+            same_intent = context.get("missed_signal_id") == signal.id
+            target.deepen_context = {
+                **context,
+                "missed_signal_id": signal.id,
+                "directive": signal.deepen_directive,
+                "source": "missed_signal",
+                "signal_deepen_count": signal.deepen_count,
+                "attempt_token": (
+                    str(context.get("attempt_token") or "")
+                    if same_intent else uuid.uuid4().hex
+                ) or uuid.uuid4().hex,
+            }
+            target.status = "queued"
+            target.verdict = ""
+            target.assigned_worker = ""
+            target.heartbeat_at = None
+            target.last_error = ""
+            target.dead_reason = ""
+            target.priority_reason = (
+                f"[疑似深挖#{signal.deepen_count}] {signal.deepen_directive[:80]}"
+            )
+            signal.deepen_phase = "queued"
+            recovered_target_ids.add(target.id)
+            deepening_recovered += 1
+
+        await session.flush()
         rows = (await session.execute(
             select(Target).where(
                 Target.task_id == self.task_id, Target.status.in_(["assigned", "scanning"])
@@ -397,8 +533,12 @@ class TaskRunner:
         await session.commit()
         await self._log(
             session, "orchestrator", "recover",
-            f"重启恢复：{recovered} 个进行中目标回退队列，{killed} 个超过重试上限转入硬骨头库",
-            recovered=recovered, killed=killed,
+            f"重启恢复：{recovered} 个进行中目标回退队列，"
+            f"{deepening_recovered} 个待深挖目标恢复队列，"
+            f"{killed} 个超过重试上限转入硬骨头库",
+            recovered=recovered,
+            deepening_recovered=deepening_recovered,
+            killed=killed,
         )
 
     async def run_forever(self) -> None:
@@ -427,7 +567,7 @@ class TaskRunner:
     async def _tick(self) -> None:
         async with SessionLocal() as session:
             task = await session.get(Task, self.task_id)
-            if not task or task.status in ("paused", "stopped"):
+            if self._stop.is_set() or not task or task.status in ("paused", "stopped"):
                 return
             self._is_enterprise = is_enterprise_src(task.src_type)
 
@@ -443,6 +583,8 @@ class TaskRunner:
                 )
 
             added = await collector.refill(session, task, LOW_WATERMARK, progress_cb=collector_progress)
+            if self._stop.is_set():
+                return
 
             # FOFA 账号连续无效达阈值 → 自动暂停任务，不再空转刷无效请求。
             fofa_fail = int((task.fofa_config or {}).get("fofa_auth_fail_count", 0))
@@ -476,6 +618,8 @@ class TaskRunner:
             # 2. 派发前先回收：清理已完成 task + 抢救心跳超时的僵尸目标
             self._reap_workers()
             await self._reclaim_stale(session)
+            if self._stop.is_set():
+                return
             # task.concurrency 是用户在 UI 配的期望并发；worker 实际并发还受全局信号量
             # WORKER_MAX_CONCURRENCY 封顶。这里按两者取小来决定本轮 spawn 多少，避免多起
             # 的协程只是白白阻塞在 worker_sem.acquire()（表现为"配了 N 并发但没那么多在跑"）。
@@ -483,20 +627,43 @@ class TaskRunner:
             free = effective_cap - len(self._active_workers)
             for _ in range(max(0, free)):
                 target = await self._pop_queued(session)
+                if self._stop.is_set():
+                    # _pop_queued durably marks the selected target assigned before
+                    # returning.  A concurrent stop may already have snapshotted the
+                    # active-worker map, so put this not-yet-spawned target back now.
+                    if target is not None:
+                        target.status = "queued"
+                        target.verdict = ""
+                        target.assigned_worker = ""
+                        target.heartbeat_at = None
+                        target.last_error = ""
+                        target.dead_reason = ""
+                        await session.commit()
+                    return
                 if not target:
                     break
                 self._spawn_worker(task, target)
 
+            if self._stop.is_set():
+                return
+
             # 3. 派发审核（pending_review → reviewed）
             await self._dispatch_reviews(session, task)
+            if self._stop.is_set():
+                return
 
-            # 4. idle 标记
+            # 4. 持久化通杀尝试派发（queued → running）。重启/重析与初次分析共用。
+            await self._dispatch_killsweep_attempts(session, task)
+            if self._stop.is_set():
+                return
+
+            # 5. idle 标记
             queued = await self._count(session, "queued")
             # 除了 queued 和内存里的活跃 worker，还要看 DB 里有没有 assigned/scanning 的
             # 在途目标：幽灵 scanning(协程已死但状态没回收)期间不能误判 idle，否则前端显示
             # 空闲、实际还有目标虚挂，直到 reclaim(最多 ~150s)才回收——保持 running 更真实。
             inflight = await self._count_inflight(session)
-            busy = bool(self._active_workers) or inflight > 0
+            busy = bool(self._active_workers) or bool(self._killsweep_tasks) or inflight > 0
             if queued == 0 and not busy and task.status == "running":
                 if task.status != "idle":
                     task.status = "idle"
@@ -915,21 +1082,33 @@ class TaskRunner:
         """停止 runner，并取消 worker/reviewer/killsweep 的后续落库。"""
         self._stop.set()
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
-        self._cancel_review_tasks(reason)
-        self._cancel_killsweep_tasks(reason)
-        self._cancel_escalation_tasks(reason)
+        await self._cancel_review_tasks(reason)
+        await self._cancel_killsweep_tasks(reason)
+        await self._cancel_escalation_tasks(reason)
 
     async def _cancel_active_workers(self, reason: str) -> None:
         target_ids = list(self._active_workers.keys())
         if not target_ids:
             return
+        active_tasks = [
+            task for tid in target_ids
+            if (task := self._active_workers.get(tid)) is not None
+        ]
         for tid in target_ids:
             self._cancelled_targets.add(tid)
             if ev := self._worker_cancel_events.get(tid):
                 ev.set()
-            if task := self._active_workers.get(tid):
-                task.cancel()
             self._live.pop(tid, None)
+        for tid in target_ids:
+            task = self._active_workers.get(tid)
+            if task is not None and not task.done() and tid not in self._worker_executor_started:
+                task.cancel()
+
+        # Worker 内部包含不可强制终止的同步 LLM/HTTP 调用。协作取消后等待其
+        # 真正退出，确保晚到的完整 capture 和 finding salvage 都已处理完毕，
+        # 再允许 stop/delete 清理数据库。
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
 
         async with SessionLocal() as session:
             rows = (await session.execute(
@@ -950,31 +1129,40 @@ class TaskRunner:
                 level="warn", count=len(rows),
             )
 
-        self._active_workers.clear()
         for tid in target_ids:
+            self._active_workers.pop(tid, None)
             self._worker_cancel_events.pop(tid, None)
 
-    def _cancel_review_tasks(self, reason: str) -> None:
+    async def _cancel_review_tasks(self, reason: str) -> None:
+        tasks = list(self._review_tasks.values())
         for finding_id, task in list(self._review_tasks.items()):
             task.cancel()
             self._review_backoff[finding_id] = asyncio.get_running_loop().time() + REVIEW_RETRY_BACKOFF
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._review_tasks.clear()
         self._review_inflight.clear()
 
-    def _cancel_killsweep_tasks(self, reason: str) -> None:
+    async def _cancel_killsweep_tasks(self, reason: str) -> None:
+        tasks = list(self._killsweep_tasks.values())
         for ev in self._killsweep_cancel_events.values():
             ev.set()
-        for task in list(self._killsweep_tasks.values()):
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._killsweep_tasks.clear()
         self._killsweep_inflight.clear()
         self._killsweep_cancel_events.clear()
 
-    def _cancel_escalation_tasks(self, reason: str) -> None:
+    async def _cancel_escalation_tasks(self, reason: str) -> None:
+        tasks = list(self._escalation_tasks.values())
         for ev in self._escalation_cancel_events.values():
             ev.set()
-        for task in list(self._escalation_tasks.values()):
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._escalation_tasks.clear()
         self._escalation_inflight.clear()
         self._escalation_cancel_events.clear()
@@ -1374,6 +1562,8 @@ class TaskRunner:
             except Exception:
                 logger.warning("TaskRunner[%s] worker crash persist failed target=%s",
                                self.task_id, target_id[:8])
+        finally:
+            self._worker_executor_started.discard(target_id)
 
     async def _run_worker_inner(self, task_id: str, target_id: str, url: str,
                                 cancel_event: threading.Event) -> None:
@@ -1387,6 +1577,8 @@ class TaskRunner:
             "started_at": _now_iso(),
             "last_activity_at": _now_iso(),
         }
+        private_persist_tasks: set = set()
+        private_persist_lock = threading.Lock()
 
         def _update_live(kind: str, data: dict):
             st = self._live.get(target_id)
@@ -1430,6 +1622,49 @@ class TaskRunner:
                 st["action"] = f"收尾: {data.get('verdict','')}"
 
         def emit(kind: str, data: dict):
+            if kind == "tool_capture_private":
+                private_data = dict(data)
+                future = schedule_private_persistence(
+                    loop,
+                    self._persist_worker_tool_event(task_id, target_id, private_data),
+                    private_persist_tasks,
+                    private_persist_lock,
+                )
+
+                def _private_done(done) -> None:
+                    with private_persist_lock:
+                        private_persist_tasks.discard(done)
+                    try:
+                        exc = done.exception()
+                    except Exception:
+                        return
+                    if exc is not None:
+                        logger.error(
+                            "background task persist_worker_tool_event failed: %r",
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+
+                future.add_done_callback(_private_done)
+                projected = public_worker_event(kind, private_data)
+
+                def _publish_private_projection() -> None:
+                    if cancel_event.is_set():
+                        return
+                    _update_live(projected["kind"], projected)
+                    publish_task = asyncio.create_task(
+                        bus.publish(
+                            task_id,
+                            {"agent": "worker", "target_id": target_id, **projected},
+                        )
+                    )
+                    publish_task.add_done_callback(
+                        lambda f: _log_bg_task_exc(f, "bus.publish")
+                    )
+
+                if not cancel_event.is_set():
+                    loop.call_soon_threadsafe(_publish_private_projection)
+                return
             if cancel_event.is_set():
                 return
             # 线程内回调 → 投递到事件循环（更新活态 + 推送看板）
@@ -1455,6 +1690,8 @@ class TaskRunner:
             loop.call_soon_threadsafe(_do)
 
         deepen_context = None
+        deepen_signal_id = ""
+        deepen_attempt_token = ""
         target_meta: dict = {}
         duplicate_history: list[dict] = []
         src_type = "edusrc"
@@ -1471,7 +1708,10 @@ class TaskRunner:
                 tgt.status = "scanning"
                 self._live[target_id]["score"] = tgt.priority_score
                 self._live[target_id]["score_reason"] = tgt.priority_reason
-                deepen_context = tgt.deepen_context or None
+                deepen_context = dict(tgt.deepen_context or {}) or None
+                if deepen_context:
+                    deepen_signal_id = str(deepen_context.get("missed_signal_id") or "")
+                    deepen_attempt_token = str(deepen_context.get("attempt_token") or "")
                 # 资产情报：候选归属学校/org/title，供 worker 核实并写进报告 owner
                 target_meta = {
                     "school": tgt.school or "", "org": tgt.org or "",
@@ -1579,7 +1819,22 @@ class TaskRunner:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
             raise
+        self._worker_executor_started.add(target_id)
         worker_future.add_done_callback(lambda _f: worker_sem.release())
+
+        async def await_worker_exit() -> bool:
+            """Keep the executor future owned until its thread and callbacks finish."""
+            cancellation_requested = False
+            while not worker_future.done():
+                try:
+                    await asyncio.shield(worker_future)
+                except asyncio.CancelledError:
+                    cancellation_requested = True
+                except Exception:
+                    break
+            _consume_task_exception(worker_future)
+            return cancellation_requested
+
         try:
             # 活跃续命：worker 有持续事件就不因旧的 30min 墙钟被误杀；
             # 真正卡死则按 idle timeout 回收，活跃过久也有 max wall 兜底。
@@ -1612,8 +1867,18 @@ class TaskRunner:
                 worker.executor.cancel_running()
             try:
                 await asyncio.wait_for(asyncio.shield(worker_future), timeout=WORKER_CLEANUP_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "worker cleanup exceeded %.1fs; waiting for executor exit target=%s",
+                    WORKER_CLEANUP_TIMEOUT,
+                    target_id[:8],
+                )
+                cancelled = await await_worker_exit()
+            except asyncio.CancelledError:
+                cancelled = True
+                await await_worker_exit()
             except Exception:
-                worker_future.add_done_callback(_consume_task_exception)
+                _consume_task_exception(worker_future)
             result = {"verdict": "timeout", "findings": [], "error": timeout_reason}
             async with SessionLocal() as s:
                 await self._log(s, "worker", "timeout",
@@ -1626,7 +1891,7 @@ class TaskRunner:
             worker = worker_holder.get("worker")
             if worker:
                 worker.executor.cancel_running()
-            worker_future.add_done_callback(_consume_task_exception)
+            await await_worker_exit()
         except Exception as e:
             result = {"verdict": "error", "findings": [], "error": str(e)}
         finally:
@@ -1657,6 +1922,7 @@ class TaskRunner:
                 (result or {}).get("verdict"),
             )
             self._cancelled_targets.discard(target_id)
+            await drain_private_tasks(private_persist_tasks, private_persist_lock)
             # 被取消（pause/stop/超时/reclaim）时，目标状态变更丢弃由回队逻辑接管；
             # 但 worker 若已经打出实锤 findings，绝不能跟着一起扔——洞是真金白银，
             # 这里单独把已发现的 findings 落库（幂等去重），避免"挖出洞却没入库"。
@@ -1666,6 +1932,14 @@ class TaskRunner:
                     await self._salvage_findings(task_id, target_id, salvage)
                 except Exception:
                     pass
+            missed_signal_id = str((deepen_context or {}).get("missed_signal_id") or "")
+            if missed_signal_id:
+                await self._finish_missed_signal_deepening(
+                    task_id,
+                    target_id,
+                    "worker cancelled by task control",
+                    signal_id=missed_signal_id,
+                )
             return
         final_result = result or {"verdict": "error", "findings": []}
         final_result.setdefault("_runtime", {})
@@ -1673,8 +1947,215 @@ class TaskRunner:
             "started_at": live_snapshot.get("started_at"),
             "finished_at": _now_iso(),
             "duration_seconds": max(0.0, loop.time() - started_monotonic),
+            # Lease identity lets result persistence distinguish the worker's
+            # original deepening attempt from a newer manual queue request.
+            "missed_signal_id": deepen_signal_id,
+            "deepen_attempt_token": deepen_attempt_token,
         })
+        await drain_private_tasks(private_persist_tasks, private_persist_lock)
         await self._persist_worker_result(task_id, target_id, final_result)
+        missed_signal_id = str((deepen_context or {}).get("missed_signal_id") or "")
+        if missed_signal_id:
+            await self._finish_missed_signal_deepening(
+                task_id,
+                target_id,
+                str(final_result.get("error") or ""),
+                signal_id=missed_signal_id,
+            )
+
+    async def _persist_worker_tool_event(
+        self,
+        task_id: str,
+        target_id: str,
+        data: dict,
+    ) -> None:
+        """Import one private capture and persist every deterministic candidate.
+
+        One response can match multiple deterministic rules.  Every resulting
+        signal receives a link to the same RawEvidence row; chunk bytes remain
+        single-copy in ``raw_evidence_chunks``.
+        """
+        tool = str(data.get("tool") or "")
+        args = data.get("args") if isinstance(data.get("args"), dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        preview = data.get("preview") if isinstance(data.get("preview"), dict) else result
+        capture = data.get("capture") if isinstance(data.get("capture"), dict) else None
+        candidates = sorted(
+            detect_tool_signals(tool, args, result),
+            key=lambda item: (-item.risk_score, item.rule_key),
+        )
+
+        async with SessionLocal() as session:
+            target = await session.get(Target, target_id)
+            task = await session.get(Task, task_id)
+            if target is None or task is None or target.task_id != task_id:
+                return
+            evidence = None
+            if capture is not None:
+                try:
+                    # import_capture intentionally commits its short chunk
+                    # batches.  Signal attachment therefore happens after
+                    # this durable boundary in the same dedicated session.
+                    evidence = await import_capture(
+                        session,
+                        capture,
+                        task_id=task_id,
+                        target_id=target_id,
+                        source_kind=f"worker_{tool}"[:40],
+                        preview=preview,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "TaskRunner[%s] raw capture import failed target=%s tool=%s: %s",
+                        self.task_id,
+                        target_id[:8],
+                        tool,
+                        self._summarize_exc(exc),
+                    )
+                    evidence = None
+
+            for candidate in candidates:
+                try:
+                    async with session.begin_nested():
+                        signal = await upsert_signal(
+                            session,
+                            task_id=task_id,
+                            target_id=target_id,
+                            candidate=candidate,
+                        )
+                        if evidence is not None:
+                            await register_signal_evidence(session, signal, evidence)
+                except Exception as exc:
+                    logger.warning(
+                        "TaskRunner[%s] missed signal upsert failed target=%s rule=%s: %s",
+                        self.task_id,
+                        target_id[:8],
+                        candidate.rule_key,
+                        self._summarize_exc(exc),
+                    )
+                    # The raw capture was already committed and remains
+                    # durable even if one candidate cannot be persisted.
+                    continue
+            await session.commit()
+
+    async def _reconcile_pending_signal_deepening(
+        self,
+        task_id: str,
+        target_id: str,
+        *,
+        exclude_signal_id: str = "",
+    ) -> bool:
+        """Requeue a durable manual intent after an older worker commits.
+
+        This deliberately uses a fresh session after the worker-result commit.
+        It therefore observes a deepen API transaction that landed after the
+        worker's earlier SQLite snapshot and closes the stale-finish race.
+        """
+        async with SessionLocal() as session:
+            filters = [
+                MissedSignal.task_id == task_id,
+                MissedSignal.target_id == target_id,
+                MissedSignal.status == "deepening",
+            ]
+            if exclude_signal_id:
+                filters.append(MissedSignal.id != exclude_signal_id)
+            pending = (
+                await session.scalars(
+                    select(MissedSignal)
+                    .where(*filters)
+                    .order_by(MissedSignal.updated_at.asc(), MissedSignal.id.asc())
+                    .limit(1)
+                )
+            ).one_or_none()
+            if pending is None:
+                return False
+            target = await session.get(Target, target_id)
+            if target is None or target.task_id != task_id:
+                return False
+
+            current_context = dict(target.deepen_context or {})
+            same_intent = current_context.get("missed_signal_id") == pending.id
+            token = str(current_context.get("attempt_token") or "")
+            if not same_intent or not token:
+                token = uuid.uuid4().hex
+            target.deepen_context = {
+                **current_context,
+                "missed_signal_id": pending.id,
+                "directive": pending.deepen_directive,
+                "source": "missed_signal",
+                "signal_deepen_count": pending.deepen_count,
+                "attempt_token": token,
+            }
+            target.verdict = ""
+            target.status = "queued"
+            target.assigned_worker = ""
+            target.heartbeat_at = None
+            target.last_error = ""
+            target.dead_reason = ""
+            if not same_intent:
+                target.priority_score = (target.priority_score or 0.0) + 100.0
+            target.priority_reason = (
+                f"[疑似深挖#{pending.deepen_count}] {pending.deepen_directive[:80]}"
+            )
+            await session.commit()
+            return True
+
+    async def _finish_missed_signal_deepening(
+        self,
+        task_id: str,
+        target_id: str,
+        error: str = "",
+        *,
+        signal_id: str = "",
+    ) -> None:
+        async with SessionLocal() as session:
+            target = await session.get(Target, target_id)
+            if target is None or target.task_id != task_id:
+                return
+            context = dict(target.deepen_context or {})
+            linked_signal_id = signal_id or str(context.get("missed_signal_id") or "")
+            if not linked_signal_id:
+                return
+            signal = await session.get(MissedSignal, linked_signal_id)
+            if signal is not None and signal.status == "deepening":
+                await finish_signal_deepening(
+                    session,
+                    linked_signal_id,
+                    error=str(error or "")[:2000],
+                )
+            # A real Finding may already have converted the signal.  In that
+            # case only clear the consumed target context; never force pending.
+            if str(context.get("missed_signal_id") or "") == linked_signal_id:
+                target.deepen_context = None
+            await session.commit()
+
+    async def _mark_missed_signals_for_findings(
+        self,
+        task_id: str,
+        target_id: str,
+        findings: list[dict],
+    ) -> None:
+        urls = {
+            str(item.get("target_url") or "")
+            for item in findings
+            if isinstance(item, dict) and item.get("target_url")
+        }
+        if not urls:
+            return
+        async with SessionLocal() as session:
+            rows = list(
+                await session.scalars(
+                    select(Finding).where(
+                        Finding.task_id == task_id,
+                        Finding.target_id == target_id,
+                        Finding.target_url.in_(urls),
+                        Finding.status != "superseded",
+                    )
+                )
+            )
+            for finding in rows:
+                await mark_matching_signals_converted(session, finding)
+            await session.commit()
 
     async def _salvage_findings(self, task_id: str, target_id: str, findings: list) -> None:
         """被取消的 worker 已发现的 findings 抢救落库（只存洞，不改目标状态）。
@@ -1716,6 +2197,7 @@ class TaskRunner:
                     continue
             if saved:
                 await session.commit()
+                await self._mark_missed_signals_for_findings(task_id, target_id, findings)
                 await self._log(session, "orchestrator", "salvage",
                                 f"被取消的 worker 抢救落库 {saved} 个漏洞（目标 {target_id[:8]}）",
                                 level="warn", target_id=target_id, saved=saved)
@@ -1756,6 +2238,7 @@ class TaskRunner:
                             dedup_key=dedup_key, status="pending_review",
                         ))
                     await session.commit()
+                    await self._mark_missed_signals_for_findings(task_id, target_id, [f])
                 except IntegrityError:
                     return
                 logger.info("[realtime_persist] target=%s title=%s 实时落库成功",
@@ -1881,6 +2364,14 @@ class TaskRunner:
             findings = result.get("findings", [])
             error_text = result.get("error") or ""
             summary_text = result.get("summary") or ""
+            runtime = result.get("_runtime") if isinstance(result.get("_runtime"), dict) else {}
+            # A runtime payload with an explicit (possibly empty) signal id is
+            # the worker lease.  Older callers without runtime metadata keep
+            # the legacy fallback to the target context.
+            if "missed_signal_id" in runtime:
+                missed_signal_id = str(runtime.get("missed_signal_id") or "")
+            else:
+                missed_signal_id = str((tgt.deepen_context or {}).get("missed_signal_id") or "")
             auto_converged = (
                 verdict == Verdict.no_vuln.value
                 and not findings
@@ -1902,6 +2393,7 @@ class TaskRunner:
             )
             # 自动深挖回火标记（worker 突破有线索时设置，用于日志）。
             auto_deepen_info = None
+            worker_lead_signal = None
             # worker 主动回队标记；回队不是终态，不能再记 target_done。
             worker_requeue_info = None
             # 临时错误回队有上限：模型持续抽风时不能让目标无限空转。
@@ -1972,6 +2464,50 @@ class TaskRunner:
                         **coverage_record,
                     },
                 ))
+                # Only explicit unresolved/remaining entries become coverage
+                # gap candidates; a completed coverage report is not a signal.
+                for gap in (item.get("gaps") or []):
+                    if not isinstance(gap, dict):
+                        continue
+                    gap_payload = dict(gap)
+                    gap_payload.setdefault("actionable", True)
+                    try:
+                        await record_coverage_gap(
+                            session,
+                            task_id=task_id,
+                            target_id=target_id,
+                            gap=gap_payload,
+                        )
+                    except Exception:
+                        logger.debug("coverage gap persistence failed", exc_info=True)
+
+                remaining = coverage_record["remaining"].strip()
+                if remaining:
+                    for endpoint in coverage_record["endpoints"]:
+                        if not isinstance(endpoint, dict):
+                            continue
+                        path = str(endpoint.get("path") or "").strip()
+                        result_text = str(endpoint.get("result") or "").lower()
+                        if not path or not (
+                            not endpoint.get("status")
+                            or any(marker in (result_text + remaining.lower()) for marker in
+                                    ("未", "待", "缺", "todo", "unknown", "unverified"))
+                        ):
+                            continue
+                        try:
+                            await record_coverage_gap(
+                                session,
+                                task_id=task_id,
+                                target_id=target_id,
+                                gap={
+                                    "endpoint": path,
+                                    "method": endpoint.get("method") or "GET",
+                                    "reason": endpoint.get("result") or remaining,
+                                    "actionable": True,
+                                },
+                            )
+                        except Exception:
+                            logger.debug("coverage endpoint gap persistence failed", exc_info=True)
             if coverage_records:
                 spawned = await self._spawn_site_followups(session, task_id, tgt, coverage_records)
                 if spawned:
@@ -1989,10 +2525,39 @@ class TaskRunner:
                         },
                     ))
 
+            # End the evidence/finding transaction before touching the target
+            # state.  A manual deepening request can commit while the worker is
+            # processing evidence; refreshing in a new transaction prevents a
+            # stale SQLite read snapshot from overwriting that intent.
+            await session.commit()
+            await session.refresh(tgt)
+            pending_manual_signal_ids = set(
+                await session.scalars(
+                    select(MissedSignal.id).where(
+                        MissedSignal.task_id == task_id,
+                        MissedSignal.target_id == target_id,
+                        MissedSignal.status == "deepening",
+                    )
+                )
+            )
+            has_new_manual_deepen = any(
+                item_id != missed_signal_id for item_id in pending_manual_signal_ids
+            )
+
             # 单站协作幂等兜底：主题深挖路线现在已在开局(_site_collect)与侦察路线一起
             # 并发入队，这里不再是必经门禁，只作兜底——万一开局某条主题路线入队失败，
             # discovery 侦察路线跑完后在此补派一次（靠 source 存在性去重，正常情况全跳过=no-op）。
             _theme_deepen_lead = (result.get("deepen_lead") or "").strip()
+            if _is_actionable_worker_deepen_lead(_theme_deepen_lead):
+                try:
+                    worker_lead_signal = await record_deepen_lead(
+                        session,
+                        task_id=task_id,
+                        target_id=target_id,
+                        lead=_theme_deepen_lead,
+                    )
+                except Exception:
+                    logger.debug("worker deepen lead persistence failed", exc_info=True)
             _discovery_ok = (verdict == Verdict.no_vuln.value or verdict == Verdict.found.value or findings)
             if _discovery_ok and not _is_actionable_worker_deepen_lead(_theme_deepen_lead):
                 theme_spawned = await self._spawn_site_theme_routes(session, task_id, tgt)
@@ -2044,6 +2609,7 @@ class TaskRunner:
                 deepen_lead = (result.get("deepen_lead") or "").strip()
                 no_vuln_retry_reason = self._no_vuln_retry_reason(tgt)
                 if (_is_actionable_worker_deepen_lead(deepen_lead) and verdict == Verdict.no_vuln.value
+                        and not missed_signal_id and not has_new_manual_deepen
                         and tgt.deepen_count < DEEPEN_CAP):
                     tgt.deepen_context = {
                         "directive": deepen_lead,
@@ -2052,8 +2618,10 @@ class TaskRunner:
                         "original_summary": summary_text[:1000],
                         "from_finding_id": "",
                         "source": "worker_lead",
+                        "missed_signal_id": worker_lead_signal.id if worker_lead_signal else missed_signal_id,
                     }
-                    tgt.deepen_count += 1
+                    if not missed_signal_id:
+                        tgt.deepen_count += 1
                     tgt.verdict = ""
                     tgt.status = "queued"
                     tgt.assigned_worker = ""
@@ -2124,6 +2692,12 @@ class TaskRunner:
             if not transient_llm_error:
                 self._transient_llm_requeue.pop(target_id, None)
             await session.commit()
+            await self._reconcile_pending_signal_deepening(
+                task_id,
+                target_id,
+                exclude_signal_id=missed_signal_id,
+            )
+            await self._mark_missed_signals_for_findings(task_id, target_id, findings)
             if auto_deepen_info:
                 host, dc, lead = auto_deepen_info
                 await self._log(session, "worker", "auto_deepen",
@@ -2215,8 +2789,12 @@ class TaskRunner:
         pending = (await session.execute(
             select(Finding).where(Finding.task_id == self.task_id, Finding.status == "pending_review").limit(5)
         )).scalars().all()
+        if self._stop.is_set():
+            return
         now = asyncio.get_running_loop().time()
         for f in pending:
+            if self._stop.is_set():
+                return
             if f.id in self._review_inflight:
                 continue
             if self._review_backoff.get(f.id, 0) > now:
@@ -2335,6 +2913,21 @@ class TaskRunner:
                     reproduced=rv.get("reproduced", False), reviewer_notes=rv.get("reviewer_notes", ""),
                     deepen_directive=rv.get("deepen_directive", ""),
                 ))
+                await session.flush()
+                archived_review = (
+                    await session.scalars(
+                        select(Review).where(Review.finding_id == finding_id)
+                    )
+                ).one_or_none()
+                if archived_review is not None:
+                    try:
+                        await record_archived_review(session, f, archived_review)
+                    except Exception:
+                        logger.debug(
+                            "archived missed-signal persistence failed finding=%s",
+                            finding_id[:8],
+                            exc_info=True,
+                        )
                 extra = ""
                 if rv["verdict"] == "deepen":
                     extra = await self._apply_deepen(session, f, rv)
@@ -2365,74 +2958,245 @@ class TaskRunner:
                                    rv.get("deepen_directive") or "", source="ai")
         return suffix
 
-    def trigger_killsweep(self, task_id: str, finding_id: str) -> bool:
-        """人工复审通过后启动通杀分析；finding 级 inflight 去重，避免重复点击。"""
-        if finding_id in self._killsweep_inflight:
+    async def _dispatch_killsweep_attempts(self, session: AsyncSession, task: Task) -> None:
+        queued = (await session.scalars(
+            select(KillsweepAttempt)
+            .where(
+                KillsweepAttempt.task_id == task.id,
+                KillsweepAttempt.status == "queued",
+            )
+            .order_by(KillsweepAttempt.created_at.asc())
+            .limit(20)
+        )).all()
+        if self._stop.is_set():
+            return
+        for attempt in queued:
+            if self._stop.is_set():
+                return
+            self.dispatch_killsweep_attempt(task.id, attempt.id)
+
+    def dispatch_killsweep_attempt(self, task_id: str, attempt_id: str) -> bool:
+        """Schedule one persisted queued attempt; the DB claim is authoritative."""
+        if self._stop.is_set() or attempt_id in self._killsweep_inflight:
             return False
-        self._killsweep_inflight.add(finding_id)
-        self._killsweep_tasks[finding_id] = asyncio.create_task(self._run_killsweep(task_id, finding_id))
+        self._killsweep_inflight.add(attempt_id)
+        self._killsweep_tasks[attempt_id] = asyncio.create_task(
+            self._run_killsweep(task_id, attempt_id)
+        )
         return True
 
-    async def _run_killsweep(self, task_id: str, finding_id: str) -> None:
-        """通杀 Hunter：人工复审通过后，分析该漏洞所在系统能否一打一片。
-        按产品指纹去重；判定可通杀且验证成功 → 把那个同款站点入挖掘队列出货。"""
-        try:
-            await self._run_killsweep_inner(task_id, finding_id)
-        except Exception:
-            async with SessionLocal() as s:
-                await self._log(s, "killsweep", "error",
-                                f"通杀分析异常: {traceback.format_exc()[:400]}", level="error",
-                                finding_id=finding_id)
-        finally:
-            self._killsweep_inflight.discard(finding_id)
-            self._killsweep_tasks.pop(finding_id, None)
-            self._killsweep_cancel_events.pop(finding_id, None)
-
-    async def _run_killsweep_inner(self, task_id: str, finding_id: str) -> None:
-        from app.agents.killsweep import KillsweepHunter, product_key
-        loop = asyncio.get_running_loop()
-
+    async def _finalize_killsweep_failure(
+        self,
+        attempt_id: str,
+        *,
+        kind: str,
+        message: str,
+        cancelled: bool = False,
+    ) -> None:
         async with SessionLocal() as session:
-            f = await session.get(Finding, finding_id)
-            if not f:
+            attempt = await session.get(KillsweepAttempt, attempt_id)
+            if attempt is None or attempt.status in {"succeeded", "failed", "cancelled"}:
                 return
+            await finalize_killsweep_attempt(
+                session,
+                attempt_id,
+                error_kind=kind,
+                error_message=message,
+                cancelled=cancelled,
+            )
+            await session.commit()
+
+    async def _run_killsweep(self, task_id: str, attempt_id: str) -> None:
+        try:
+            await self._run_killsweep_inner(task_id, attempt_id)
+        except asyncio.CancelledError:
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind="control_cancelled",
+                message="通杀分析被控制面取消",
+                cancelled=True,
+            )
+            raise
+        except Exception as exc:
+            message = self._summarize_exc(exc)
+            logger.exception(
+                "TaskRunner[%s] killsweep attempt %s failed",
+                task_id, attempt_id,
+            )
+            await self._finalize_killsweep_failure(
+                attempt_id, kind="unexpected_error", message=message
+            )
+        finally:
+            self._killsweep_inflight.discard(attempt_id)
+            self._killsweep_tasks.pop(attempt_id, None)
+            self._killsweep_cancel_events.pop(attempt_id, None)
+            self._killsweep_event_locks.pop(attempt_id, None)
+
+    async def _persist_killsweep_hunter_event(
+        self,
+        *,
+        task_id: str,
+        case_id: str,
+        attempt_id: str,
+        finding_id: str,
+        kind: str,
+        data: dict,
+    ) -> None:
+        event_data = dict(data or {})
+        capture = event_data.pop("capture", None)
+        payload = event_data.pop("payload", None)
+        summary = str(event_data.pop("summary", "") or kind)
+        source_kind = str(event_data.pop("source_kind", "killsweep_tool"))
+        lock = self._killsweep_event_locks.setdefault(attempt_id, asyncio.Lock())
+        async with lock:
+            async with SessionLocal() as session:
+                if kind == "killsweep_tool_result":
+                    await persist_tool_event(
+                        session,
+                        case_id=case_id,
+                        attempt_id=attempt_id,
+                        kind=kind,
+                        summary=summary,
+                        payload=payload or {},
+                        capture=capture,
+                        source_kind=source_kind,
+                    )
+                else:
+                    await append_killsweep_event(
+                        session,
+                        case_id=case_id,
+                        attempt_id=attempt_id,
+                        kind=kind,
+                        summary=summary,
+                        payload=event_data,
+                    )
+                await session.commit()
+        # WebSocket only gets the bounded stage summary. Raw values remain in evidence storage.
+        await bus.publish(task_id, {
+            "agent": "killsweep",
+            "kind": kind,
+            "finding_id": finding_id,
+            "case_id": case_id,
+            "attempt_id": attempt_id,
+            "message": summary,
+        })
+
+    async def _run_killsweep_inner(self, task_id: str, attempt_id: str) -> None:
+        from app.agents.killsweep import KillsweepHunter
+
+        loop = asyncio.get_running_loop()
+        async with SessionLocal() as session:
+            attempt = await claim_killsweep_attempt(session, attempt_id)
+            if attempt is None:
+                return
+            case = await session.get(Killsweep, attempt.case_id)
+            finding_id = case.origin_finding_id
+            finding = await session.get(Finding, finding_id)
             task = await session.get(Task, task_id)
+            if task is None or finding is None or case.task_id != task_id:
+                await finalize_killsweep_attempt(
+                    session,
+                    attempt_id,
+                    error_kind="missing_source",
+                    error_message="通杀案例关联的任务或源漏洞不存在",
+                )
+                await session.commit()
+                return
+            await session.commit()
             fofa_key = resolve_fofa_key(task)
             fofa_base_url = resolve_fofa_base_url(task)
-            src_type = (task.src_type if task else "edusrc") or "edusrc"
+            src_type = (task.src_type or "edusrc")
             finding_dict = {
-                "title": f.title, "vuln_type": f.vuln_type, "target_url": f.target_url,
-                "owner": f.owner, "description": f.description, "poc": f.poc,
-                "raw_response": f.raw_response,
+                "id": finding.id,
+                "title": finding.title,
+                "vuln_type": finding.vuln_type,
+                "target_url": finding.target_url,
+                "owner": finding.owner,
+                "description": finding.description,
+                "poc": finding.poc,
+                "raw_request": finding.raw_request,
+                "raw_response": finding.raw_response,
             }
-            origin_host = f.target_url
+            origin_host = finding.target_url
+            case_id = case.id
 
         if not fofa_key:
-            async with SessionLocal() as s:
-                await self._log(s, "killsweep", "skip", "无 FOFA key，跳过通杀分析",
-                                level="warn", finding_id=finding_id)
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind="missing_fofa",
+                message="缺少可用 FOFA Key",
+            )
+            return
+        try:
+            task_obj = await self._get_task(task_id)
+            llm = _llm_for_task(task_obj)
+        except Exception as exc:
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind="missing_llm",
+                message=f"没有可用 LLM Provider: {self._summarize_exc(exc)}",
+            )
             return
 
-        llm = _llm_for_task(await self._get_task(task_id))
+        provider_trace = [{"available_providers": list(llm.enabled_providers)}]
         cancel_event = threading.Event()
-        self._killsweep_cancel_events[finding_id] = cancel_event
+        self._killsweep_cancel_events[attempt_id] = cancel_event
+        event_futures = []
 
         def emit(kind: str, data: dict):
-            asyncio.run_coroutine_threadsafe(
-                bus.publish(task_id, {"agent": "killsweep", "kind": kind, "finding_id": finding_id, **data}),
+            future = asyncio.run_coroutine_threadsafe(
+                self._persist_killsweep_hunter_event(
+                    task_id=task_id,
+                    case_id=case_id,
+                    attempt_id=attempt_id,
+                    finding_id=finding_id,
+                    kind=kind,
+                    data=data,
+                ),
                 loop,
             )
+            event_futures.append(future)
+
+        async def await_without_abandoning(future: asyncio.Future) -> bool:
+            """Wait through task cancellation so thread/event cleanup cannot outlive us."""
+            cancellation_requested = False
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    cancellation_requested = True
+                except Exception:
+                    break
+            return cancellation_requested
+
+        async def drain_events() -> bool:
+            cancellation_requested = False
+            index = 0
+            # Hunter callbacks can append while earlier persistence is in flight.
+            # This loop is called only after Hunter completion and drains the final list.
+            while index < len(event_futures):
+                future = asyncio.wrap_future(event_futures[index])
+                cancellation_requested |= await await_without_abandoning(future)
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("failed to persist killsweep timeline event")
+                index += 1
+            return cancellation_requested
 
         def do_hunt() -> dict:
             hunter = KillsweepHunter(
-                finding_dict, fofa_key, llm=llm, on_event=emit,
-                src_type=src_type, cancel_event=cancel_event,
+                finding_dict,
+                fofa_key,
+                llm=llm,
+                on_event=emit,
+                src_type=src_type,
+                cancel_event=cancel_event,
                 fofa_base_url=fofa_base_url,
             )
             try:
                 return hunter.run().model_dump(mode="json")
             finally:
-                # 正常完成清理：只杀子进程，不污染 cancel_event（同 worker 修复）。
                 hunter.executor.kill_processes()
 
         killsweep_sem = agent_semaphore("killsweep")
@@ -2450,44 +3214,53 @@ class TaskRunner:
         hunt_future.add_done_callback(_release_killsweep)
         try:
             res = await asyncio.wait_for(
-                asyncio.shield(hunt_future),
-                timeout=KILLSWEEP_WALL_TIMEOUT,
+                asyncio.shield(hunt_future), timeout=KILLSWEEP_WALL_TIMEOUT
             )
         except asyncio.TimeoutError:
             cancel_event.set()
-            try:
-                await asyncio.wait_for(asyncio.shield(hunt_future), timeout=WORKER_CLEANUP_TIMEOUT)
-            except Exception:
-                hunt_future.add_done_callback(_consume_task_exception)
-            res = {"error": f"通杀分析超时(>{int(KILLSWEEP_WALL_TIMEOUT)}s)"}
+            cancellation_requested = await await_without_abandoning(hunt_future)
+            cancellation_requested |= await drain_events()
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind="timeout",
+                message=f"通杀分析超时(>{int(KILLSWEEP_WALL_TIMEOUT)}s)",
+            )
+            return
         except asyncio.CancelledError:
             cancel_event.set()
-            hunt_future.add_done_callback(_consume_task_exception)
-            async with SessionLocal() as s:
-                await self._log(s, "killsweep", "cancelled",
-                                "通杀分析被控制面取消，未写入结果",
-                                level="warn", finding_id=finding_id)
+            # stop/delete must not race a still-running Hunter that can emit events or
+            # import evidence after its task rows have been removed.
+            await await_without_abandoning(hunt_future)
+            await drain_events()
+            raise
+        except Exception as exc:
+            if await drain_events():
+                raise asyncio.CancelledError
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind="llm_error",
+                message=self._summarize_exc(exc),
+            )
             return
-        except Exception as e:
-            res = {"error": str(e)}
 
+        if await drain_events():
+            raise asyncio.CancelledError
         if res.get("error"):
-            async with SessionLocal() as s:
-                if self._is_quota_error(str(res["error"])):
-                    await self._stop_task_for_quota(s, str(res["error"]), finding_id=finding_id)
-                    await self._log(s, "orchestrator", "quota_stop",
-                                    f"通杀阶段检测到 LLM/API 额度不足，任务已自动停止: {str(res['error'])[:120]}",
-                                    level="error", finding_id=finding_id)
-                else:
-                    await self._log(s, "killsweep", "error", f"通杀分析失败: {res['error']}",
-                                    level="warn", finding_id=finding_id)
+            error = str(res["error"])
+            kind = "cancelled" if cancel_event.is_set() else "llm_error"
+            await self._finalize_killsweep_failure(
+                attempt_id,
+                kind=kind,
+                message=error,
+                cancelled=kind == "cancelled",
+            )
             return
 
-        pkey = product_key(res.get("product_name", ""), res.get("fofa_query", ""), res.get("fingerprint", ""))
-        affected_table = res.get("affected_table") or []
-        if res.get("verified_url") and not affected_table:
+        if res.get("verified_url") and not res.get("affected_table"):
             vhost = collector.normalize_host(res["verified_url"])
-            affected_table = [{
+            res["affected_table"] = [{
                 "school": "待确认",
                 "url": res["verified_url"],
                 "host": vhost,
@@ -2500,49 +3273,47 @@ class TaskRunner:
                     f"killsweep|{vhost}|{finding_dict['vuln_type'].lower()}|{finding_dict['title']}".encode()
                 ).hexdigest(),
             }]
-        async with SessionLocal() as session:
-            # 产品指纹去重：同款系统同类洞已分析过则跳过（保留首条）
-            exists = (await session.execute(
-                select(Killsweep).where(Killsweep.task_id == task_id, Killsweep.product_key == pkey)
-            )).scalar_one_or_none()
-            if exists:
-                await self._log(session, "killsweep", "dedup",
-                                f"同款产品已分析过，跳过：{res.get('product_name','')}",
-                                finding_id=finding_id)
-                return
-            try:
-                async with session.begin_nested():
-                    session.add(Killsweep(
-                        task_id=task_id, origin_finding_id=finding_id, product_key=pkey,
-                        product_name=res.get("product_name", ""), vuln_type=finding_dict["vuln_type"],
-                        vuln_summary=finding_dict["title"], fofa_query=res.get("fofa_query", ""),
-                        fingerprint=res.get("fingerprint", ""), asset_count=res.get("asset_count", 0),
-                        edu_count=res.get("edu_count", 0), is_killsweep=res.get("is_killsweep", False),
-                        confidence=res.get("confidence", ""), verified_url=res.get("verified_url", ""),
-                        verified=res.get("verified", False), affected_table=affected_table,
-                        notes=res.get("notes", ""),
-                        status="done",
-                    ))
-            except IntegrityError:
-                return  # 并发撞唯一索引，跳过
 
-            # 判定可通杀 + 实证验证成功 → 把那个同款站点入挖掘队列出货
-            enq = ""
-            if res.get("is_killsweep") and res.get("verified") and res.get("verified_url"):
-                added = await self._enqueue_killsweep_target(
-                    session, task_id, res["verified_url"], origin_host)
-                enq = "；已将验证成功的同款站点入队出货" if added else ""
+        async with SessionLocal() as session:
+            attempt = await finalize_killsweep_attempt(
+                session,
+                attempt_id,
+                result=res,
+                provider_trace=provider_trace,
+            )
+            case = await session.get(Killsweep, attempt.case_id)
+            enqueued = False
+            if case.automatic_verdict == "killsweep" and case.verified_url:
+                enqueued = await self._enqueue_killsweep_target(
+                    session,
+                    task_id,
+                    case.id,
+                    case.verified_url,
+                    origin_host,
+                )
             await session.commit()
-            await self._log(session, "killsweep", "killsweep_done",
-                            f"通杀分析「{res.get('product_name','')}」: "
-                            f"{'可通杀' if res.get('is_killsweep') else '不可通杀'} "
-                            f"(全网{res.get('asset_count',0)}/教育{res.get('edu_count',0)}){enq}",
-                            finding_id=finding_id, is_killsweep=res.get("is_killsweep"),
-                            asset_count=res.get("asset_count", 0))
+            await self._log(
+                session,
+                "killsweep",
+                "killsweep_done",
+                f"通杀分析「{case.product_name}」完成：{case.automatic_verdict}",
+                finding_id=finding_id,
+                case_id=case.id,
+                attempt_id=attempt_id,
+                automatic_verdict=case.automatic_verdict,
+                enqueued=enqueued,
+            )
 
     async def _enqueue_killsweep_target(self, session: AsyncSession, task_id: str,
-                                        url: str, origin: str) -> bool:
+                                        case_id: str, url: str, origin: str) -> bool:
         """把通杀验证成功的同款站点作为新目标入队（host 去重；拉高优先级）。"""
+        case = await session.get(Killsweep, case_id)
+        if (
+            case is None
+            or case.task_id != task_id
+            or case.manual_verdict in NEGATIVE_MANUAL_VERDICTS
+        ):
+            return False
         host = collector.normalize_host(url)
         if not host or host == collector.normalize_host(origin):
             return False
@@ -2556,6 +3327,7 @@ class TaskRunner:
                 session.add(Target(
                     task_id=task_id, url=collector._ensure_url(host), host=host,
                     source="killsweep", status="queued", is_edu=True,
+                    killsweep_case_id=case_id,
                     priority_score=120.0, priority_reason="[通杀验证] 同款系统已实证中招，重点出货",
                 ))
         except IntegrityError:
@@ -2743,6 +3515,11 @@ class OrchestratorManager:
     def __init__(self) -> None:
         self._runners: dict[str, TaskRunner] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._stopped_task_ids: set[str] = set()
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
+
+    def _lifecycle_lock(self, task_id: str) -> asyncio.Lock:
+        return self._lifecycle_locks.setdefault(task_id, asyncio.Lock())
 
     def get_runner(self, task_id: str) -> "TaskRunner | None":
         return self._runners.get(task_id)
@@ -2766,40 +3543,57 @@ class OrchestratorManager:
         }
 
     async def trigger_killsweep(self, task_id: str, finding_id: str) -> bool:
-        """人工复审通过后触发通杀 Hunter。
+        """Compatibility entry point: persist then dispatch an initial attempt."""
+        async with SessionLocal() as session:
+            try:
+                _case, attempt, created = await queue_initial_attempt(
+                    session, task_id=task_id, finding_id=finding_id
+                )
+            except LookupError:
+                return False
+            await session.commit()
+        if not created and attempt.status != "queued":
+            return False
+        return await self.dispatch_killsweep_attempt(task_id, attempt.id)
 
-        任务即使当前不在 running，也允许做一次离线通杀分析；这里创建轻量 runner
-        只承载该后台任务，不自动启动主挖掘循环。
-        """
+    async def dispatch_killsweep_attempt(self, task_id: str, attempt_id: str) -> bool:
+        """Dispatch an already-persisted attempt, including for an offline task."""
+        if task_id in self._stopped_task_ids:
+            return False
         runner = self._runners.get(task_id)
         if not runner:
             runner = TaskRunner(task_id)
-            # 离线通杀也挂到 manager，后续 stop/pause 才能统一取消它。
             self._runners[task_id] = runner
-        return runner.trigger_killsweep(task_id, finding_id)
+        return runner.dispatch_killsweep_attempt(task_id, attempt_id)
 
     async def ensure_running(self, task_id: str) -> None:
-        existing_task = self._tasks.get(task_id)
-        if task_id in self._runners and existing_task and not existing_task.done():
-            return
-        if existing_task and existing_task.done():
-            self._tasks.pop(task_id, None)
-        runner = self._runners.get(task_id)
-        if not runner or runner._stop.is_set():
-            runner = TaskRunner(task_id)
+        async with self._lifecycle_lock(task_id):
+            self._stopped_task_ids.discard(task_id)
+            existing_task = self._tasks.get(task_id)
+            if task_id in self._runners and existing_task and not existing_task.done():
+                return
+            if existing_task and existing_task.done():
+                self._tasks.pop(task_id, None)
+            runner = self._runners.get(task_id)
+            if not runner or runner._stop.is_set():
+                runner = TaskRunner(task_id)
+                self._runners[task_id] = runner
             self._runners[task_id] = runner
-        self._runners[task_id] = runner
-        self._tasks[task_id] = asyncio.create_task(runner.run_forever())
+            self._tasks[task_id] = asyncio.create_task(runner.run_forever())
 
     async def stop(self, task_id: str) -> None:
-        runner = self._runners.pop(task_id, None)
-        if runner:
-            await runner.stop()
-        t = self._tasks.pop(task_id, None)
-        if t:
-            t.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await t
+        self._stopped_task_ids.add(task_id)
+        async with self._lifecycle_lock(task_id):
+            runner = self._runners.get(task_id)
+            if runner:
+                await runner.stop()
+            if self._runners.get(task_id) is runner:
+                self._runners.pop(task_id, None)
+            task = self._tasks.pop(task_id, None)
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     async def pause(self, task_id: str) -> None:
         runner = self._runners.get(task_id)
@@ -2809,13 +3603,36 @@ class OrchestratorManager:
     async def restore_on_startup(self) -> None:
         """重启恢复：把 running/idle 的任务重新拉起。"""
         async with SessionLocal() as session:
+            try:
+                from app.missed_signals import backfill_archived_signals
+                await backfill_archived_signals(session, limit=200)
+            except Exception:
+                logger.warning("疑似信号旧归档回填失败", exc_info=True)
+            queued_attempt_ids = await recover_killsweep_attempts(session)
+            await session.commit()
+            queued_attempts = []
+            if queued_attempt_ids:
+                queued_attempts = (await session.scalars(
+                    select(KillsweepAttempt).where(
+                        KillsweepAttempt.id.in_(queued_attempt_ids)
+                    )
+                )).all()
             rows = await session.execute(select(Task).where(Task.status.in_(["running", "idle"])))
             for task in rows.scalars().all():
                 await self.ensure_running(task.id)
+            for attempt in queued_attempts:
+                await self.dispatch_killsweep_attempt(attempt.task_id, attempt.id)
 
     async def pause_on_startup(self) -> None:
         """安全启动模式：只恢复 Web/API，把历史运行任务暂停并回收半路目标。"""
         async with SessionLocal() as session:
+            try:
+                from app.missed_signals import backfill_archived_signals
+                await backfill_archived_signals(session, limit=200)
+            except Exception:
+                logger.warning("疑似信号旧归档回填失败", exc_info=True)
+            await recover_killsweep_attempts(session)
+            await session.commit()
             rows = (await session.execute(
                 select(Task).where(Task.status.in_(["running", "idle"]))
             )).scalars().all()

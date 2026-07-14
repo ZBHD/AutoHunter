@@ -1,14 +1,20 @@
 <script setup>
-import { computed, reactive, ref, onMounted } from "vue";
-import { api } from "../api.js";
+import { computed, onMounted, reactive, ref, watch } from "vue";
+import { api, authReadyRef, authRoleRef, loadAuthRole } from "../api.js";
 import LlmProvidersPanel from "../components/LlmProvidersPanel.vue";
 import {
   isProviderUsable,
   markHealthCheckStale,
   summarizeHealthCheck,
 } from "../llmProviders.js";
+import {
+  currentTheme,
+  requestTokenDialog,
+  setThemePreference,
+  shouldLoadSystemSettings,
+} from "../preferences.js";
 
-const loading = ref(true);
+const loading = ref(false);
 const saving = ref(false);
 const toastMsg = ref("");
 const meta = ref({ updated_at: null });
@@ -17,6 +23,15 @@ const providerPanel = ref(null);
 const healthChecking = ref(false);
 const healthResponse = ref(null);
 const healthError = ref("");
+const systemLoaded = ref(false);
+const theme = ref("dark");
+const systemAccess = computed(() => shouldLoadSystemSettings(authRoleRef.value));
+const roleLabel = computed(() => ({
+  full: "全权限",
+  readonly: "只读",
+  observer: "观摩",
+  none: "未认证",
+}[authRoleRef.value] || "未认证"));
 const enabledProviders = computed(() => providers.value.filter(isProviderUsable));
 const healthSummary = computed(() => summarizeHealthCheck(healthResponse.value || {}));
 
@@ -60,6 +75,10 @@ async function runHealthCheck() {
 }
 
 async function load() {
+  if (!systemAccess.value) {
+    loading.value = false;
+    return;
+  }
   loading.value = true;
   try {
     const s = await api.getSettings();
@@ -74,9 +93,18 @@ async function load() {
     form.concurrency = s.defaults?.concurrency ?? 3;
     form.skip_score_threshold = s.defaults?.skip_score_threshold ?? -10;
     form.worker_prompt_version = s.defaults?.worker_prompt_version || "legacy";
+    systemLoaded.value = true;
   } finally {
     loading.value = false;
   }
+}
+
+function changeToken() {
+  requestTokenDialog("switch");
+}
+
+function setTheme(value) {
+  theme.value = setThemePreference(value);
 }
 
 async function save() {
@@ -109,21 +137,91 @@ async function save() {
   }
 }
 
-onMounted(load);
+watch(authRoleRef, async (role) => {
+  if (shouldLoadSystemSettings(role) && !systemLoaded.value) await load();
+});
+
+onMounted(async () => {
+  theme.value = currentTheme();
+  if (!authReadyRef.value) {
+    await loadAuthRole();
+    return;
+  }
+  if (systemAccess.value && !systemLoaded.value) await load();
+});
 </script>
 
 <template>
   <section class="view settings-view">
     <header class="page-head">
-      <h2>系统配置</h2>
+      <h2>设置</h2>
       <p class="page-sub">
-        管理全局 Provider 池、FOFA 与调度参数。任务可使用全局池，或显式切换到专用模型。
+        管理个人访问偏好<span v-if="systemAccess">，以及全局 Provider 池、FOFA 与调度参数</span>。
         <span v-if="meta.updated_at" class="settings-updated">上次保存 {{ meta.updated_at?.slice(0, 19).replace("T", " ") }}</span>
       </p>
     </header>
 
-    <div v-if="loading" class="empty">加载中…</div>
-    <div v-else class="settings-layout">
+    <section class="settings-personal" aria-labelledby="personal-settings-title">
+      <header>
+        <div>
+          <h3 id="personal-settings-title">个人设置</h3>
+          <p>当前访问身份：<b>{{ roleLabel }}</b></p>
+        </div>
+      </header>
+      <div class="settings-personal-grid">
+        <div class="personal-setting-item">
+          <span class="personal-setting-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2"/><path d="m16 6 3 3"/>
+            </svg>
+          </span>
+          <div>
+            <b>访问令牌</b>
+            <small>更换当前浏览器使用的访问身份</small>
+          </div>
+          <button type="button" class="ghost personal-setting-action" @click="changeToken">更换令牌</button>
+        </div>
+
+        <div class="personal-setting-item theme-setting-item">
+          <span class="personal-setting-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2"/>
+            </svg>
+          </span>
+          <div>
+            <b>界面主题</b>
+            <small>只影响当前浏览器</small>
+          </div>
+          <div class="settings-theme-switch" role="group" aria-label="界面主题">
+            <button type="button" :class="{ active: theme === 'light' }" :aria-pressed="theme === 'light'"
+              @click="setTheme('light')">亮色</button>
+            <button type="button" :class="{ active: theme === 'dark' }" :aria-pressed="theme === 'dark'"
+              @click="setTheme('dark')">暗色</button>
+          </div>
+        </div>
+
+        <div class="personal-setting-item about-setting-item">
+          <span class="personal-setting-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>
+            </svg>
+          </span>
+          <div>
+            <b>关于 AutoHunter</b>
+            <small>源代码与项目文档</small>
+          </div>
+          <a class="ghost personal-setting-action" href="https://github.com/ZBHD/AutoHunter"
+            target="_blank" rel="noopener noreferrer">GitHub</a>
+        </div>
+      </div>
+    </section>
+
+    <template v-if="systemAccess">
+      <div v-if="loading" class="empty">加载中…</div>
+      <div v-else class="settings-layout">
       <aside class="settings-summary" aria-label="当前系统配置摘要">
         <div class="settings-summary-head">
           <span>ACTIVE PROFILE</span>
@@ -272,7 +370,8 @@ onMounted(load);
           </div>
         </form>
       </div>
-    </div>
+      </div>
+    </template>
 
     <div v-if="toastMsg" class="toast settings-toast">{{ toastMsg }}</div>
   </section>

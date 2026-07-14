@@ -395,7 +395,7 @@ KILLSWEEP_TOOL_SCHEMAS = [
                     "asset_count": {"type": "integer", "description": "全网同款资产规模(FOFA size)"},
                     "edu_count": {"type": "integer", "description": "教育行业同款规模"},
                     "verified_url": {"type": "string", "description": "实际打的那个同款站点 URL（验证成功才填）"},
-                    "verified": {"type": "boolean", "description": "是否打了1个同款站点并实证同样中招"},
+                    "verified": {"type": "boolean", "description": "是否在非源站点按同方法、路径和参数名复现，并从实际响应获得与源 Finding 同类漏洞实证；普通 2xx/健康页/空响应必须为 false"},
                     "affected_table": {
                         "type": "array",
                         "description": "通杀影响明细表：每行是一个学校/单位与对应通杀洞，后端会写入查重库，避免后续重复报同一通杀洞。",

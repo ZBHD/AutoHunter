@@ -1,24 +1,34 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { api, wsUrl, authRoleRef, authReadyRef, loadAuthRole } from "../api.js";
 import { copyText } from "../clipboard.js";
 import { effectiveSeverity, buildReportMd, buildEdusrcToolReport } from "../report.js";
 import ReportDrawer from "../components/ReportDrawer.vue";
 import TaskEditModal from "../components/TaskEditModal.vue";
+import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
+import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
+import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
+import { taskProgressSummary, taskViewForRole } from "../taskViews.js";
 
 const props = defineProps({ id: String });
+const route = useRoute();
+const router = useRouter();
+const requestedQueryView = ["scanned", "findings"].includes(String(route.query.view || ""))
+  ? String(route.query.view)
+  : "board";
+const queryView = taskViewForRole(requestedQueryView, authRoleRef.value);
 const task = ref(null);
-const tab = ref("board");          // board | review | submit | killsweep | rejected
+const tab = ref(queryView);         // board | scanned | findings | review | submit | killsweep | rejected
 const boardPanel = ref("workers"); // workers | stream（手机端看板切换）
 const events = ref([]);
 const liveWorkers = ref([]);       // 在跑 worker 活态
 const siteCollab = ref(null);      // 单站协作态势（三阶段路线流水线，仅 site 任务）
 const queue = ref([]);             // 复审队列
 const submitItems = ref([]);       // 待提交
-const killsweepItems = ref([]);    // 通杀列
 const rejectedItems = ref([]);     // 已驳回
 const archivedItems = ref([]);     // AI 未采纳归档（ignored/deepen，可救回）
-const expandedKillsweeps = ref(new Set());
+const taskKillsweepTotal = ref(0);
 const searchDraft = ref("");
 const searchText = ref("");
 const submittedFilter = ref(false);
@@ -26,7 +36,6 @@ const drawerId = ref(null);
 const drawerMode = ref("view");
 const toastMsg = ref("");
 const editOpen = ref(false);
-const invalidatingKillsweepId = ref(null);
 const readonly = computed(() => authRoleRef.value !== "full");
 const initialLoading = ref(false);
 const refreshing = ref(false);
@@ -42,9 +51,27 @@ const EXPORT_PAGE_SIZE = 80;
 let ws = null, poll = null, boardPoll = null, searchTimer = null;
 let wsReconnectTimer = null, wsReconnectAttempt = 0, wsIntentionalClose = false;
 let eventRefreshTimer = null, eventRefreshPending = null;
-const LIST_TABS = new Set(["review", "submit", "killsweep", "rejected", "archived"]);
+const LIST_TABS = new Set(["review", "submit", "rejected", "archived"]);
 // 记录哪些列表 tab 已经加载过数据：首屏只拉看板，列表按需加载；后台只刷新看过的列表。
 const loadedTabs = ref(new Set());
+
+function selectTaskView(view) {
+  tab.value = taskViewForRole(view, authRoleRef.value);
+}
+
+function syncTaskViewQuery(view) {
+  const query = { ...route.query };
+  const next = ["scanned", "findings"].includes(view) ? view : "";
+  if (next) query.view = next;
+  else delete query.view;
+  if (String(route.query.view || "") === next) return;
+  router.replace({ query });
+}
+
+function openRawFinding(id) {
+  drawerId.value = id;
+  drawerMode.value = "view";
+}
 
 function toast(m) { toastMsg.value = m; setTimeout(() => (toastMsg.value = ""), 2200); }
 
@@ -71,11 +98,15 @@ async function loadTask() {
   if (id === props.id && id === loadedTaskId.value) task.value = t;
 }
 async function loadQueue() {
+  if (authRoleRef.value === "observer") return;
   const id = props.id;
   const rows = await api.reviewQueue(id);
-  if (id === props.id) queue.value = rows.map(withSearchCache);
+  if (id === props.id && authRoleRef.value !== "observer") {
+    queue.value = rows.map(withSearchCache);
+  }
 }
 async function loadSubmit(opts = {}) {
+  if (authRoleRef.value === "observer") return;
   const id = props.id;
   const reset = opts.reset !== false;
   const offset = reset ? 0 : submitItems.value.length;
@@ -88,24 +119,23 @@ async function loadSubmit(opts = {}) {
     });
     const rows = Array.isArray(res) ? res : (res.items || []);
     const next = rows.map(withSearchCache);
-    if (id !== props.id) return;
+    if (id !== props.id || authRoleRef.value === "observer") return;
     submitItems.value = reset ? next : [...submitItems.value, ...next];
     submitHasMore.value = !Array.isArray(res) && !!res.has_more;
   } finally {
     submitLoading.value = false;
   }
 }
-async function loadKillsweeps() {
-  const id = props.id;
-  const rows = await api.killsweeps(id);
-  if (id === props.id) killsweepItems.value = rows.map(withSearchCache);
-}
 async function loadRejected() {
+  if (authRoleRef.value === "observer") return;
   const id = props.id;
   const rows = await api.rejectedList(id);
-  if (id === props.id) rejectedItems.value = rows.map(withSearchCache);
+  if (id === props.id && authRoleRef.value !== "observer") {
+    rejectedItems.value = rows.map(withSearchCache);
+  }
 }
 async function loadArchived(opts = {}) {
+  if (authRoleRef.value === "observer") return;
   const id = props.id;
   const reset = opts.reset !== false;
   const offset = reset ? 0 : archivedItems.value.length;
@@ -117,7 +147,7 @@ async function loadArchived(opts = {}) {
     });
     const rows = Array.isArray(res) ? res : (res.items || []);
     const next = rows.map(withSearchCache);
-    if (id !== props.id) return;
+    if (id !== props.id || authRoleRef.value === "observer") return;
     archivedItems.value = reset ? next : [...archivedItems.value, ...next];
     archivedHasMore.value = !Array.isArray(res) && !!res.has_more;
   } finally {
@@ -149,13 +179,13 @@ async function refreshAll(opts = {}) {
 }
 
 async function loadTabData(t = tab.value) {
+  if (authRoleRef.value === "observer") return;
   if (t === "review") await loadQueue();
   else if (t === "submit") await loadSubmit({ reset: true });
-  else if (t === "killsweep") await loadKillsweeps();
   else if (t === "rejected") await loadRejected();
   else if (t === "archived") await loadArchived();
   else return;
-  markTabLoaded(t);
+  if (authRoleRef.value !== "observer") markTabLoaded(t);
 }
 
 function refreshTabData() {
@@ -192,9 +222,6 @@ async function refreshFromEvent(ev) {
   if ((k.includes("submit") || k.includes("review")) && shouldRefreshTab("submit")) {
     jobs.push(loadTabData("submit"));
   }
-  if (k.includes("killsweep") && shouldRefreshTab("killsweep")) {
-    jobs.push(loadTabData("killsweep"));
-  }
   await Promise.all(jobs);
 }
 
@@ -213,7 +240,7 @@ function resetTaskState(full = true) {
     task.value = null;
     queue.value = [];
     submitItems.value = [];
-    killsweepItems.value = [];
+    taskKillsweepTotal.value = 0;
     rejectedItems.value = [];
     archivedItems.value = [];
     archivedHasMore.value = false;
@@ -440,12 +467,36 @@ watch(() => task.value?.status, () => {
 });
 
 watch(tab, (t) => {
+  syncTaskViewQuery(t);
   // 已加载过的 tab 直接用内存数据；未打开过的列表按需补拉一次。
   // 数据新鲜度由 WebSocket 事件后台刷新 + 后台轮询(refreshAll)保证。
-  if (t === "board") return;
+  if (!isListTab(t)) return;
   if (loadedTabs.value.has(t)) return;
   loadTabData(t);
 });
+
+watch(() => route.query.view, (value) => {
+  const requested = ["scanned", "findings"].includes(String(value || "")) ? String(value) : "board";
+  const next = taskViewForRole(requested, authRoleRef.value);
+  if (tab.value !== next && ["board", "scanned", "findings"].includes(tab.value)) tab.value = next;
+});
+
+watch(authRoleRef, (role) => {
+  const next = taskViewForRole(tab.value, role);
+  if (next !== tab.value) tab.value = next;
+  if (role === "observer") {
+    queue.value = [];
+    submitItems.value = [];
+    rejectedItems.value = [];
+    archivedItems.value = [];
+    loadedTabs.value = new Set();
+    submitHasMore.value = false;
+    archivedHasMore.value = false;
+    taskKillsweepTotal.value = 0;
+    drawerId.value = null;
+    clearSearch();
+  }
+}, { immediate: true });
 
 watch(searchDraft, (v) => {
   clearTimeout(searchTimer);
@@ -497,61 +548,12 @@ async function restoreArchived(id) {
     toast(`恢复失败：${e?.message || e}`);
   }
 }
-function toggleKillsweep(id) {
-  const next = new Set(expandedKillsweeps.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  expandedKillsweeps.value = next;
-}
-function isKillsweepOpen(id) {
-  return expandedKillsweeps.value.has(id);
-}
-function assetRows(k) {
-  const rows = Array.isArray(k?.affected_table) ? k.affected_table : [];
-  if (rows.length) return rows;
-  if (k?.verified_url) {
-    return [{
-      school: "待确认",
-      url: k.verified_url,
-      host: "",
-      vuln_title: k.vuln_summary || k.origin_title || "通杀验证目标",
-      status: k.verified ? "verified" : "candidate",
-      evidence: k.verified ? "通杀 Hunter 已验证" : "通杀 Hunter 圈定候选",
-    }];
-  }
-  return [];
-}
-function assetStatusLabel(status) {
-  return status === "verified" ? "已验证" : "候选";
-}
 function formatTokenCount(n) {
   const v = Number(n || 0);
   if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
   if (v >= 10_000) return `${Math.round(v / 1000)}K`;
   if (v >= 1000) return `${(v / 1000).toFixed(1)}K`;
   return String(v);
-}
-function shortText(text, max = 80) {
-  const s = String(text || "").replace(/\s+/g, " ").trim();
-  return s.length > max ? `${s.slice(0, max)}…` : s;
-}
-async function invalidateKillsweep(k) {
-  if (readonly.value || invalidatingKillsweepId.value) return;
-  const name = shortText(k.product_name || k.vuln_summary || "这条通杀记录");
-  if (!window.confirm(`确认把「${name}」标记为无效？\n标记后会从默认通杀列隐藏，原始记录仍保留用于审计。`)) return;
-  invalidatingKillsweepId.value = k.id;
-  try {
-    await api.invalidateKillsweep(props.id, k.id, "人工复审判定该通杀候选无效");
-    const next = new Set(expandedKillsweeps.value);
-    next.delete(k.id);
-    expandedKillsweeps.value = next;
-    toast("已标记为无效");
-    await Promise.all([loadTabData("killsweep"), loadBoard()]);
-  } catch (e) {
-    toast(`标记失败：${e.message || e}`);
-  } finally {
-    invalidatingKillsweepId.value = null;
-  }
 }
 
 async function loadMoreSubmit() {
@@ -661,22 +663,15 @@ const submitCount = computed(() => {
     ? submitItems.value.filter((f) => !f.review?.submitted).length
     : 0;
 });
-const sweepCount = computed(() =>
-  Math.max(stats.value.killsweep ?? 0, loadedTabs.value.has("killsweep") ? killsweepItems.value.length : 0));
+const sweepCount = computed(() => Math.max(stats.value.killsweep ?? 0, taskKillsweepTotal.value));
 const rejectedCount = computed(() =>
   Math.max(stats.value.rejected ?? 0, loadedTabs.value.has("rejected") ? rejectedItems.value.length : 0));
 const archivedCount = computed(() =>
   Math.max(stats.value.archived ?? 0, loadedTabs.value.has("archived") ? archivedItems.value.length : 0));
-const totalTargets = computed(() =>
-  (stats.value.queued ?? 0) + (stats.value.scanning ?? 0) +
-  (stats.value.done ?? 0) + (stats.value.dead ?? 0) + (stats.value.skipped ?? 0)
-);
-const resolvedTargets = computed(() =>
-  (stats.value.done ?? 0) + (stats.value.dead ?? 0) + (stats.value.skipped ?? 0)
-);
-const progressPct = computed(() =>
-  totalTargets.value ? Math.round((resolvedTargets.value / totalTargets.value) * 100) : 0
-);
+const targetProgress = computed(() => taskProgressSummary(stats.value));
+const totalTargets = computed(() => targetProgress.value.total);
+const resolvedTargets = computed(() => targetProgress.value.resolved);
+const progressPct = computed(() => targetProgress.value.percent);
 const collectorCfg = computed(() => task.value?.fofa_config || {});
 const collectorVisible = computed(() => {
   // 过滤/入队完成后（phase=dispatch）自动隐藏，不再占位。
@@ -761,12 +756,10 @@ const searchPlaceholder = computed(() =>
     ? "搜索漏洞：标题 / URL / 类型 / 单位 / 系统 / 报告正文 / 审核备注"
     : "搜索漏洞：标题 / URL / 类型 / 学校 / 报告正文 / 审核备注"
 );
-const scopeCountLabel = computed(() => isEnterpriseTask.value ? "范围" : "教育");
-
 const searchTokens = computed(() =>
   searchText.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
 );
-const searchEnabled = computed(() => tab.value !== "board");
+const searchEnabled = computed(() => LIST_TABS.has(tab.value));
 function stringifyForSearch(v) {
   if (v?._searchText) return v._searchText;
   return buildSearchText(v);
@@ -793,13 +786,11 @@ function matchSearch(item) {
 }
 const filteredQueue = computed(() => queue.value.filter(matchSearch));
 const filteredSubmit = computed(() => submitItems.value.filter(matchSearch));
-const filteredKillsweeps = computed(() => killsweepItems.value.filter(matchSearch));
 const filteredRejected = computed(() => rejectedItems.value.filter(matchSearch));
 const filteredArchived = computed(() => archivedItems.value.filter(matchSearch));
 const visibleCount = computed(() => {
   if (tab.value === "review") return filteredQueue.value.length;
   if (tab.value === "submit") return filteredSubmit.value.length;
-  if (tab.value === "killsweep") return filteredKillsweeps.value.length;
   if (tab.value === "rejected") return filteredRejected.value.length;
   if (tab.value === "archived") return filteredArchived.value.length;
   return 0;
@@ -807,7 +798,6 @@ const visibleCount = computed(() => {
 const rawCount = computed(() => {
   if (tab.value === "review") return queue.value.length;
   if (tab.value === "submit") return submitItems.value.length;
-  if (tab.value === "killsweep") return killsweepItems.value.length;
   if (tab.value === "rejected") return rejectedItems.value.length;
   if (tab.value === "archived") return archivedItems.value.length;
   return 0;
@@ -972,12 +962,14 @@ function parseEventTs(ts) {
       <div class="metric-card active">
         <span class="metric-k">ACTIVE</span><b>{{ stats.scanning ?? 0 }}</b><em>扫描中</em>
       </div>
-      <div class="metric-card">
+      <button type="button" class="metric-card metric-action" :class="{ selected: tab === 'scanned' }"
+        :disabled="authRoleRef === 'observer'" @click="selectTaskView('scanned')">
         <span class="metric-k">DONE</span><b>{{ stats.done ?? 0 }}</b><em>已扫</em>
-      </div>
-      <div class="metric-card hot">
+      </button>
+      <button type="button" class="metric-card metric-action hot" :class="{ selected: tab === 'findings' }"
+        :disabled="authRoleRef === 'observer'" @click="selectTaskView('findings')">
         <span class="metric-k">FINDINGS</span><b>{{ stats.findings_total ?? 0 }}</b><em>原始发现</em>
-      </div>
+      </button>
       <div class="metric-card warn">
         <span class="metric-k">REVIEW</span><b>{{ reviewCount }}</b><em>待复审</em>
       </div>
@@ -993,6 +985,7 @@ function parseEventTs(ts) {
       <button type="button" role="tab" :aria-selected="tab === 'board'" :class="{ active: tab === 'board' }" @click="tab = 'board'">
         <span class="tab-long">实时看板</span><span class="tab-short">看板</span>
       </button>
+      <template v-if="authRoleRef !== 'observer'">
       <button type="button" role="tab" :aria-selected="tab === 'review'" :class="{ active: tab === 'review' }" @click="tab = 'review'">
         <span class="tab-long">复审队列</span><span class="tab-short">复审</span>
         <i v-if="reviewCount">{{ reviewCount }}</i>
@@ -1001,7 +994,8 @@ function parseEventTs(ts) {
         <span class="tab-long">待提交</span><span class="tab-short">提交</span>
         <i v-if="submitCount">{{ submitCount }}</i>
       </button>
-      <button type="button" role="tab" :aria-selected="tab === 'killsweep'" :class="{ active: tab === 'killsweep' }" @click="tab = 'killsweep'">
+      <button type="button" role="tab" :aria-selected="tab === 'killsweep'"
+        :class="{ active: tab === 'killsweep' }" @click="tab = 'killsweep'">
         <span class="tab-long">通杀列</span><span class="tab-short">通杀</span>
         <i v-if="sweepCount">{{ sweepCount }}</i>
       </button>
@@ -1013,6 +1007,7 @@ function parseEventTs(ts) {
         <span class="tab-long">AI 未采纳</span><span class="tab-short">AI 未采纳</span>
         <i v-if="archivedCount">{{ archivedCount }}</i>
       </button>
+      </template>
     </div>
 
     <div v-if="searchEnabled" class="search-strip">
@@ -1076,8 +1071,13 @@ function parseEventTs(ts) {
       </div>
     </div>
 
+    <ScannedTargetsPanel v-if="authRoleRef !== 'observer' && tab === 'scanned'"
+      :task-id="props.id" @open-finding="openRawFinding" />
+    <RawFindingsPanel v-if="authRoleRef !== 'observer' && tab === 'findings'" :task-id="props.id"
+      @open-finding="openRawFinding" @toast="toast" />
+
     <!-- 复审队列 -->
-    <div v-show="tab === 'review'" class="list-panel">
+    <div v-if="authRoleRef !== 'observer'" v-show="tab === 'review'" class="list-panel">
       <div class="list-head"><span>复审队列</span><small>AI 采纳后等待人工裁决</small></div>
       <div v-if="!queue.length" class="empty">没有待复审的漏洞（AI 采纳后会进这里）</div>
       <div v-else-if="!filteredQueue.length" class="empty">没有匹配当前关键词的复审漏洞</div>
@@ -1092,7 +1092,7 @@ function parseEventTs(ts) {
     </div>
 
     <!-- 待提交 -->
-    <div v-show="tab === 'submit'" class="list-panel">
+    <div v-if="authRoleRef !== 'observer'" v-show="tab === 'submit'" class="list-panel">
       <div class="list-head"><span>待提交</span><small>人工通过后的 SRC 报告池</small></div>
       <div class="submit-toolbar">
         <label class="inline"><input type="checkbox" v-model="submittedFilter" @change="loadTabData('submit')" /> 只看已提交</label>
@@ -1118,81 +1118,11 @@ function parseEventTs(ts) {
       </button>
     </div>
 
-    <!-- 通杀列 -->
-    <div v-show="tab === 'killsweep'" class="list-panel">
-      <div class="list-head"><span>通杀列</span><small>人工通过后触发，验证 1 个同款站点</small></div>
-      <div v-if="!killsweepItems.length" class="empty">还没有通杀候选（人工复审通过后，通杀 Hunter 会自动分析同款系统）</div>
-      <div v-else-if="!filteredKillsweeps.length" class="empty">没有匹配当前关键词的通杀记录</div>
-      <div v-for="k in filteredKillsweeps" :key="k.id" class="killsweep-card" :class="{ open: isKillsweepOpen(k.id) }">
-        <button class="ks-summary" type="button" :aria-expanded="isKillsweepOpen(k.id)" @click="toggleKillsweep(k.id)">
-          <span class="ks-chevron">{{ isKillsweepOpen(k.id) ? "⌄" : "›" }}</span>
-          <span class="ks-main">
-            <span class="ks-title">{{ k.product_name || "未知产品" }}</span>
-            <span class="meta">{{ k.vuln_type }} · {{ k.origin_title || k.vuln_summary || "通杀候选" }}</span>
-          </span>
-          <span class="ks-summary-metrics">
-            <span><b>{{ assetRows(k).length }}</b>资产</span>
-            <span><b>{{ isEnterpriseTask ? (k.asset_count ?? 0) : (k.edu_count ?? 0) }}</b>{{ scopeCountLabel }}</span>
-            <span><b>{{ k.asset_count ?? 0 }}</b>全网</span>
-          </span>
-          <span class="ks-badges">
-            <span class="tag-done" v-if="k.verified">已验证</span>
-            <span class="sev-pill" :class="k.confidence">{{ k.confidence || "uncertain" }}</span>
-          </span>
-        </button>
-
-        <div v-if="isKillsweepOpen(k.id)" class="ks-detail">
-          <div class="ks-compact">
-            <div>
-              <span>FOFA 语法</span>
-              <code>{{ k.fofa_query || "无 FOFA 语法" }}</code>
-            </div>
-            <div>
-              <span>指纹依据</span>
-              <p>{{ k.fingerprint || k.notes || "无补充依据" }}</p>
-            </div>
-          </div>
-
-          <div class="ks-affected">
-            <div class="ks-affected-head">
-              <span>统一资产列表</span>
-              <small>{{ assetRows(k).length }} 条 · 强制字段：单位/系统 / 目标 / 漏洞 / 状态 / 依据</small>
-            </div>
-            <div v-if="!assetRows(k).length" class="empty sm">暂无资产明细，仅保留通杀摘要。</div>
-            <table v-else>
-              <thead>
-                <tr>
-                  <th>单位</th>
-                  <th>目标</th>
-                  <th>通杀洞</th>
-                  <th>状态</th>
-                  <th>依据</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="(row, idx) in assetRows(k)" :key="row.dedup_key || row.url || row.host || idx">
-                  <td>{{ row.school || "待确认" }}</td>
-                  <td><span class="mono">{{ row.url || row.host || "-" }}</span></td>
-                  <td>{{ row.vuln_title || k.vuln_summary || k.origin_title || "-" }}</td>
-                  <td><span class="asset-status" :class="{ verified: row.status === 'verified' }">{{ assetStatusLabel(row.status) }}</span></td>
-                  <td>{{ row.evidence || "-" }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <div class="ks-actions" v-if="!readonly">
-            <button class="ks-invalid" type="button" :disabled="invalidatingKillsweepId === k.id" @click="invalidateKillsweep(k)">
-              {{ invalidatingKillsweepId === k.id ? "标记中…" : "标记为无效" }}
-            </button>
-            <span>误判、资产不稳定、未实际验证或通杀条件不成立时使用。</span>
-          </div>
-        </div>
-      </div>
-    </div>
+    <TaskKillsweepPanel v-if="authRoleRef !== 'observer'" v-show="tab === 'killsweep'"
+      :task-id="props.id" :active="tab === 'killsweep'" @count="taskKillsweepTotal = $event" />
 
     <!-- 已驳回 -->
-    <div v-show="tab === 'rejected'" class="list-panel">
+    <div v-if="authRoleRef !== 'observer'" v-show="tab === 'rejected'" class="list-panel">
       <div class="list-head"><span>已驳回</span><small>沉淀不收口径，可恢复或继续深挖</small></div>
       <div v-if="!rejectedItems.length" class="empty">还没有被驳回的漏洞（复审点「不通过」会进这里，可回看与恢复）</div>
       <div v-else-if="!filteredRejected.length" class="empty">没有匹配当前关键词的驳回漏洞</div>
@@ -1208,7 +1138,7 @@ function parseEventTs(ts) {
     </div>
 
     <!-- AI 未采纳归档：ignored（疑似误杀）/ deepen 未升级，保留可回看纠错，一键救回复审 -->
-    <div v-show="tab === 'archived'" class="list-panel">
+    <div v-if="authRoleRef !== 'observer'" v-show="tab === 'archived'" class="list-panel">
       <div class="list-head">
         <span>AI 未采纳</span>
         <small>AI 判为非漏洞或深挖未升级的洞，保留在此防误杀，可点开查看、必要时「恢复到复审」</small>
@@ -1238,7 +1168,7 @@ function parseEventTs(ts) {
       </button>
     </div>
 
-    <ReportDrawer :finding-id="drawerId" :mode="drawerMode" :src-type="task.src_type"
+    <ReportDrawer v-if="authRoleRef !== 'observer'" :finding-id="drawerId" :mode="drawerMode" :src-type="task.src_type"
       @close="drawerId = null" @updated="onDrawerUpdated" @toast="toast" />
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
     </template>

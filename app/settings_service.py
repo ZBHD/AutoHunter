@@ -285,6 +285,8 @@ def resolve_llm_providers(task: Task | None = None) -> list[LLMProviderConfig]:
 def resolve_llm_config(task: Task | None = None) -> LLMConfig:
     """兼容旧展示调用方：返回首个可用 provider，否则返回池中首项。"""
     providers = resolve_llm_providers(task)
+    if not providers:
+        providers = [_legacy_provider()]
     selected = next(
         (provider for provider in providers if provider.enabled and provider.api_key),
         providers[0],

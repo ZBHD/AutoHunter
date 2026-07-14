@@ -1,15 +1,20 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { api, canWrite } from "../api.js";
 
+const route = useRoute();
+const router = useRouter();
+const queryValue = (value) => Array.isArray(value) ? String(value[0] || "") : String(value || "");
 const stats = ref({ total: 0, by_kind: {}, verified: 0, reused: 0 });
 const rows = ref([]);
 const initialLoading = ref(true);
 const refreshing = ref(false);
 const kind = ref("all");
 const confidence = ref("all");
-const searchDraft = ref("");
-const searchText = ref("");
+const searchDraft = ref(queryValue(route.query.q));
+const searchText = ref(queryValue(route.query.q).trim());
+const taskFilter = ref(queryValue(route.query.task_id));
 const curator = ref(null);
 const curatorLoading = ref(false);
 const curatorApplying = ref(false);
@@ -39,11 +44,22 @@ async function loadList() {
   if (!rows.value.length) initialLoading.value = true;
   else refreshing.value = true;
   try {
-    rows.value = await api.intelList(kind.value, confidence.value, searchText.value, 800);
+    const result = await api.intelList(kind.value, confidence.value, searchText.value, 800);
+    rows.value = taskFilter.value
+      ? result.filter((item) => item.source_task_id === taskFilter.value)
+      : result;
   } finally {
     initialLoading.value = false;
     refreshing.value = false;
   }
+}
+
+async function clearContextFilter() {
+  taskFilter.value = "";
+  searchDraft.value = "";
+  searchText.value = "";
+  await router.replace({ name: "intel" });
+  await loadList();
 }
 
 async function reload() {
@@ -122,6 +138,15 @@ watch(searchDraft, (v) => {
     loadList();
   }, 180);
 });
+watch(() => [route.query.q, route.query.task_id], ([nextQuery, nextTask]) => {
+  const q = queryValue(nextQuery);
+  const task = queryValue(nextTask);
+  if (q === searchDraft.value && task === taskFilter.value) return;
+  searchDraft.value = q;
+  searchText.value = q.trim();
+  taskFilter.value = task;
+  loadList();
+});
 
 onMounted(reload);
 </script>
@@ -174,6 +199,13 @@ onMounted(reload);
       </select>
       <button class="btn-ghost" @click="reload" :disabled="refreshing">{{ refreshing ? "刷新中…" : "刷新" }}</button>
       <button v-if="writable" class="btn-danger" @click="clearKind">清空当前类</button>
+    </div>
+
+    <div v-if="taskFilter" class="intel-context-filter">
+      <span>通杀关联筛选</span>
+      <b>任务 {{ taskFilter }}</b>
+      <b v-if="searchText">产品 {{ searchText }}</b>
+      <button type="button" @click="clearContextFilter">清除筛选</button>
     </div>
 
     <div class="curator-card">

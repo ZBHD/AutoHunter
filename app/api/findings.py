@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime import AGENT_EXECUTOR, agent_semaphore
@@ -21,6 +21,7 @@ from app.settings_service import llm_router_for_task
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
 from app.events import bus
+from app.killsweep_service import apply_manual_verdict, queue_initial_attempt
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.tools.executor import ToolExecutor
 
@@ -174,6 +175,10 @@ async def _resolve_edu_school_async(target_url: str | None) -> str | None:
 @router.get("/tasks/{task_id}/findings")
 async def list_findings(task_id: str, status: Optional[str] = None,
                         search: Optional[str] = Query(None, alias="q"),
+                        exclude_status: Optional[str] = "superseded",
+                        compact: bool = False,
+                        limit: Optional[int] = Query(None, ge=1, le=200),
+                        offset: int = Query(0, ge=0),
                         session: AsyncSession = Depends(get_session)):
     """所有原始漏洞（可按 status 过滤）。"""
     q = (
@@ -183,10 +188,35 @@ async def list_findings(task_id: str, status: Optional[str] = None,
     )
     if status:
         q = q.where(Finding.status == status)
+    if exclude_status:
+        q = q.where(Finding.status != exclude_status)
+    if search:
+        pattern = f"%{search.strip()}%"
+        q = q.where(or_(
+            Finding.title.ilike(pattern), Finding.target_url.ilike(pattern),
+            Finding.vuln_type.ilike(pattern), Finding.description.ilike(pattern),
+            Finding.owner.ilike(pattern), Review.reviewer_notes.ilike(pattern),
+        ))
+    total = (await session.execute(
+        select(func.count()).select_from(q.order_by(None).subquery())
+    )).scalar() or 0
     q = q.order_by(Finding.created_at.desc())
+    if limit is not None:
+        q = q.offset(offset).limit(limit)
     rows = (await session.execute(q)).all()
     out = [_finding_dict(f, r) for f, r in rows]
-    return [d for d in out if _matches_query(d, search)]
+    if compact:
+        omitted = {
+            "description", "steps", "poc", "raw_request", "raw_response", "evidence",
+            "affected_scope", "kill_chain", "self_check", "assistant_messages",
+        }
+        out = [{key: value for key, value in item.items() if key not in omitted} for item in out]
+    if compact or limit is not None or offset:
+        return {
+            "items": out, "total": total, "limit": limit or total, "offset": offset,
+            "has_more": offset + len(out) < total,
+        }
+    return out
 
 
 @router.get("/tasks/{task_id}/results")
@@ -376,7 +406,10 @@ async def killsweep_list(task_id: str, only_hits: bool = True,
         .where(Killsweep.task_id == task_id)
     )
     if only_hits:
-        q = q.where(Killsweep.is_killsweep == True)  # noqa: E712
+        q = q.where(
+            Killsweep.is_killsweep == True,  # noqa: E712
+            or_(Killsweep.manual_verdict.is_(None), Killsweep.manual_verdict != "invalid"),
+        )
     q = q.order_by(Killsweep.verified.desc(), Killsweep.asset_count.desc(), Killsweep.created_at.desc())
     rows = (await session.execute(q)).all()
     out = []
@@ -400,6 +433,16 @@ async def killsweep_list(task_id: str, only_hits: bool = True,
             "affected_table": k.affected_table or [],
             "notes": k.notes,
             "status": k.status,
+            "automatic_verdict": k.automatic_verdict,
+            "manual_verdict": k.manual_verdict,
+            "manual_reason": k.manual_reason,
+            "failure_kind": k.failure_kind,
+            "failure_message": k.failure_message,
+            "attempt_count": k.attempt_count,
+            "queued_at": to_cst_iso(k.queued_at),
+            "started_at": to_cst_iso(k.started_at),
+            "finished_at": to_cst_iso(k.finished_at),
+            "legacy_without_timeline": k.legacy_without_timeline,
             "created_at": to_cst_iso(k.created_at),
         }
         if _matches_query(item, search):
@@ -431,15 +474,12 @@ async def invalidate_killsweep(task_id: str, killsweep_id: str,
     k = await session.get(Killsweep, killsweep_id)
     if not k or k.task_id != task_id:
         raise HTTPException(404, "通杀记录不存在")
-    if k.status == "invalid" or not k.is_killsweep:
-        return {"ok": True, "id": k.id, "status": k.status or "invalid", "already_invalid": True}
+    if k.manual_verdict == "invalid":
+        return {"ok": True, "id": k.id, "status": k.status, "manual_verdict": "invalid", "already_invalid": True}
     reason = ((req.reason if req else "") or "人工标记无效").strip()[:500]
-    now = _now()
-    k.is_killsweep = False
-    k.status = "invalid"
-    k.updated_at = now
-    marker = f"[人工标记无效] {reason}"
-    k.notes = f"{(k.notes or '').strip()}\n{marker}".strip()
+    await apply_manual_verdict(
+        session, k.id, verdict="invalid", reason=reason, actor="full"
+    )
     session.add(TaskEvent(
         task_id=task_id,
         agent="killsweep",
@@ -457,7 +497,7 @@ async def invalidate_killsweep(task_id: str, killsweep_id: str,
         "product": k.product_name,
         "reason": reason,
     })
-    return {"ok": True, "id": k.id, "status": k.status}
+    return {"ok": True, "id": k.id, "status": k.status, "manual_verdict": k.manual_verdict}
 
 
 class ReportAssistantRequest(BaseModel):
@@ -1012,6 +1052,7 @@ async def user_review(finding_id: str, req: UserReviewRequest,
         raise HTTPException(404, "审核记录不存在")
     previous_user_status = r.user_status
     trigger_killsweep = False
+    killsweep_attempt_id = ""
     killsweep_skipped_reason = ""
     task_id = r.task_id
     f = await session.get(Finding, finding_id)
@@ -1037,12 +1078,24 @@ async def user_review(finding_id: str, req: UserReviewRequest,
         r.user_edits = req.user_edits
     if req.submitted is not None:
         r.submitted = req.submitted
+    if trigger_killsweep:
+        try:
+            _case, attempt, created = await queue_initial_attempt(
+                session, task_id=task_id, finding_id=finding_id
+            )
+            if created or attempt.status == "queued":
+                killsweep_attempt_id = attempt.id
+        except LookupError:
+            trigger_killsweep = False
+            killsweep_skipped_reason = "源漏洞不存在，无法创建通杀案例"
     await session.commit()
     killsweep_triggered = False
-    if trigger_killsweep:
-        # 只有人工复审通过才启动通杀 Hunter；AI accepted 只是进入复审队列。
+    if trigger_killsweep and killsweep_attempt_id:
+        # case + attempt 已与人工通过同事务提交；此处只唤醒持久化 attempt。
         from app.orchestrator import manager
-        killsweep_triggered = await manager.trigger_killsweep(task_id, finding_id)
+        killsweep_triggered = await manager.dispatch_killsweep_attempt(
+            task_id, killsweep_attempt_id
+        )
     return {
         "ok": True,
         "killsweep_triggered": killsweep_triggered,

@@ -8,7 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, text,
+    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
+    Text, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -100,6 +101,10 @@ class Target(Base):
     deepen_count: Mapped[int] = mapped_column(Integer, default=0)
     # 搜集阶段顺带查到的、过滤打分后的该域泄露凭证（喂给 worker 作额外攻击面）。
     leaked_creds: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 通杀派生目标所属案例；人工否定时只取消该案例尚未执行的目标。
+    killsweep_case_id: Mapped[str | None] = mapped_column(
+        ForeignKey("killsweeps.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
     assigned_worker: Mapped[str] = mapped_column(String(64), default="")
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -183,15 +188,113 @@ class Review(Base):
     finding: Mapped["Finding"] = relationship(back_populates="review")
 
 
+class MissedSignal(Base):
+    """尚未形成正式 Finding 的高价值信号及其人工处理状态。"""
+    __tablename__ = "missed_signals"
+    __table_args__ = (
+        Index("ux_missed_signals_dedup_key", "dedup_key", unique=True),
+        Index("ix_missed_signals_status_risk_seen", "status", "risk_score", "last_seen_at"),
+        Index("ix_missed_signals_task_status", "task_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("targets.id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    source_finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    converted_finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    dedup_key: Mapped[str] = mapped_column(String(128))
+    rule_key: Mapped[str] = mapped_column(String(80), default="")
+    rule_label: Mapped[str] = mapped_column(String(200), default="")
+    method: Mapped[str] = mapped_column(String(16), default="")
+    endpoint_key: Mapped[str] = mapped_column(String(1000), default="")
+    title: Mapped[str] = mapped_column(String(500), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    risk_level: Mapped[str] = mapped_column(String(20), default="medium")
+    risk_score: Mapped[float] = mapped_column(Float, default=0.0)
+    source_types: Mapped[list] = mapped_column(JSON, default=list)
+    # pending / deepening / converted / rejected
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    hit_count: Mapped[int] = mapped_column(Integer, default=1)
+    evidence_count: Mapped[int] = mapped_column(Integer, default=0)
+    deepen_count: Mapped[int] = mapped_column(Integer, default=0)
+    deepen_phase: Mapped[str] = mapped_column(String(40), default="")
+    deepen_directive: Mapped[str] = mapped_column(Text, default="")
+    deepen_error: Mapped[str] = mapped_column(Text, default="")
+    last_rejection_reason: Mapped[str] = mapped_column(Text, default="")
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    converted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class MissedSignalEvent(Base):
+    """疑似信号不可变的状态与人工操作审计记录。"""
+    __tablename__ = "missed_signal_events"
+    __table_args__ = (
+        Index("ix_missed_signal_events_signal_created", "signal_id", "created_at"),
+        Index("ix_missed_signal_events_task_created", "task_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[str] = mapped_column(
+        ForeignKey("missed_signals.id", ondelete="CASCADE"), index=True,
+    )
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(40), default="")
+    actor_role: Mapped[str] = mapped_column(String(20), default="system")
+    from_status: Mapped[str] = mapped_column(String(20), default="")
+    to_status: Mapped[str] = mapped_column(String(20), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class MissedSignalDraft(Base):
+    """由已有证据生成、可自动保存并采用乐观锁编辑的报告草稿。"""
+    __tablename__ = "missed_signal_drafts"
+    __table_args__ = (
+        Index("ux_missed_signal_drafts_signal", "signal_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    signal_id: Mapped[str] = mapped_column(
+        ForeignKey("missed_signals.id", ondelete="CASCADE"), index=True,
+    )
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    # generating / ready / failed / confirmed
+    status: Mapped[str] = mapped_column(String(20), default="generating", index=True)
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    missing_evidence: Mapped[list] = mapped_column(JSON, default=list)
+    provider_trace: Mapped[list] = mapped_column(JSON, default=list)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    generation_count: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Killsweep(Base):
     """通杀候选：审核 accepted 一个洞后，通杀 Hunter 分析该系统是否为通用产品、能否一打一片。
 
-    按「产品指纹」去重——同款系统（同一 product_key）只分析一条。
+    每个源 Finding 对应一个非历史案例；产品指纹只用于检索，不再决定案例身份。
     """
     __tablename__ = "killsweeps"
     __table_args__ = (
-        # 同一任务内同款产品只留一条（产品指纹去重）
-        Index("ux_killsweeps_task_product", "task_id", "product_key", unique=True),
+        Index("ix_killsweeps_task_product", "task_id", "product_key"),
+        Index(
+            "ux_killsweeps_origin_finding", "origin_finding_id", unique=True,
+            sqlite_where=text("origin_finding_id <> '' AND legacy_without_timeline = 0"),
+        ),
+        Index("ix_killsweeps_status_finished", "status", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -213,10 +316,169 @@ class Killsweep(Base):
     # 既用于前端展示，也会进入 worker 查重上下文，避免同学校同通杀洞反复提交。
     affected_table: Mapped[list] = mapped_column(JSON, default=list)
     notes: Mapped[str] = mapped_column(Text, default="")                 # 分析结论/批量建议
-    # analyzing / done / failed
-    status: Mapped[str] = mapped_column(String(20), default="analyzing", index=True)
+    # queued / running / succeeded / failed
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    # pending_validation / killsweep / not_killsweep
+    automatic_verdict: Mapped[str] = mapped_column(
+        String(20), default="pending_validation", index=True,
+    )
+    # null / confirmed / not_killsweep / invalid；与自动结论并列保留。
+    manual_verdict: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    manual_reason: Mapped[str] = mapped_column(Text, default="")
+    manual_actor: Mapped[str] = mapped_column(String(40), default="")
+    manual_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failure_kind: Mapped[str] = mapped_column(String(60), default="")
+    failure_message: Mapped[str] = mapped_column(Text, default="")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime, default=_now, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    legacy_without_timeline: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 避免 Killsweep 与 Attempt 互相声明外键造成 SQLite 环形建表。
+    current_attempt_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    latest_success_attempt_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class KillsweepReanalysisBatch(Base):
+    """一次按当前筛选条件选择最多 40 条案例的重析请求。"""
+    __tablename__ = "killsweep_reanalysis_batches"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    filters: Mapped[dict] = mapped_column(JSON, default=dict)
+    actor_role: Mapped[str] = mapped_column(String(20), default="full")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+
+class KillsweepAttempt(Base):
+    """通杀案例的一次不可覆盖分析尝试。"""
+    __tablename__ = "killsweep_attempts"
+    __table_args__ = (
+        Index("ux_killsweep_attempts_case_number", "case_id", "attempt_no", unique=True),
+        Index(
+            "ux_killsweep_attempts_active_case", "case_id", unique=True,
+            sqlite_where=text("status IN ('queued', 'running')"),
+        ),
+        Index("ix_killsweep_attempts_task_status", "task_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    case_id: Mapped[str] = mapped_column(
+        ForeignKey("killsweeps.id", ondelete="CASCADE"), index=True,
+    )
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("killsweep_reanalysis_batches.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer)
+    trigger: Mapped[str] = mapped_column(String(30), default="initial")
+    # queued / running / succeeded / failed / cancelled
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    automatic_verdict: Mapped[str] = mapped_column(String(20), default="pending_validation")
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    provider_trace: Mapped[list] = mapped_column(JSON, default=list)
+    error_kind: Mapped[str] = mapped_column(String(60), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KillsweepEvent(Base):
+    """一次通杀尝试中的完整有序时间线事件。"""
+    __tablename__ = "killsweep_events"
+    __table_args__ = (
+        Index("ix_killsweep_events_case_sequence", "case_id", "sequence"),
+        Index("ix_killsweep_events_attempt_sequence", "attempt_id", "sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[str] = mapped_column(
+        ForeignKey("killsweeps.id", ondelete="CASCADE"), index=True,
+    )
+    attempt_id: Mapped[str | None] = mapped_column(
+        ForeignKey("killsweep_attempts.id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    kind: Mapped[str] = mapped_column(String(50), default="")
+    level: Mapped[str] = mapped_column(String(10), default="info")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class RawEvidence(Base):
+    """工具完整原始证据的元数据；正文按频道存入分块表。"""
+    __tablename__ = "raw_evidence"
+    __table_args__ = (
+        Index("ix_raw_evidence_signal_created", "missed_signal_id", "created_at"),
+        Index("ix_raw_evidence_killsweep_event", "killsweep_event_id"),
+        Index("ix_raw_evidence_task_created", "task_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("targets.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    missed_signal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("missed_signals.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    killsweep_event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("killsweep_events.id", ondelete="CASCADE"), nullable=True, index=True,
+    )
+    source_kind: Mapped[str] = mapped_column(String(40), default="")
+    # writing / complete / partial / failed / legacy_partial
+    capture_status: Mapped[str] = mapped_column(String(20), default="writing", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    preview: Mapped[dict] = mapped_column(JSON, default=dict)
+    content_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    # 私有清理注册表：仅记录尚待删除的 `.captures/<id>` 目录，不通过 API/LLM 暴露。
+    spool_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class RawEvidenceChunk(Base):
+    """原始证据固定大小分块；同频道按 seq 串流重建。"""
+    __tablename__ = "raw_evidence_chunks"
+    __table_args__ = (
+        Index(
+            "ux_raw_evidence_chunks_channel_seq",
+            "evidence_id", "channel", "seq", unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    evidence_id: Mapped[str] = mapped_column(
+        ForeignKey("raw_evidence.id", ondelete="CASCADE"), index=True,
+    )
+    channel: Mapped[str] = mapped_column(String(30))
+    seq: Mapped[int] = mapped_column(Integer)
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+
+
+class MissedSignalEvidence(Base):
+    """多条疑似信号共享同一份完整 capture 的关联表。
+
+    ``RawEvidence.missed_signal_id`` 保留为旧库兼容的主关联；新运行时关系
+    统一写入这里，因此同一份分块正文不会因规则命中数增加而复制。
+    """
+    __tablename__ = "missed_signal_evidence"
+    __table_args__ = (
+        Index("ix_missed_signal_evidence_evidence", "evidence_id"),
+    )
+
+    missed_signal_id: Mapped[str] = mapped_column(
+        ForeignKey("missed_signals.id", ondelete="CASCADE"), primary_key=True,
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        ForeignKey("raw_evidence.id", ondelete="CASCADE"), primary_key=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class TaskEvent(Base):

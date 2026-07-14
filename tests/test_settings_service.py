@@ -681,3 +681,28 @@ def test_refresh_cache_tolerates_non_mapping_provider_entries(
         asyncio.run(engine.dispose())
 
     assert settings_service.resolve_llm_providers() == []
+
+
+def test_legacy_display_config_survives_an_all_invalid_provider_cache(monkeypatch) -> None:
+    monkeypatch.setattr(
+        settings_service,
+        "_cache",
+        {
+            "llm": {
+                "base_url": "https://legacy.example/v1",
+                "api_key": "legacy-key",
+                "model": "legacy-model",
+                "protocol": "openai_chat",
+                "temperature": 0.3,
+            },
+            "llm_providers": ["not-a-provider"],
+            "fofa": {},
+            "engines": {},
+            "defaults": {},
+        },
+    )
+
+    resolved = settings_service.resolve_llm_config()
+
+    assert resolved.model == "legacy-model"
+    assert resolved.base_url == "https://legacy.example/v1"
