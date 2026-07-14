@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from app.db.models import Finding, Target
 
 DEEPEN_CAP = 2  # 单 target 被打回深挖的最大次数（人工 + AI 合计）
@@ -41,6 +43,9 @@ def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
     }
     tgt.deepen_count += 1
     tgt.status = "queued"
+    # Manual ordering is 1-based. Newer negative timestamps sort before every
+    # existing position and before earlier deepening requests.
+    tgt.queue_position = -int(time.time() * 1_000_000)
     tgt.assigned_worker = ""
     tgt.retry_count = 0
     # 回队前清掉上一轮的终态残留：done 目标带的旧 verdict=found、心跳、dead_reason

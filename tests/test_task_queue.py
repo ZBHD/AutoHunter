@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app import orchestrator
-from app.db.models import Base, Target, Task
+from app.agents.deepen import apply_deepen
+from app.db.models import Base, Finding, Target, Task
+from app.queue_targets import queue_dispatch_order
 
 
 def _run(coro):
@@ -83,6 +86,63 @@ def test_unordered_queue_keeps_existing_priority_dispatch(tmp_path, monkeypatch)
             selected = await runner._pop_queued(session)
             assert selected is not None
             assert selected.id == "target-default-high"
+        await engine.dispose()
+
+    _run(scenario())
+
+
+def test_manual_deepen_is_inserted_at_the_front_of_the_persisted_queue(tmp_path) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'deepen-front.db'}")
+        sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(Task(id="task-deepen-front", name="Deepen front", status="paused"))
+            session.add_all([
+                Target(
+                    id="target-manual-first", task_id="task-deepen-front",
+                    url="https://manual.example", host="manual.example", source="fofa",
+                    status="queued", priority_score=999, queue_position=1,
+                ),
+                Target(
+                    id="target-earlier-deepen", task_id="task-deepen-front",
+                    url="https://earlier.example", host="earlier.example", source="fofa",
+                    status="queued", priority_score=200, queue_position=-1_000_000,
+                ),
+            ])
+            target = Target(
+                id="target-deepen", task_id="task-deepen-front",
+                url="https://deep.example", host="deep.example", source="fofa",
+                status="done", verdict="found", priority_score=1, queue_position=8,
+            )
+            finding = Finding(
+                id="finding-deepen", task_id="task-deepen-front", target_id=target.id,
+                vuln_type="idor", title="Original finding", severity_claimed="高危",
+                target_url="https://deep.example/api/users", description="Original evidence summary",
+                dedup_key="finding-deepen-key",
+            )
+            session.add_all([target, finding])
+            await session.flush()
+
+            applied, _message = apply_deepen(
+                session, finding, target, "Verify the original IDOR with another account", source="user",
+            )
+            await session.commit()
+
+            queued = list(await session.scalars(
+                select(Target)
+                .where(Target.task_id == "task-deepen-front", Target.status == "queued")
+                .order_by(*queue_dispatch_order())
+            ))
+            assert applied is True
+            assert [item.id for item in queued] == [
+                "target-deepen", "target-earlier-deepen", "target-manual-first",
+            ]
+            assert target.queue_position is not None and target.queue_position < 0
+            assert target.deepen_context["directive"] == "Verify the original IDOR with another account"
+            assert target.deepen_context["original_title"] == "Original finding"
+            assert target.deepen_context["original_summary"] == "Original evidence summary"
         await engine.dispose()
 
     _run(scenario())
