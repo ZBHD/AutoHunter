@@ -21,7 +21,7 @@ fi
 if [ -n "$SOURCE_BUNDLE" ]; then
   git fetch "$SOURCE_BUNDLE" main
   if git rev-parse --verify HEAD >/dev/null 2>&1; then
-    git reset --ff-only FETCH_HEAD
+    git merge --ff-only FETCH_HEAD
   else
     git checkout -B main FETCH_HEAD
   fi

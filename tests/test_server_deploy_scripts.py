@@ -24,7 +24,7 @@ def test_server_update_builds_before_stopping_and_backs_up_before_recreate() -> 
     assert build < stop < backup < recreate
     assert "git pull --ff-only origin" in source
     assert "git fetch \"$SOURCE_BUNDLE\" main" in source
-    assert "git reset --ff-only FETCH_HEAD" in source
+    assert "git merge --ff-only FETCH_HEAD" in source
     assert "restart_previous_container" in source
     assert "trap restart_previous_container EXIT" in source
     assert 'curl -fsS --max-time 5 "$HEALTH_URL"' in source
