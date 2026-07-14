@@ -254,6 +254,16 @@ docker compose up -d --build           # 更新代码后重建
 
 数据持久化在 Docker volume：`ah_data`（SQLite 数据库 + 漏洞证据）、`ah_work`（Worker 临时工作区）。**升级/重启不丢数据。**
 
+### 服务器无损更新（推荐）
+
+服务器部署后使用仓库内的更新脚本，避免直接删除卷或在构建失败时中断旧版本：
+
+```bash
+bash scripts/update-server.sh
+```
+
+脚本会先拉取 `main` 并构建新镜像，构建成功后才优雅停止旧容器，备份 `ah_data`，再启动新版本并检查 `/health`。更新失败会尝试恢复旧镜像；备份保存在 `backups/`，默认保留最近 10 份。不要执行 `docker compose down -v`，否则会删除任务、漏洞和 Provider 数据。
+
 ---
 
 ## 服务器长期运行 / 开机自启
