@@ -1,6 +1,6 @@
 # AutoHunter 停止搜索并排空队列设计
 
-> 2026-07-15 | status: draft
+> 2026-07-15 | status: approved
 
 ## 目标
 
