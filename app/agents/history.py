@@ -24,6 +24,7 @@ import json
 from typing import Any
 
 from app.config import worker_config
+from app.tools.src_toolkit import SRC_TOOL_NAMES
 
 # http 响应里值得在历史中保留的关键头（小写匹配）：鉴权/指纹/跳转/会话判断依据。
 _KEY_RESP_HEADERS = (
@@ -135,6 +136,70 @@ def _compress_js_analysis(data: dict) -> dict:
     return keep
 
 
+def _compress_api_schema(data: dict) -> dict:
+    keep = _pick_fields(data, ("ok", "title", "version", "base_url", "endpoint_count", "truncated"), 180)
+    endpoints = data.get("endpoints")
+    if isinstance(endpoints, list):
+        keep["endpoints_top"] = [
+            _pick_fields(
+                item,
+                ("method", "path", "url", "auth", "risk_score", "risk_reasons", "parameters", "request_fields"),
+                140,
+            )
+            for item in endpoints[:10]
+            if isinstance(item, dict)
+        ]
+    return keep
+
+
+def _compress_http_surface(data: dict) -> dict:
+    keep = _pick_fields(data, ("ok", "content_type", "generator"), 160)
+    forms = data.get("forms")
+    if isinstance(forms, list):
+        keep["forms_top"] = [
+            _pick_fields(item, ("action", "method", "has_password", "has_file_input", "risk_score", "risk_reasons"), 140)
+            for item in forms[:6]
+            if isinstance(item, dict)
+        ]
+    candidates = data.get("candidates")
+    if isinstance(candidates, list):
+        keep["candidates_top"] = [
+            _pick_fields(item, ("method", "url", "source", "risk_score", "risk_reasons"), 140)
+            for item in candidates[:10]
+            if isinstance(item, dict)
+        ]
+    if isinstance(data.get("scripts"), list):
+        keep["scripts_sample"] = [_short(item, 140) for item in data["scripts"][:8]]
+    return keep
+
+
+def _compress_response_compare(data: dict) -> dict:
+    keep: dict[str, Any] = {
+        "ok": data.get("ok"),
+        "material_difference": data.get("material_difference"),
+        "status": data.get("status"),
+    }
+    body = data.get("body")
+    if isinstance(body, dict):
+        keep["body"] = {
+            "format": body.get("format"),
+            "similarity": body.get("similarity"),
+            "changed_paths": (body.get("changed_paths") or [])[:8],
+            "added_paths": (body.get("added_paths") or [])[:8],
+            "removed_paths": (body.get("removed_paths") or [])[:8],
+        }
+    return keep
+
+
+def _compress_auth_analysis(data: dict) -> dict:
+    keep = _pick_fields(data, ("ok", "authorization", "session_signals", "api_key_headers", "csrf_candidates"), 240)
+    for name in ("request_cookies", "response_cookies", "jwt_candidates"):
+        value = data.get(name)
+        if isinstance(value, list):
+            keep[name] = value[:8]
+    return keep
+
+
 def _compress_generic(data: dict) -> dict:
     """未知工具的兜底压缩：保留标量/短字段，长字符串只留开头。"""
     keep: dict[str, Any] = {}
@@ -165,13 +230,42 @@ def summarize_tool_content(raw: str, tool: str) -> str:
         keep = _compress_shell(data)
     elif tool == "analyze_javascript":
         keep = _compress_js_analysis(data)
+    elif tool == "analyze_api_schema":
+        keep = _compress_api_schema(data)
+    elif tool == "extract_http_surface":
+        keep = _compress_http_surface(data)
+    elif tool == "compare_http_responses":
+        keep = _compress_response_compare(data)
+    elif tool == "analyze_auth_material":
+        keep = _compress_auth_analysis(data)
+    elif tool in SRC_TOOL_NAMES:
+        keep = _compress_shell(data)
     else:
         keep = _compress_generic(data)
 
     summary = json.dumps(keep, ensure_ascii=False, separators=(",", ":"))
-    limit = 2400 if tool == "analyze_javascript" else 720
-    # JS 摘要稍宽一些，保留后续可验证端点；其它工具保持小而稳定。
+    limit = 2400 if tool in {
+        "analyze_javascript", "analyze_api_schema", "extract_http_surface",
+        "compare_http_responses", "analyze_auth_material",
+    } else 720
+    # 分析工具摘要稍宽一些，保留后续可验证端点；其它工具保持小而稳定。
     return f"[历史已压缩·{tool}] {summary}"[:limit]
+
+
+def bounded_tool_content(result: Any, tool: str) -> str:
+    """Serialize a recent tool result without exceeding the configured LLM cap."""
+    raw = json.dumps(result, ensure_ascii=False, default=str)
+    if tool not in SRC_TOOL_NAMES | {
+        "analyze_api_schema", "extract_http_surface",
+        "compare_http_responses", "analyze_auth_material",
+    }:
+        return raw
+    limit = max(1, int(worker_config.output_truncate or 4096))
+    if worker_config.llm_tool_output_truncate > 0:
+        limit = min(limit, int(worker_config.llm_tool_output_truncate))
+    if len(raw) <= limit:
+        return raw
+    return summarize_tool_content(raw, tool)[:limit]
 
 
 def compact_messages(messages: list[dict[str, Any]], cur_round: int) -> list[dict[str, Any]]:

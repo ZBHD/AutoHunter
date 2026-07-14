@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime import AGENT_EXECUTOR, agent_semaphore
 from app.agents.deepen import apply_deepen
+from app.agents.prompts import is_enterprise_src
 from app.settings_service import llm_router_for_task
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
@@ -77,6 +78,9 @@ def _clip_text(text: str, limit: int) -> str:
 
 def _clip_json(value, limit: int) -> str:
     data = {} if value is None else value
+    model_dump = getattr(data, "model_dump", None)
+    if callable(model_dump):
+        data = model_dump(mode="json")
     return _clip_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), limit)
 
 
@@ -714,9 +718,15 @@ def _run_report_assistant(
     req: ReportAssistantRequest,
     cancel_event: threading.Event,
     emit=None,
+    enterprise: bool = False,
 ) -> dict:
     """运行报告助手；emit(event:dict) 可选回调，每完成一步就推一条事件用于流式展示。"""
-    executor = ToolExecutor(f"report_assistant_{f.target_url or f.id}", cancel_event=cancel_event)
+    executor = ToolExecutor(
+        f"report_assistant_{f.target_url or f.id}",
+        cancel_event=cancel_event,
+        enterprise=enterprise,
+        scope_target=f.target_url or "",
+    )
     messages = _build_assistant_messages(f, r, req)
     tool_logs: list[dict] = []
 
@@ -872,6 +882,7 @@ async def report_assistant(finding_id: str, req: ReportAssistantRequest,
     task = await session.get(Task, f.task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    assistant_enterprise = is_enterprise_src(getattr(task, "src_type", "edusrc"))
 
     persisted = _sanitize_assistant_messages(f.assistant_messages)
     if not persisted:
@@ -888,7 +899,11 @@ async def report_assistant(finding_id: str, req: ReportAssistantRequest,
     await assistant_sem.acquire()
     try:
         future = loop.run_in_executor(
-            AGENT_EXECUTOR, lambda: _run_report_assistant(llm, f, r, llm_req, cancel_event),
+            AGENT_EXECUTOR,
+            lambda: _run_report_assistant(
+                llm, f, r, llm_req, cancel_event,
+                enterprise=assistant_enterprise,
+            ),
         )
     except BaseException:
         assistant_sem.release()
@@ -941,6 +956,7 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
     task = await session.get(Task, f.task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    assistant_enterprise = is_enterprise_src(getattr(task, "src_type", "edusrc"))
 
     persisted = _sanitize_assistant_messages(f.assistant_messages)
     if not persisted:
@@ -962,7 +978,10 @@ async def report_assistant_stream(finding_id: str, req: ReportAssistantRequest,
         try:
             future = loop.run_in_executor(
                 AGENT_EXECUTOR,
-                lambda: _run_report_assistant(llm, f, r, llm_req, cancel_event, emit=_emit),
+                lambda: _run_report_assistant(
+                    llm, f, r, llm_req, cancel_event, emit=_emit,
+                    enterprise=assistant_enterprise,
+                ),
             )
         except BaseException:
             assistant_sem.release()
@@ -1120,7 +1139,12 @@ async def user_deepen(finding_id: str, req: DeepenRequest,
         raise HTTPException(404, "漏洞不存在")
     r = (await session.execute(select(Review).where(Review.finding_id == finding_id))).scalar_one_or_none()
     tgt = await session.get(Target, f.target_id)
-    ok, suffix = apply_deepen(session, f, tgt, directive, source="user")
+    effective_severity = (
+        (r.user_severity or r.severity_final) if r else None
+    ) or f.severity_claimed
+    ok, suffix = apply_deepen(
+        session, f, tgt, directive, source="user", severity=effective_severity
+    )
     if not ok:
         # 深挖失败：回滚一切改动，绝不把 user_status 污染成 deepening，
         # 否则该漏洞会从复审/驳回列表消失又进不了深挖，变成查不到的"幽灵数据"。

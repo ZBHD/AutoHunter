@@ -64,7 +64,7 @@ const form = reactive({
   model: "",
   protocol: "openai_chat",
   temperature: 0.3,
-  prompt_version: "legacy",
+  prompt_version: "current",
   fofa_key: "",
   fofa_base_url: "",
   max_pages: 20,
@@ -104,7 +104,7 @@ function fill(task) {
   form.model = modelCfg.model || "";
   form.protocol = modelCfg.protocol || "openai_chat";
   form.temperature = Number(modelCfg.temperature ?? 0.3);
-  form.prompt_version = modelCfg.prompt_version || "legacy";
+  form.prompt_version = modelCfg.prompt_version || "current";
   form.fofa_key = "";
   form.fofa_base_url = fofaCfg.base_url || "";
   form.max_pages = fofaCfg.max_pages ?? 20;

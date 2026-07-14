@@ -26,7 +26,7 @@ AutoHunter 是一个**多 Agent 协同的自动化漏洞挖掘系统**。你把�
 
 ```
 Collector（搜集）  →  Worker（1:1 真实挖洞）  →  Reviewer（AI 初审去垃圾）  →  人工复审 → 待提交
-     ↑ FOFA/手动录目标        ↑ LLM + 真实工具链（nmap/nuclei/sqlmap/httpx/JS 分析…）
+     ↑ FOFA/手动录目标        ↑ LLM + 真实工具链（httpx/Katana/FFUF/Arjun/JS 与证据分析…）
 ```
 
 - **Collector**：从 FOFA 持续产出目标，探活、预筛、评分、归属标注后入队。
@@ -135,7 +135,7 @@ bash scripts/install.sh
 
 脚本会：检查 Docker 环境 → 引导你填 **LLM API Key**（必填）、**FOFA Key**（推荐）→ 自动生成高强度访问令牌 → 构建镜像并启动 → 打印访问地址和令牌。
 
-> 首次构建会编译前端 + 安装挖洞工具（nmap / nuclei / sqlmap / httpx / whatweb 等），约 5–15 分钟，请耐心等待。
+> 首次构建会编译前端，并安装 HTTPX、Katana、FFUF、Arjun、wafw00f、Nmap、WhatWeb，以及仅供非企业模式定向验证的 Nuclei、Dalfox、SQLMap，约 5–15 分钟，请耐心等待。企业 SRC 的工具限制见下方[模式矩阵](#企业与非企业模式矩阵)；镜像内存在某个二进制不代表该模式允许调用。
 
 ---
 
@@ -204,6 +204,85 @@ body="管理" && org="China Education and Research Network Center"
 展开「高级」可选择使用**全局 Provider 池**，或按任务固定 `base_url`/`api_key`/模型名/协议/温度；还可覆盖 Worker 提示词版本、FOFA key、FOFA 最大页数和 Worker 并发数。默认使用全局池。
 
 > ⚠️ **务必收窄授权范围**：只搜你有权限测试的资产。`org` / `domain` / `cert` 是最有效的归属过滤手段。
+
+### Worker 工具使用方法与场景
+
+工具由 Worker 根据当前响应自动选择，通常不需要人工逐个调用。任务的「挖掘方向」可以明确要求优先走某条链路，例如“先提取 OpenAPI，再重点验证对象级权限边界”。
+
+| 工具 | 使用方法 | 适用场景 |
+|------|----------|----------|
+| `http_request` | 传完整 URL、方法、请求头和请求体，获取真实状态码、响应头、正文和请求包 | 所有 HTTP 基线、候选和取证请求的首选入口 |
+| `extract_http_surface` | 优先直接传页面 `url`，工具会内部获取完整的有界 HTML；已有完整内容时也可传 `body`/`base_url`/响应头 | 登录页、后台页、服务端渲染页面；提取表单、上传字段、脚本和 API/管理路径 |
+| `analyze_javascript` | 传入口 URL 或已经取得的 JS 文本 | Vue/React/SPA、前端路由、隐藏 API、签名参数、硬编码配置和密钥线索 |
+| `analyze_api_schema` | 优先直接传文档 `url`，工具会内部获取完整的有界文档；已有完整 JSON 时可传 `document`，可附 `base_url` 和关注关键词 | Swagger/OpenAPI 暴露；按鉴权、对象参数、读写方法和业务敏感度排序接口 |
+| `analyze_auth_material` | 传已取得的请求头、响应头或正文 | 识别 Authorization、Cookie、JWT、API Key 头、CSRF 字段和会话属性；完整令牌只保留指纹 |
+| `session_set` | 登记已经取得的 Cookie 或 Authorization 等请求头 | 登录成功、拿到 Token 或切换测试身份后，后续 `http_request` 自动保持会话 |
+| `compare_http_responses` | 传入基线响应和候选响应，可指定忽略的动态 JSON 路径 | IDOR/BOLA、未授权、身份切换、修改前后状态；量化状态码、关键头和 JSON 路径差异 |
+| `decode_transform` | 传 token/编码串并选择 `auto/base64/hex/url/jwt/hash` | JWT 结构、Base64/Hex 参数、URL 编码和哈希类型识别 |
+| `suggest_waf_bypass` | 传被拦截的最小 payload、状态码、响应头和正文 | 明确验证请求遇到 403/406/429 或拦截页；输出少量候选变形后必须重新实测 |
+| `fofa_lookup` | 传精确 FOFA 语法和小样本数量 | 确认裸 IP 归属、同 IP/同域服务和隐藏端口，不替代漏洞验证 |
+| `run_shell` | 传具体命令和超时；优先用于 curl 或短脚本构造单请求 | 已知入口的最小复现、格式转换和本地辅助；企业 SRC 严禁借此调用 Nuclei 类自动化漏洞扫描器 |
+| `check_duplicate_finding` | 传漏洞类型、标题和 URL | 提交前查询统一查重库，避免重复报告 |
+| `report_intel` | 上报已验证的端点、凭证状态或技术画像 | 把可复用情报提供给后续同系统 Worker；失败和猜测不沉淀 |
+| `report_coverage` | 上报已验证端点、剩余入口和覆盖缺口 | 单站多路线协作，避免后续 Worker 重复测试同一批接口 |
+| `submit_finding` | 填完整 Finding、自检、原始请求响应和利用链 | 已形成真实影响并满足证据门槛时提交原始发现 |
+| `finish` | 填 `found/no_vuln`、总结和可选 `deepen_lead` | 当前 Worker 收尾；线索真实但差一步时明确下一轮接口、参数和动作 |
+
+#### SRC CLI 工具
+
+以下工具均由 Worker 以结构化参数调用，命令使用独立参数数组执行，不经过 shell 拼接。示例只展示最小参数；请求头、Cookie 等敏感值会在展示命令中脱敏。
+
+| 工具 | 最小用法 | 适用场景 | 执行边界与结果处理 |
+|------|----------|----------|------------------|
+| `probe_http`（HTTPX） | `{"url":"https://host/","rate_limit":20}` | 初次进入目标时确认状态码、标题、技术栈、Server、IP 和 CNAME，建立 HTTP 基线 | 仅当前目标主机；速率最高 50 req/s、单请求超时最高 30 秒。指纹不是漏洞，后续用 `http_request` 取证 |
+| `crawl_endpoints`（Katana） | `{"url":"https://host/","depth":2,"js_crawl":true}` | SPA、登录后页面、JS 较多的站点；补全页面、表单、脚本和带参端点 | 仅当前 FQDN；深度最高 3、并发最高 10，并限制爬取时长、页面数和响应大小。优先复核认证、上传、导出和管理端点 |
+| `discover_content`（FFUF） | `{"url":"https://host/FUZZ","wordlist":"api"}` | 已确认存在 Web 服务，但页面或 JS 未暴露完整的 API、后台、文档、上传等高价值路径 | URL 必须包含 `FUZZ`；只能选仓库内置 `common/api` 小字典；线程最高 20、速率最高 50 req/s。命中后须排除软 404 和统一跳转 |
+| `discover_parameters`（Arjun） | `{"url":"https://host/api/item","method":"GET"}` | 已知业务端点疑似存在隐藏的对象、租户、分页、导出或鉴权参数 | 仅使用内置小参数字典；方法限 `GET/POST/JSON/XML`，线程最高 5、速率最高 20 req/s。发现参数后先用无害值做基线与候选对比 |
+| `scan_nuclei`（Nuclei） | `{"url":"https://host/","template_id":["TEMPLATE_ID"]}` | **仅非企业模式**，且已经形成组件、配置或 CVE 假设时，用具体模板、tag 或 template ID 做定向验证 | 至少提供一种 selector；并发最高 10、速率最高 50 req/s。企业 SRC 不提供该工具，`run_shell` 也不得调用；命中仅算候选，必须回到最小请求复核 |
+| `verify_xss`（Dalfox） | `{"url":"https://host/search?q=test","params":["q"]}` | **仅非企业模式**，已通过基线请求确认具体参数可控或反射时，做定向 XSS 验证 | 必须给出已知参数，最多 5 个；跳过参数挖掘，worker 最高 5、速率最高 20 req/s。输出需结合实际上下文和 SRC 收取规则复核 |
+| `fingerprint_waf`（wafw00f） | `{"url":"https://host/"}` | 出现 403、406、429、挑战页或响应差异时，识别 WAF、CDN 或安全网关 | 只做当前 URL 的防护指纹，不代表已绕过，也不自动生成漏洞结论；后续请求保持低频并保存基线 |
+| `scan_web_ports`（Nmap） | `{"host":"host","ports":[443,8443]}` | 当前目标存在明确的 Web、API 或管理端口线索时，确认少量端口和服务版本 | 仅当前单主机，最多 20 个明确端口；固定 TCP connect、轻量版本识别和主机超时，不做全端口或网段扫描 |
+
+#### 企业与非企业模式矩阵
+
+“有界侦察工具”用于梳理当前目标的资产、端点和参数；“自动化漏洞扫描器”会批量生成漏洞探测请求。企业 SRC 只开放前者和单请求取证，二者不可混用。
+
+| 能力 | 非企业模式（EduSRC 等） | 企业 SRC | 共同要求 |
+|------|-------------------------|----------|----------|
+| HTTP/防护指纹：`probe_http`、`fingerprint_waf` | 可用 | 可用 | 仅当前主机、低频执行，结果只用于选择后续入口 |
+| 端点与参数发现：`crawl_endpoints`、`discover_content`、`discover_parameters` | 可用 | 可用，但必须遵守任务资产边界和内置小字典/并发上限 | 命中后以 `http_request` 做单请求复核，不把发现结果直接当漏洞 |
+| 少量 Web 端口确认：`scan_web_ports` | 可用 | 可用 | 最多 20 个明确端口，不做全端口、网段或姊妹域扫描 |
+| 自动化漏洞扫描：`scan_nuclei`、`verify_xss`，以及 Nuclei、SQLMap、Dalfox、Nikto、Xray 等同类命令 | 仅在任务规则允许且已有明确入口、参数或 selector 时定向使用 | **严禁使用；对应结构化工具不会开放，`run_shell` 也不可作为绕过入口** | 扫描结果均不是漏洞证据，非企业模式命中后仍须最小请求复核 |
+| 真实验证与取证：`http_request`、curl 单请求、证据分析工具 | 首选 | 首选 | 保存同一次真实请求/响应，证明可控性和实际影响 |
+
+典型调用链：
+
+1. HTTP 基线：`probe_http → fingerprint_waf（出现防护信号时）→ http_request`。
+2. SPA/前端入口：`crawl_endpoints → analyze_javascript → http_request`，服务端 HTML 可走 `extract_http_surface`。
+3. 高价值路径：`discover_content（URL 带 FUZZ）→ http_request 排除软 404/统一跳转 → extract_http_surface 或 analyze_api_schema`。
+4. 隐藏参数：`discover_parameters（已知端点）→ 两次 http_request → compare_http_responses`。
+5. Web 端口线索：`scan_web_ports（不超过 20 个明确端口）→ probe_http → http_request`。
+6. API 文档：`http_request → analyze_api_schema → http_request → compare_http_responses`。
+7. 登录与越权：`http_request → analyze_auth_material → session_set → 两次 http_request → compare_http_responses`。
+8. 非企业定向验证：`scan_nuclei 或 verify_xss → http_request/curl 最小复现 → 保存原始证据`；企业 SRC 跳过此链，直接从已知入口构造单请求。
+9. 提交结果：实证完成后 `check_duplicate_finding → submit_finding → finish`。
+
+`analyze_api_schema` 和 `extract_http_surface` 的 `url` 模式适合超过 LLM 预览长度的文档或页面：它们在工具层按 `WORKER_HTTP_MAX_BYTES` 取回内容，保留原始证据 capture，再只把有界结构化摘要送回 LLM。
+
+### 按等级深挖
+
+Reviewer 打回和 accepted 后的扩大危害使用同一份等级策略。Worker 的硬轮数仍受 `WORKER_MAX_ROUNDS` 和 `*_BUDGET_CAP` 控制，等级策略只决定回炉次数、队列优先级和软收敛位置。
+
+| 原等级 | Reviewer 回炉上限 | Worker 软收敛位置 | accepted 后扩大危害预算 | 主要目标 |
+|--------|:----------------:|:-----------------:|:-----------------------:|----------|
+| 低危 | 1 次 | 硬上限的 60% | 6 轮 | 串联鉴权、对象接口或业务状态，证明能否升级到中危影响 |
+| 中危 | 2 次 | 硬上限的 72% | 10 轮 | 从单对象/局部影响推进到批量、敏感写、认证突破或高权限 |
+| 高危 | 3 次 | 硬上限的 85% | 14 轮 | 推进管理员能力、任意用户接管、核心数据、关键写操作或执行链 |
+| 严重 | 3 次 | 硬上限的 95% | 16 轮 | 复核稳定性和权限边界，量化横向、租户或供应链级影响 |
+
+`ESCALATE_MAX_ROUNDS=0` 使用上表预算；设置为正数会统一覆盖所有等级。每个 accepted Finding 会在审核事务内创建唯一的持久化扩大危害 attempt；暂停、取消或进程重启后，未完成的 attempt 会重新排队。`ESCALATE_TASK_MAX_ATTEMPTS=100` 限制单任务尝试数，`ESCALATE_TASK_ROUND_BUDGET=1000` 限制单任务计划轮数总和；两者设为 `0` 表示不限制。预算用尽的 attempt 会以 `skipped` 留痕，删除任务时一并清理。
+
+扩大危害结果仍需通过等级提升、顶格危害或影响面数量级门槛，未形成新实证时只记录事件，不生成重复 Finding。
 
 ---
 
@@ -329,7 +408,9 @@ hunt.example.com {
 - 后端：Python 3.12 · FastAPI · SQLAlchemy(SQLite) · asyncio
 - 前端：Vue 3 · Vite
 - 模型：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses，以及兼容这些协议的网关
-- 工具链（容器内置）：nmap · nuclei · sqlmap · httpx · whatweb · curl/wget/jq 等
+- 有界侦察与指纹：HTTPX · Katana · FFUF · Arjun · wafw00f · Nmap · WhatWeb
+- 真实验证与辅助：`http_request` · curl/wget/jq · JS/OpenAPI/认证材料/响应差异分析
+- 非企业模式定向验证：Nuclei · Dalfox · SQLMap（企业 SRC 严禁调用 Nuclei 类自动化漏洞扫描器，`run_shell` 同样执行该限制）
 
 ---
 

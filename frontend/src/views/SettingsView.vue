@@ -44,7 +44,7 @@ const form = reactive({
   default_intent_mode: "",
   concurrency: 3,
   skip_score_threshold: -10,
-  worker_prompt_version: "legacy",
+  worker_prompt_version: "current",
 });
 
 function toast(m) {
@@ -92,7 +92,7 @@ async function load() {
     form.default_intent_mode = s.fofa?.default_intent_mode || "";
     form.concurrency = s.defaults?.concurrency ?? 3;
     form.skip_score_threshold = s.defaults?.skip_score_threshold ?? -10;
-    form.worker_prompt_version = s.defaults?.worker_prompt_version || "legacy";
+    form.worker_prompt_version = s.defaults?.worker_prompt_version || "current";
     systemLoaded.value = true;
   } finally {
     loading.value = false;
@@ -355,9 +355,9 @@ onMounted(async () => {
               </label>
               <label class="full">Worker 提示词版本
                 <select v-model="form.worker_prompt_version">
-                  <option value="legacy">legacy（旧版 23/25 风格）</option>
                   <option value="current">current（当前省 token 版）</option>
                   <option value="modern">modern（当前完整版）</option>
+                  <option value="legacy">legacy（旧版 23/25 风格）</option>
                 </select>
               </label>
               <p class="field-hint full">Collector 评分低于此值的目标直接跳过，避免 worker 消耗在垃圾资产上。</p>

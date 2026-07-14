@@ -12,6 +12,8 @@ from app.api import tasks as tasks_api
 from app.config import worker_config
 from app.db.models import (
     Base,
+    EscalationAttempt,
+    Finding,
     Killsweep,
     KillsweepAttempt,
     KillsweepEvent,
@@ -53,6 +55,15 @@ def test_task_delete_waits_for_runtime_and_removes_operations_data(tmp_path, mon
             session.add(Target(
                 id="target-delete", task_id="task-delete", url="https://delete.test",
                 host="delete.test", status="done",
+            ))
+            session.add(Finding(
+                id="finding-delete", task_id="task-delete", target_id="target-delete",
+                vuln_type="idor", title="Delete finding", severity_claimed="中危",
+                target_url="https://delete.test/api",
+            ))
+            session.add(EscalationAttempt(
+                id="escalation-delete", task_id="task-delete", finding_id="finding-delete",
+                orig_severity="中危", round_budget=10, status="queued",
             ))
             signal = MissedSignal(
                 id="signal-delete", task_id="task-delete", target_id="target-delete",
@@ -129,7 +140,7 @@ def test_task_delete_waits_for_runtime_and_removes_operations_data(tmp_path, mon
             models = (
                 Task, MissedSignal, MissedSignalEvent, MissedSignalDraft,
                 RawEvidence, RawEvidenceChunk, Killsweep, KillsweepAttempt,
-                KillsweepEvent, KillsweepReanalysisBatch,
+                KillsweepEvent, KillsweepReanalysisBatch, EscalationAttempt,
             )
             return {
                 model.__name__: await session.scalar(select(func.count()).select_from(model))

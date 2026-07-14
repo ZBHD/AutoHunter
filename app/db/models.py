@@ -389,6 +389,33 @@ class KillsweepAttempt(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class EscalationAttempt(Base):
+    """一次按 Finding 等级预算执行的扩大危害尝试。"""
+    __tablename__ = "escalation_attempts"
+    __table_args__ = (
+        Index("ux_escalation_attempts_finding", "finding_id", unique=True),
+        Index("ix_escalation_attempts_task_status", "task_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True,
+    )
+    finding_id: Mapped[str] = mapped_column(
+        ForeignKey("findings.id", ondelete="CASCADE"), index=True,
+    )
+    orig_severity: Mapped[str] = mapped_column(String(10), default="中危")
+    round_budget: Mapped[int] = mapped_column(Integer, default=0)
+    # queued / running / succeeded / skipped / failed
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_kind: Mapped[str] = mapped_column(String(60), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class KillsweepEvent(Base):
     """一次通杀尝试中的完整有序时间线事件。"""
     __tablename__ = "killsweep_events"

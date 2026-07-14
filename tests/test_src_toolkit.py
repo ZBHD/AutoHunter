@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from app.agents.escalate import EscalateHunter
+from app.agents.history import bounded_tool_content
+from app.agents.worker import Worker
+from app.tools.executor import ToolExecutor
+from app.tools.schemas import ESCALATE_TOOL_SCHEMAS, TOOL_SCHEMAS
+from app.tools.src_toolkit import SRC_TOOL_NAMES, SrcToolError, build_src_plan
+
+
+def _tool_names(schemas: list[dict]) -> set[str]:
+    return {item["function"]["name"] for item in schemas}
+
+
+def test_src_tool_schemas_are_available_to_worker_and_escalation() -> None:
+    assert SRC_TOOL_NAMES <= _tool_names(TOOL_SCHEMAS)
+    assert SRC_TOOL_NAMES <= _tool_names(ESCALATE_TOOL_SCHEMAS)
+
+
+def test_http_probe_builds_bounded_same_host_argv() -> None:
+    plan = build_src_plan(
+        "probe_http",
+        {
+            "url": "https://app.example.test/login?next=/home;marker=1",
+            "follow_redirects": True,
+            "rate_limit": 999,
+            "request_timeout": 999,
+            "headers": {"Authorization": "Bearer top-secret"},
+        },
+        scope_target="https://app.example.test",
+    )
+
+    assert plan.binary == "httpx"
+    assert plan.argv[0] == "httpx"
+    assert "https://app.example.test/login?next=/home;marker=1" in plan.argv
+    assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
+    assert plan.argv[plan.argv.index("-timeout") + 1] == "30"
+    assert "-follow-redirects" in plan.argv
+    assert "Authorization: Bearer top-secret" in plan.argv
+    assert "Bearer top-secret" not in plan.display_argv
+    assert plan.timeout <= 180
+
+
+def test_src_plan_rejects_cross_host_target() -> None:
+    with pytest.raises(SrcToolError, match="当前目标") as exc:
+        build_src_plan(
+            "crawl_endpoints",
+            {"url": "https://other.example.test/"},
+            scope_target="https://app.example.test/",
+        )
+    assert exc.value.blocked is True
+
+
+def test_katana_plan_is_same_host_and_resource_bounded() -> None:
+    plan = build_src_plan(
+        "crawl_endpoints",
+        {"url": "https://app.example.test/", "depth": 9, "concurrency": 99, "rate_limit": 999},
+        scope_target="https://app.example.test/",
+    )
+
+    assert plan.argv[:3] == ("katana", "-u", "https://app.example.test/")
+    assert plan.argv[plan.argv.index("-depth") + 1] == "3"
+    assert plan.argv[plan.argv.index("-concurrency") + 1] == "10"
+    assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
+    assert plan.argv[plan.argv.index("-field-scope") + 1] == "fqdn"
+    assert plan.argv[plan.argv.index("-max-domain-pages") + 1] == "200"
+    assert "-jsonl" in plan.argv
+
+
+def test_ffuf_plan_requires_fuzz_and_uses_curated_wordlist(tmp_path: Path) -> None:
+    with pytest.raises(SrcToolError, match="FUZZ"):
+        build_src_plan(
+            "discover_content",
+            {"url": "https://app.example.test/admin"},
+            scope_target="https://app.example.test",
+            wordlist_root=tmp_path,
+        )
+
+    plan = build_src_plan(
+        "discover_content",
+        {"url": "https://app.example.test/FUZZ", "wordlist": "api", "rate_limit": 500},
+        scope_target="https://app.example.test",
+        wordlist_root=tmp_path,
+    )
+    assert plan.binary == "ffuf"
+    assert plan.argv[plan.argv.index("-w") + 1] == str(tmp_path / "src-api.txt")
+    assert plan.argv[plan.argv.index("-rate") + 1] == "50"
+    assert plan.argv[plan.argv.index("-maxtime") + 1] == "180"
+    assert "-noninteractive" in plan.argv
+    assert "-json" in plan.argv
+
+
+def test_arjun_plan_uses_small_wordlist_and_stable_limits(tmp_path: Path) -> None:
+    plan = build_src_plan(
+        "discover_parameters",
+        {
+            "url": "https://app.example.test/api/users",
+            "method": "JSON",
+            "threads": 99,
+            "rate_limit": 999,
+        },
+        scope_target="https://app.example.test",
+        wordlist_root=tmp_path,
+    )
+    assert plan.argv[0] == "arjun"
+    assert plan.argv[plan.argv.index("-w") + 1] == str(tmp_path / "src-params.txt")
+    assert plan.argv[plan.argv.index("-m") + 1] == "JSON"
+    assert plan.argv[plan.argv.index("-t") + 1] == "5"
+    assert plan.argv[plan.argv.index("--rate-limit") + 1] == "20"
+    assert "--stable" in plan.argv
+
+
+def test_nuclei_requires_explicit_selector_and_builds_targeted_plan() -> None:
+    with pytest.raises(SrcToolError, match="template/tags/template_id"):
+        build_src_plan(
+            "scan_nuclei",
+            {"url": "https://app.example.test"},
+            scope_target="https://app.example.test",
+        )
+
+    plan = build_src_plan(
+        "scan_nuclei",
+        {
+            "url": "https://app.example.test",
+            "tags": ["exposure", "misconfig"],
+            "severity": ["medium", "high"],
+            "rate_limit": 999,
+        },
+        scope_target="https://app.example.test",
+    )
+    assert plan.argv[plan.argv.index("-tags") + 1] == "exposure,misconfig"
+    assert plan.argv[plan.argv.index("-severity") + 1] == "medium,high"
+    assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
+    assert "-jsonl" in plan.argv
+    assert "-disable-update-check" in plan.argv
+
+
+def test_dalfox_requires_known_parameter_and_caps_payloads() -> None:
+    with pytest.raises(SrcToolError, match="params"):
+        build_src_plan(
+            "verify_xss",
+            {"url": "https://app.example.test/search?q=test"},
+            scope_target="https://app.example.test",
+        )
+
+    plan = build_src_plan(
+        "verify_xss",
+        {"url": "https://app.example.test/search?q=test", "params": ["q"], "workers": 50},
+        scope_target="https://app.example.test",
+    )
+    assert plan.argv[:3] == ("dalfox", "url", "--url")
+    assert plan.argv[plan.argv.index("--workers") + 1] == "5"
+    assert plan.argv[plan.argv.index("--max-payloads-per-param") + 1] == "200"
+    assert "--skip-discovery" in plan.argv
+    assert "--skip-mining" in plan.argv
+    assert plan.timeout <= 240
+
+
+def test_waf_and_web_port_plans_are_narrow() -> None:
+    waf = build_src_plan(
+        "fingerprint_waf",
+        {"url": "https://app.example.test"},
+        scope_target="https://app.example.test",
+    )
+    assert waf.argv == ("wafw00f", "https://app.example.test", "-a", "--no-colors", "-f", "json")
+
+    ports = build_src_plan(
+        "scan_web_ports",
+        {"host": "app.example.test", "ports": [80, 443, 8080, 8443]},
+        scope_target="https://app.example.test",
+    )
+    assert ports.argv[0] == "nmap"
+    assert ports.argv[ports.argv.index("-p") + 1] == "80,443,8080,8443"
+    assert "-sT" in ports.argv
+    assert "-sV" in ports.argv
+    assert "--host-timeout" in ports.argv
+
+    with pytest.raises(SrcToolError, match="20"):
+        build_src_plan(
+            "scan_web_ports",
+            {"host": "app.example.test", "ports": list(range(1, 22))},
+            scope_target="https://app.example.test",
+        )
+
+
+def test_executor_runs_src_plan_without_shell_and_reports_missing_binary(monkeypatch, tmp_path: Path) -> None:
+    executor = ToolExecutor("https://app.example.test", work_dir=str(tmp_path))
+    monkeypatch.setattr("app.tools.executor.shutil.which", lambda _binary: "/usr/local/bin/httpx")
+    captured: dict = {}
+
+    def fake_run_process(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return {"ok": True, "output": "{}"}
+
+    monkeypatch.setattr(executor, "_run_process", fake_run_process)
+    result = executor.run_src_tool(
+        "probe_http",
+        {"url": "https://app.example.test/?q=1;touch+/tmp/pwn"},
+    )
+
+    assert result["ok"] is True
+    assert isinstance(captured["command"], list)
+    assert captured["shell"] is False
+    assert "https://app.example.test/?q=1;touch+/tmp/pwn" in captured["command"]
+
+    monkeypatch.setattr("app.tools.executor.shutil.which", lambda _binary: None)
+    missing = executor.run_src_tool(
+        "crawl_endpoints",
+        {"url": "https://app.example.test"},
+    )
+    assert missing["ok"] is False
+    assert missing["missing_tool"] is True
+    assert missing["tool"] == "crawl_endpoints"
+
+
+def test_enterprise_src_hides_and_blocks_nuclei(monkeypatch, tmp_path: Path) -> None:
+    from app.agents import worker as worker_module
+
+    monkeypatch.setattr(worker_module.worker_config, "work_root", str(tmp_path))
+    executor = ToolExecutor(
+        "https://corp.example.test",
+        work_dir=str(tmp_path),
+        enterprise=True,
+    )
+    blocked = executor.run_src_tool(
+        "scan_nuclei",
+        {"url": "https://corp.example.test", "tags": ["exposure"]},
+    )
+    assert blocked["ok"] is False
+    assert blocked["blocked"] is True
+    assert blocked["kind"] == "enterprise_policy"
+
+    worker = Worker(
+        target="https://corp.example.test",
+        llm=SimpleNamespace(),
+        src_type="enterprise",
+    )
+    assert "scan_nuclei" not in _tool_names(worker._available_tool_schemas())
+
+    hunter = EscalateHunter(
+        {"target_url": "https://corp.example.test", "severity": "高危"},
+        llm=SimpleNamespace(),
+        src_type="enterprise",
+    )
+    assert "scan_nuclei" not in _tool_names(hunter._tools)
+
+
+def test_worker_and_escalation_dispatch_src_tools(monkeypatch, tmp_path: Path) -> None:
+    from app.agents import worker as worker_module
+
+    monkeypatch.setattr(worker_module.worker_config, "work_root", str(tmp_path))
+    worker = Worker(
+        target="https://app.example.test",
+        llm=SimpleNamespace(),
+    )
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        worker.executor,
+        "run_src_tool",
+        lambda name, args: calls.append((name, args)) or {"ok": True},
+    )
+    result = worker._dispatch(
+        "crawl_endpoints",
+        {"url": "https://app.example.test"},
+        rnd=2,
+    )
+    assert result["ok"] is True
+    assert calls[-1][0] == "crawl_endpoints"
+
+    hunter = EscalateHunter(
+        {"target_url": "https://app.example.test", "severity": "高危"},
+        llm=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        hunter.executor,
+        "run_src_tool",
+        lambda name, args: calls.append((name, args)) or {"ok": True},
+    )
+    result = hunter._dispatch(
+        "scan_nuclei",
+        {"url": "https://app.example.test", "tags": ["exposure"]},
+    )
+    assert result["ok"] is True
+    assert calls[-1][0] == "scan_nuclei"
+
+
+def test_recent_src_tool_output_is_bounded(monkeypatch) -> None:
+    from app.agents import history as history_module
+
+    monkeypatch.setattr(history_module.worker_config, "output_truncate", 700)
+    monkeypatch.setattr(history_module.worker_config, "llm_tool_output_truncate", 700)
+    result = {
+        "ok": True,
+        "tool": "crawl_endpoints",
+        "return_code": 0,
+        "output": "\n".join(
+            json.dumps({"url": f"https://app.example.test/api/{index}", "raw": "x" * 80})
+            for index in range(200)
+        ),
+    }
+    content = bounded_tool_content(result, "crawl_endpoints")
+    assert len(content) <= 700
+    assert "crawl_endpoints" in content or "return_code" in content
+
+
+def test_bundled_src_wordlists_are_small_and_present() -> None:
+    root = Path(__file__).resolve().parents[1] / "wordlists"
+    expected = {"src-common.txt", "src-api.txt", "src-params.txt"}
+    assert expected <= {path.name for path in root.glob("src-*.txt")}
+    for name in expected:
+        entries = [
+            line.strip()
+            for line in (root / name).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert 20 <= len(entries) <= 250
+        assert len(entries) == len(set(entries))
+
+
+def test_docker_image_pins_new_src_cli_dependencies() -> None:
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    tool_requirements = (root / "requirements-tools.txt").read_text(encoding="utf-8")
+
+    for marker in (
+        "KATANA_VER=1.6.1",
+        "FFUF_VER=2.2.1",
+        "DALFOX_VER=3.1.2",
+        "/usr/local/bin/katana",
+        "/usr/local/bin/ffuf",
+        "/usr/local/bin/dalfox",
+    ):
+        assert marker in dockerfile
+    assert "arjun==2.2.7" in tool_requirements
+    assert "wafw00f==2.4.2" in tool_requirements
+    assert "requirements-tools.txt" in dockerfile
+
+
+def test_docker_installs_projectdiscovery_httpx_after_python_httpx() -> None:
+    """The Python httpx console script must not overwrite ProjectDiscovery httpx."""
+    dockerfile = (
+        Path(__file__).resolve().parents[1] / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    pip_install = dockerfile.index("pip install --no-cache-dir")
+    projectdiscovery_install = dockerfile.index(
+        'unzip -oq "$HTTPX_ASSET" httpx -d /usr/local/bin/'
+    )
+    assert pip_install < projectdiscovery_install
+    assert "RUN httpx -version" in dockerfile

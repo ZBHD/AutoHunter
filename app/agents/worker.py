@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
-from app.agents.history import compact_messages
+from app.agents.history import bounded_tool_content, compact_messages
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
 from app.config import worker_config
 from app import dedup
@@ -22,11 +22,8 @@ from app.llm.router import LLMRouter
 from app.schemas import Finding, Verdict, WorkerResult
 from app.raw_evidence import detach_capture
 from app.tools.executor import ToolExecutor
-from app.tools.schemas import (
-    JS_ANALYZER_TOOL_SCHEMAS,
-    SESSION_TOOL_SCHEMAS,
-    TOOL_SCHEMAS,
-)
+from app.tools.schemas import worker_tool_schemas
+from app.tools.src_toolkit import SRC_TOOL_NAMES
 
 
 _BROAD_NMAP_RE = re.compile(r"\bnmap\b[\s\S]*(?:-p\s*(?:-|1-10000|1-65535|0-65535)|--top-ports\s+\d{3,})", re.IGNORECASE)
@@ -89,6 +86,12 @@ class Worker:
         self._reported_intel: list[dict] = []
         # 单站协作覆盖记录（API/入口/测试项摘要），由编排层写入事件流供后续 worker 复用。
         self._reported_coverage: list[dict] = []
+
+    def _available_tool_schemas(self) -> list[dict]:
+        return worker_tool_schemas(
+            enterprise=self._enterprise,
+            include_js=self._js_tool_enabled,
+        )
 
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
@@ -240,11 +243,7 @@ class Worker:
             rounds += 1
             try:
                 self._emit("llm_round_start", round=rounds)
-                tools = list(TOOL_SCHEMAS)
-                # 会话保持工具全模式开放：拿到凭证登录后固化登录态再深挖。
-                tools += SESSION_TOOL_SCHEMAS
-                if self._js_tool_enabled:
-                    tools += JS_ANALYZER_TOOL_SCHEMAS
+                tools = self._available_tool_schemas()
                 send_messages = compact_messages(messages, rounds)
                 msg = self.llm.chat(send_messages, tools=tools, tool_choice="auto")
             except Exception as e:
@@ -339,7 +338,7 @@ class Worker:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": bounded_tool_content(result, name),
                     "_round": rounds,
                     "_tool": name,
                 })
@@ -490,6 +489,22 @@ class Worker:
             max_rounds = min(max_rounds, 30)
         elif intensity == "quick":
             soft_rounds = min(soft_rounds, 18)
+        policy = (self.deepen_context or {}).get("depth_policy")
+        if isinstance(policy, dict):
+            try:
+                ratio = max(0.5, min(float(policy.get("soft_round_ratio", 0.5)), 1.0))
+                tier_soft_rounds = int(max_rounds * ratio)
+                if tier_soft_rounds < max_rounds * ratio:
+                    tier_soft_rounds += 1
+                soft_rounds = max(soft_rounds, tier_soft_rounds)
+            except (TypeError, ValueError):
+                pass
+        configured_soft_cap = (
+            worker_config.enterprise_soft_round_budget_cap
+            if self._enterprise else worker_config.soft_round_budget_cap
+        )
+        if configured_soft_cap > 0:
+            soft_rounds = min(soft_rounds, configured_soft_cap)
         return max(1, max_rounds), max(1, min(soft_rounds, max_rounds))
 
     def _cancelled_result(self, rounds: int) -> WorkerResult:
@@ -516,6 +531,14 @@ class Worker:
         ]
         if summary:
             parts.append(f"原始线索摘要：{summary[:800]}")
+        policy = ctx.get("depth_policy")
+        if isinstance(policy, dict):
+            objective = str(policy.get("objective") or "").strip()
+            requirements = policy.get("evidence_requirements") or []
+            if objective:
+                parts.append(f"本等级深挖目标：{objective}")
+            if requirements:
+                parts.append("本等级证据要求：" + "；".join(str(item) for item in requirements[:4]))
         parts += [
             "",
             "审核判定：线索真实有价值，但利用链没打穿，所以打回让你专门攻这一个点。",
@@ -582,6 +605,11 @@ class Worker:
                 max_assets=args.get("max_assets", 80),
             )
 
+        if name in SRC_TOOL_NAMES:
+            self._mark_tool_used(name, rnd)
+            self._emit("tool_src_cli", round=rnd, tool=name)
+            return self.executor.run_src_tool(name, args)
+
         if name == "run_shell":
             self._mark_tool_used(name, rnd)
             command = (args.get("command") or args.get("cmd") or args.get("shell") or "").strip()
@@ -610,6 +638,75 @@ class Worker:
             value = args.get("value") or ""
             self._emit("tool_decode", round=rnd, mode=args.get("mode", "auto"), value_len=len(str(value)))
             return self.executor.decode_transform(value=value, mode=args.get("mode", "auto"))
+
+        if name == "compare_http_responses":
+            self._mark_tool_used(name, rnd)
+            baseline = args.get("baseline")
+            candidate = args.get("candidate")
+            if not isinstance(baseline, dict) or not isinstance(candidate, dict):
+                return self._tool_arg_error(
+                    "compare_http_responses", "baseline/candidate",
+                    "必须传两份已经由 http_request 取得的响应对象；先发最小基线与候选请求再比较。",
+                )
+            self._emit("tool_response_compare", round=rnd)
+            return self.executor.compare_http_responses(
+                baseline=baseline,
+                candidate=candidate,
+                ignore_json_paths=args.get("ignore_json_paths"),
+            )
+
+        if name == "analyze_api_schema":
+            self._mark_tool_used(name, rnd)
+            document = args.get("document") or ""
+            url = args.get("url") or ""
+            if (not isinstance(document, str) or not document.strip()) and not url:
+                return self._tool_arg_error(
+                    "analyze_api_schema", "document/url",
+                    "传 OpenAPI/Swagger JSON 正文，或传文档 URL 让工具读取完整正文。",
+                )
+            self._emit("tool_api_schema", round=rnd, document_len=len(document))
+            return self.executor.analyze_api_schema(
+                document=document,
+                url=url,
+                base_url=args.get("base_url", ""),
+                focus=args.get("focus"),
+            )
+
+        if name == "extract_http_surface":
+            self._mark_tool_used(name, rnd)
+            body = args.get("body") or ""
+            url = args.get("url") or ""
+            if (not isinstance(body, str) or not body.strip()) and not url:
+                return self._tool_arg_error(
+                    "extract_http_surface", "body/url",
+                    "传 HTML 正文，或传页面 URL 让工具读取完整页面后提取入口。",
+                )
+            self._emit("tool_http_surface", round=rnd, body_len=len(body))
+            return self.executor.extract_http_surface(
+                body=body,
+                url=url,
+                base_url=args.get("base_url", ""),
+                response_headers=args.get("response_headers"),
+            )
+
+        if name == "analyze_auth_material":
+            self._mark_tool_used(name, rnd)
+            request_headers = args.get("request_headers")
+            response_headers = args.get("response_headers")
+            body = args.get("body") or ""
+            set_cookie_headers = args.get("set_cookie_headers")
+            if not request_headers and not response_headers and not set_cookie_headers and not body:
+                return self._tool_arg_error(
+                    "analyze_auth_material", "request_headers/response_headers/body",
+                    "传入已获取的请求头、响应头或正文；工具不会自行登录或发送请求。",
+                )
+            self._emit("tool_auth_analysis", round=rnd)
+            return self.executor.analyze_auth_material(
+                request_headers=request_headers,
+                response_headers=response_headers,
+                set_cookie_headers=set_cookie_headers,
+                body=body,
+            )
 
         if name == "suggest_waf_bypass":
             self._mark_tool_used(name, rnd)

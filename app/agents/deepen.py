@@ -7,23 +7,27 @@ from __future__ import annotations
 
 import time
 
+from app.agents.depth_policy import depth_policy_for
 from app.db.models import Finding, Target
 
-DEEPEN_CAP = 2  # 单 target 被打回深挖的最大次数（人工 + AI 合计）
+# 兼容旧调用方的全局常量；实际限制由 finding 等级策略决定。
+DEEPEN_CAP = 3
 
 
 def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
-                 source: str = "ai") -> tuple[bool, str]:
+                  source: str = "ai", severity: str | None = None) -> tuple[bool, str]:
     """执行一次深挖回炉。返回 (是否生效, 日志后缀)。
 
     session: 调用方持有的 session（同步操作 ORM 对象属性，由调用方 commit）。
     source: 'ai' / 'user'，用于 priority_reason 标注来源。
     """
     directive = (directive or "").strip()
-    if not tgt or not directive or tgt.deepen_count >= DEEPEN_CAP:
+    policy = depth_policy_for(severity or getattr(finding, "severity_claimed", ""))
+    deepen_cap = policy.deepen_cap
+    if not tgt or not directive or tgt.deepen_count >= deepen_cap:
         finding.status = "reviewed"
-        if tgt and tgt.deepen_count >= DEEPEN_CAP:
-            why = f"深挖次数已达上限({DEEPEN_CAP})"
+        if tgt and tgt.deepen_count >= deepen_cap:
+            why = f"深挖次数已达上限({deepen_cap})"
         elif not directive:
             why = "未给深挖指令"
         else:
@@ -40,6 +44,7 @@ def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
         "original_summary": (finding.description or "")[:1000],
         "from_finding_id": finding.id,
         "source": source,
+        "depth_policy": policy.as_dict(),
     }
     tgt.deepen_count += 1
     tgt.status = "queued"
@@ -53,7 +58,7 @@ def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
     tgt.verdict = ""
     tgt.heartbeat_at = None
     tgt.dead_reason = ""
-    tgt.priority_score = (tgt.priority_score or 0) + 100.0
+    tgt.priority_score = (tgt.priority_score or 0) + policy.priority_bonus
     tag = "人工深挖" if source == "user" else "深挖"
     tgt.priority_reason = f"[{tag}#{tgt.deepen_count}] {directive[:80]}"
     return True, f" → 打回{tag}#{tgt.deepen_count}：{directive[:80]}"

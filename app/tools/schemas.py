@@ -5,6 +5,10 @@ submit_finding 的参数 schema 直接对应 Finding 结构，强制 LLM 结构�
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
+from app.tools.src_toolkit import ENTERPRISE_BLOCKED_SRC_TOOLS
+
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -546,6 +550,7 @@ COLLECTOR_EDU_SCHEMAS = [
 	                                "index": {"type": "integer", "description": "对应输入资产的序号"},
 	                                "is_edu": {"type": "boolean"},
 	                                "school": {"type": "string", "description": "归属学校/教育机构全称，推断不出可空"},
+	                                "reason": {"type": "string", "description": "一句简短归属依据"},
 	                            },
                             "required": ["index", "is_edu"],
                         },
@@ -556,6 +561,273 @@ COLLECTOR_EDU_SCHEMAS = [
         },
     },
 ]
+
+
+EVIDENCE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_http_responses",
+            "description": "对比两次已取得的 HTTP 响应，量化状态码、关键响应头、JSON 路径或正文差异。只产出证据差异，不自动判漏洞。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "baseline": {
+                        "type": "object",
+                        "description": "基线响应，如未登录、自身对象或修改前响应",
+                        "properties": {
+                            "status_code": {"type": "integer"},
+                            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "body": {"type": "string", "description": "响应正文字符串"},
+                        },
+                        "required": ["body"],
+                    },
+                    "candidate": {
+                        "type": "object",
+                        "description": "候选响应，如换对象、换身份或修改后响应",
+                        "properties": {
+                            "status_code": {"type": "integer"},
+                            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "body": {"type": "string", "description": "响应正文字符串"},
+                        },
+                        "required": ["body"],
+                    },
+                    "ignore_json_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "忽略的动态 JSON 路径，如 $.timestamp",
+                    },
+                },
+                "required": ["baseline", "candidate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_api_schema",
+            "description": "解析已获取的 OpenAPI/Swagger JSON，提取鉴权、对象参数、读写接口并按验证价值排序。文档存在本身不是漏洞。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document": {"type": "string", "description": "http_request 已获取的 OpenAPI/Swagger JSON 正文"},
+                    "url": {"type": "string", "description": "文档 URL；与 document 二选一，按 URL 可读取完整正文"},
+                    "base_url": {"type": "string", "description": "可选 API 基址；优先于文档 servers/host"},
+                    "focus": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选关注方向，如 admin、upload、export、reset",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_http_surface",
+            "description": "解析已获取的 HTML，提取表单、上传点、脚本、链接和高价值 API/管理路径。只做入口整理，实际影响仍需发包验证。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "body": {"type": "string", "description": "http_request 获取的 HTML 正文"},
+                    "url": {"type": "string", "description": "页面 URL；与 body 二选一，按 URL 可读取完整正文"},
+                    "base_url": {"type": "string", "description": "用于把相对路径还原成完整 URL"},
+                    "response_headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "可选响应头",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_auth_material",
+            "description": "归纳已获取请求/响应里的 Authorization、Cookie、JWT、API Key 头和 CSRF 线索。完整秘密值会被指纹化隐藏。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "已获取请求头",
+                    },
+                    "response_headers": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "已获取响应头",
+                    },
+                    "set_cookie_headers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "http_request 返回的多条 Set-Cookie 原始头",
+                    },
+                    "body": {"type": "string", "description": "可选正文，用于发现 JWT/CSRF 字段"},
+                },
+            },
+        },
+    },
+]
+
+SRC_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "probe_http",
+            "description": "用 httpx 对当前 URL 做低频 HTTP 存活、标题、技术栈、IP/CNAME 指纹。适合进入深挖前建立基线。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "当前目标的完整 URL"},
+                    "follow_redirects": {"type": "boolean", "default": True},
+                    "rate_limit": {"type": "integer", "default": 20, "description": "每秒请求上限，最大 50"},
+                    "request_timeout": {"type": "integer", "default": 10, "description": "单请求超时，最大 30 秒"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "crawl_endpoints",
+            "description": "用 Katana 在当前主机内爬取页面、JS、表单和带参端点。适合 SPA、登录后页面和 API 入口补全。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "depth": {"type": "integer", "default": 2, "description": "爬取深度，最大 3"},
+                    "js_crawl": {"type": "boolean", "default": True},
+                    "concurrency": {"type": "integer", "default": 5, "description": "最大 10"},
+                    "rate_limit": {"type": "integer", "default": 20, "description": "最大 50 req/s"},
+                    "request_timeout": {"type": "integer", "default": 10},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discover_content",
+            "description": "用 FFUF + 内置小字典发现当前主机的高价值路径/API。URL 必须带 FUZZ，不使用外部大字典。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "含 FUZZ 的 URL，如 https://host/FUZZ"},
+                    "wordlist": {"type": "string", "enum": ["common", "api"], "default": "common"},
+                    "match_codes": {"type": "array", "items": {"type": "string"}},
+                    "follow_redirects": {"type": "boolean", "default": False},
+                    "threads": {"type": "integer", "default": 10, "description": "最大 20"},
+                    "rate_limit": {"type": "integer", "default": 20, "description": "最大 50 req/s"},
+                    "request_timeout": {"type": "integer", "default": 10},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discover_parameters",
+            "description": "用 Arjun + 内置小参数字典发现已知端点的隐藏 GET/POST/JSON/XML 参数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "method": {"type": "string", "enum": ["GET", "POST", "JSON", "XML"], "default": "GET"},
+                    "include": {"type": "string", "description": "每次请求固定附带的小型请求体"},
+                    "follow_redirects": {"type": "boolean", "default": False},
+                    "threads": {"type": "integer", "default": 3, "description": "最大 5"},
+                    "rate_limit": {"type": "integer", "default": 10, "description": "最大 20 req/s"},
+                    "request_timeout": {"type": "integer", "default": 10},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_nuclei",
+            "description": "用 Nuclei 的具体 template/tag/id 定向验证已有假设。至少提供一种 selector，不运行无选择器泛扫。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "template": {"type": "array", "items": {"type": "string"}},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "template_id": {"type": "array", "items": {"type": "string"}},
+                    "severity": {"type": "array", "items": {"type": "string", "enum": ["info", "low", "medium", "high", "critical", "unknown"]}},
+                    "concurrency": {"type": "integer", "default": 5, "description": "最大 10"},
+                    "rate_limit": {"type": "integer", "default": 15, "description": "最大 50 req/s"},
+                    "request_timeout": {"type": "integer", "default": 10},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_xss",
+            "description": "用 Dalfox 对已知可控参数做定向 XSS 验证。必须给出 params，跳过宽泛参数挖掘。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "params": {"type": "array", "items": {"type": "string"}, "description": "已知可控参数，最多 5 个"},
+                    "workers": {"type": "integer", "default": 3, "description": "最大 5"},
+                    "rate_limit": {"type": "integer", "default": 10, "description": "最大 20 req/s"},
+                    "request_timeout": {"type": "integer", "default": 10},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+                "required": ["url", "params"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fingerprint_waf",
+            "description": "用 wafw00f 识别当前 URL 前的 WAF/CDN/安全网关，为后续请求节奏和差异分析提供依据。",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_web_ports",
+            "description": "用 Nmap TCP connect 模式验证当前主机不超过 20 个明确 Web/管理端口并识别服务。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "当前单个主机名或 IP"},
+                    "ports": {"type": "array", "items": {"type": "integer"}, "description": "可选；默认小型 Web 端口集，最多 20"},
+                },
+                "required": ["host"],
+            },
+        },
+    },
+]
+
+# Worker 与扩大危害 Hunter 共用证据分析和有界 SRC CLI 工具。
+TOOL_SCHEMAS.extend(EVIDENCE_TOOL_SCHEMAS)
+ESCALATE_TOOL_SCHEMAS.extend(EVIDENCE_TOOL_SCHEMAS)
+TOOL_SCHEMAS.extend(SRC_TOOL_SCHEMAS)
+ESCALATE_TOOL_SCHEMAS.extend(SRC_TOOL_SCHEMAS)
 
 
 def _compact_descriptions(value, limit: int = 72, _depth: int = 0):
@@ -581,6 +853,8 @@ def _compact_descriptions(value, limit: int = 72, _depth: int = 0):
 
 
 TOOL_SCHEMAS = _compact_descriptions(TOOL_SCHEMAS)
+EVIDENCE_TOOL_SCHEMAS = _compact_descriptions(EVIDENCE_TOOL_SCHEMAS)
+SRC_TOOL_SCHEMAS = _compact_descriptions(SRC_TOOL_SCHEMAS)
 JS_ANALYZER_TOOL_SCHEMAS = _compact_descriptions(JS_ANALYZER_TOOL_SCHEMAS)
 SESSION_TOOL_SCHEMAS = _compact_descriptions(SESSION_TOOL_SCHEMAS)
 # 向后兼容别名（历史命名，全模式已可用）。
@@ -590,3 +864,52 @@ KILLSWEEP_TOOL_SCHEMAS = _compact_descriptions(KILLSWEEP_TOOL_SCHEMAS)
 ESCALATE_TOOL_SCHEMAS = _compact_descriptions(ESCALATE_TOOL_SCHEMAS)
 COLLECTOR_QUERY_SCHEMAS = _compact_descriptions(COLLECTOR_QUERY_SCHEMAS)
 COLLECTOR_EDU_SCHEMAS = _compact_descriptions(COLLECTOR_EDU_SCHEMAS)
+
+
+def _schema_name(schema: dict) -> str:
+    return str(schema.get("function", {}).get("name") or "")
+
+
+def _enterprise_schema_copy(schema: dict) -> dict:
+    copied = deepcopy(schema)
+    if _schema_name(copied) == "run_shell":
+        copied["function"]["description"] = (
+            "仅执行当前任务资产内的单请求 curl 或本地解析脚本。"
+        )
+    return copied
+
+
+def worker_tool_schemas(enterprise: bool = False, include_js: bool = False) -> list[dict]:
+    schemas = list(TOOL_SCHEMAS) + list(SESSION_TOOL_SCHEMAS)
+    if include_js:
+        schemas += list(JS_ANALYZER_TOOL_SCHEMAS)
+    if not enterprise:
+        return schemas
+    return [
+        _enterprise_schema_copy(schema)
+        for schema in schemas
+        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
+    ]
+
+
+def escalate_tool_schemas(enterprise: bool = False) -> list[dict]:
+    schemas = list(ESCALATE_TOOL_SCHEMAS) + list(SESSION_TOOL_SCHEMAS)
+    if not enterprise:
+        return schemas
+    return [
+        _enterprise_schema_copy(schema)
+        for schema in schemas
+        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
+    ]
+
+
+def killsweep_tool_schemas(enterprise: bool = False) -> list[dict]:
+    """Killsweep schemas with the enterprise scanner policy applied."""
+    schemas = list(KILLSWEEP_TOOL_SCHEMAS)
+    if not enterprise:
+        return schemas
+    return [
+        _enterprise_schema_copy(schema)
+        for schema in schemas
+        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
+    ]

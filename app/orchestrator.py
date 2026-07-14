@@ -28,19 +28,27 @@ from app.agents import playbook_router
 from app.agents import prefilter
 from app.agents import site_collab
 from app.agents import target_cluster
-from app.agents.deepen import DEEPEN_CAP  # 单 target 深挖上限（人工+AI 合计，防死循环）
+from app.agents.depth_policy import depth_policy_for
 from app.agents.prompts import is_enterprise_src, should_escalate
 from app.agents.reviewer import Reviewer
 from app.agents.worker import Worker
 from app.agent_runtime import (
-    AGENT_EXECUTOR, COLLECTOR_IO_EXECUTOR, WORKER_MAX_CONCURRENCY,
+    AGENT_EXECUTOR, COLLECTOR_IO_EXECUTOR, ESCALATION_MAX_CONCURRENCY, WORKER_MAX_CONCURRENCY,
     agent_semaphore, shutdown_agent_executor,
 )
 from app.db.models import (
-    CST, Finding, Killsweep, KillsweepAttempt, MissedSignal, Review, Target, Task, TaskEvent,
+    CST, EscalationAttempt, Finding, Killsweep, KillsweepAttempt, MissedSignal,
+    Review, Target, Task, TaskEvent,
 )
 from app.db.session import SessionLocal
 from app.events import bus
+from app.escalation_service import (
+    claim_attempt as claim_escalation_attempt,
+    finalize_attempt as finalize_escalation_attempt,
+    queue_attempt as queue_escalation_attempt,
+    recover_attempts as recover_escalation_attempts,
+    requeue_attempt as requeue_escalation_attempt,
+)
 from app.killsweep_service import (
     NEGATIVE_MANUAL_VERDICTS,
     append_event as append_killsweep_event,
@@ -417,6 +425,7 @@ class TaskRunner:
         self._escalation_inflight: set[str] = set()  # 正在做扩大危害深挖的 finding_id
         self._escalation_tasks: dict[str, asyncio.Task] = {}
         self._escalation_cancel_events: dict[str, threading.Event] = {}
+        self._escalation_dispatch_paused = False
         # 实时看板：每个在跑 worker 的活态 {target_id: {host, url, round, action, started_at, findings}}
         self._live: dict[str, dict] = {}
         self._worker_last_activity: dict[str, float] = {}
@@ -657,18 +666,28 @@ class TaskRunner:
             if self._stop.is_set():
                 return
 
-            # 4. 持久化通杀尝试派发（queued → running）。重启/重析与初次分析共用。
+            # 4. 派发持久化扩大危害尝试（queued → running）。
+            await self._dispatch_escalation_attempts(session, task)
+            if self._stop.is_set():
+                return
+
+            # 5. 持久化通杀尝试派发（queued → running）。重启/重析与初次分析共用。
             await self._dispatch_killsweep_attempts(session, task)
             if self._stop.is_set():
                 return
 
-            # 5. idle 标记
+            # 6. idle 标记
             queued = await self._count(session, "queued")
             # 除了 queued 和内存里的活跃 worker，还要看 DB 里有没有 assigned/scanning 的
             # 在途目标：幽灵 scanning(协程已死但状态没回收)期间不能误判 idle，否则前端显示
             # 空闲、实际还有目标虚挂，直到 reclaim(最多 ~150s)才回收——保持 running 更真实。
             inflight = await self._count_inflight(session)
-            busy = bool(self._active_workers) or bool(self._killsweep_tasks) or inflight > 0
+            busy = (
+                bool(self._active_workers)
+                or bool(self._killsweep_tasks)
+                or bool(self._escalation_tasks)
+                or inflight > 0
+            )
             if queued == 0 and not busy and task.status == "running":
                 if task.status != "idle":
                     task.status = "idle"
@@ -1108,12 +1127,19 @@ class TaskRunner:
                             f"抢救 {reclaimed} 个僵尸目标回退队列", level="warn", reclaimed=reclaimed)
 
     async def pause(self, reason: str = "任务暂停") -> None:
-        """暂停调度并收回正在跑的 worker。已进入同步调用的线程会收到取消标记，结果不再落库。"""
+        """暂停调度，收回 worker，并将正在执行的扩大危害 attempt 重新排队。"""
+        self._escalation_dispatch_paused = True
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
+        await self._cancel_escalation_tasks(reason)
+
+    def resume(self) -> None:
+        """恢复持久化扩大危害队列的派发入口。"""
+        self._escalation_dispatch_paused = False
 
     async def stop(self, reason: str = "任务停止") -> None:
         """停止 runner，并取消 worker/reviewer/killsweep 的后续落库。"""
         self._stop.set()
+        self._escalation_dispatch_paused = True
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
         await self._cancel_review_tasks(reason)
         await self._cancel_killsweep_tasks(reason)
@@ -2641,12 +2667,15 @@ class TaskRunner:
                 tgt.dead_reason = ""
             elif verdict == Verdict.no_vuln.value:
                 # 自动深挖回火：worker 突破了入口但没打穿，给了 deepen_lead → 带定向指令再派一轮
-                # （复用 deepen_count + DEEPEN_CAP 防死循环；优先于收敛/重试/dead）。
+                # （复用 deepen_count + 等级策略上限防死循环；优先于收敛/重试/dead）。
                 deepen_lead = (result.get("deepen_lead") or "").strip()
                 no_vuln_retry_reason = self._no_vuln_retry_reason(tgt)
+                prior_policy = (tgt.deepen_context or {}).get("depth_policy")
+                prior_severity = prior_policy.get("severity") if isinstance(prior_policy, dict) else ""
+                deepen_policy = depth_policy_for(prior_severity)
                 if (_is_actionable_worker_deepen_lead(deepen_lead) and verdict == Verdict.no_vuln.value
                         and not missed_signal_id and not has_new_manual_deepen
-                        and tgt.deepen_count < DEEPEN_CAP):
+                        and tgt.deepen_count < deepen_policy.deepen_cap):
                     tgt.deepen_context = {
                         "directive": deepen_lead,
                         "vuln_type": "",
@@ -2655,6 +2684,7 @@ class TaskRunner:
                         "from_finding_id": "",
                         "source": "worker_lead",
                         "missed_signal_id": worker_lead_signal.id if worker_lead_signal else missed_signal_id,
+                        "depth_policy": deepen_policy.as_dict(),
                     }
                     if not missed_signal_id:
                         tgt.deepen_count += 1
@@ -2663,7 +2693,7 @@ class TaskRunner:
                     tgt.assigned_worker = ""
                     tgt.heartbeat_at = None
                     tgt.retry_count = 0  # 深挖是新方向，不计入普通重试
-                    tgt.priority_score = (tgt.priority_score or 0) + 100.0
+                    tgt.priority_score = (tgt.priority_score or 0) + deepen_policy.priority_bonus
                     tgt.priority_reason = f"[自动深挖#{tgt.deepen_count}] {deepen_lead[:80]}"
                     tgt.last_error = ""
                     tgt.dead_reason = ""
@@ -2859,6 +2889,7 @@ class TaskRunner:
                 return
             task_obj = await session.get(Task, task_id)
             src_type = (task_obj.src_type if task_obj else "edusrc") or "edusrc"
+            src_rules = (task_obj.src_rules if task_obj else "") or ""
             finding_schema = FindingSchema(
                 vuln_type=f.vuln_type, title=f.title, severity_claimed=f.severity_claimed,
                 target_url=f.target_url, description=f.description, steps=f.steps,
@@ -2876,7 +2907,12 @@ class TaskRunner:
             )
 
         def do_review() -> dict:
-            reviewer = Reviewer(llm=llm, on_event=emit, src_type=src_type)
+            reviewer = Reviewer(
+                llm=llm,
+                on_event=emit,
+                src_type=src_type,
+                src_rules=src_rules,
+            )
             return reviewer.review(finding_schema).model_dump(mode="json")
 
         review_sem = agent_semaphore("review")
@@ -2935,7 +2971,8 @@ class TaskRunner:
             rv["reviewer_notes"] = (rv.get("reviewer_notes", "") +
                                     "\n[系统] 审核未给最终等级，已按 worker 自评兜底。").strip()
 
-        escalate_finding = False
+        escalation_attempt_id = ""
+        escalation_budget_message = ""
         async with SessionLocal() as session:
             f = await session.get(Finding, finding_id)
             if f:
@@ -2969,30 +3006,73 @@ class TaskRunner:
                     extra = await self._apply_deepen(session, f, rv)
                 else:
                     f.status = "reviewed"
+                # 通杀 Hunter 不在 AI accepted 后触发；必须等人工复审 passed 后再启动。
+                # 扩大危害 Hunter：每个已定级 accepted 洞创建一次持久化分级深挖尝试。
+                should_queue_escalation = (
+                    rv["verdict"] == "accepted"
+                    and f.worker_id != "escalation"  # 断递归：升级洞不再触发升级
+                    and should_escalate(f.vuln_type, f.title, rv.get("severity_final") or "")
+                )
+                if should_queue_escalation:
+                    escalation_attempt, _created = await queue_escalation_attempt(
+                        session,
+                        task_id=task_id,
+                        finding_id=finding_id,
+                        orig_severity=rv.get("severity_final") or f.severity_claimed,
+                    )
+                    if escalation_attempt.status == "queued":
+                        escalation_attempt_id = escalation_attempt.id
+                    elif escalation_attempt.status == "skipped":
+                        escalation_budget_message = escalation_attempt.error_message
                 await session.commit()
                 await self._log(session, "reviewer", "review_done",
                                 f"审核「{f.title}」: {rv['verdict']} {rv.get('severity_final') or ''}{extra}",
                                 finding_id=finding_id, verdict=rv["verdict"],
                                 severity=rv.get("severity_final"), score=rv["score"])
-                # 通杀 Hunter 不在 AI accepted 后触发；必须等人工复审 passed 后再启动。
-                # 扩大危害 Hunter：AI accepted 后自动触发（仅对有纵向升级空间的洞），
-                # 顺着已确认据点再打一层，显著升级才产出新 finding，否则丢弃。
-                escalate_finding = (
-                    rv["verdict"] == "accepted"
-                    and f.worker_id != "escalation"  # 断递归：升级洞不再触发升级
-                    and should_escalate(f.vuln_type, f.title, rv.get("severity_final") or "")
+        # attempt 已与审核结论同事务提交；此处只唤醒持久化队列。
+        if escalation_attempt_id:
+            self.dispatch_escalation_attempt(task_id, escalation_attempt_id)
+        elif escalation_budget_message:
+            async with SessionLocal() as session:
+                await self._log(
+                    session,
+                    "escalation",
+                    "escalate_budget_skip",
+                    escalation_budget_message,
+                    level="warn",
+                    finding_id=finding_id,
                 )
-        # commit 之后、脱离 session 再触发，避免把后台任务寿命绑在本次事务上。
-        if escalate_finding:
-            self.trigger_escalation(task_id, finding_id, rv.get("severity_final") or "")
 
     async def _apply_deepen(self, session: AsyncSession, finding: Finding, rv: dict) -> str:
         """审核打回深挖：复用共享回炉逻辑（与人工复审「继续深挖」同一套）。"""
         from app.agents.deepen import apply_deepen
         tgt = await session.get(Target, finding.target_id)
         _ok, suffix = apply_deepen(session, finding, tgt,
-                                   rv.get("deepen_directive") or "", source="ai")
+                                   rv.get("deepen_directive") or "", source="ai",
+                                   severity=rv.get("severity_final") or finding.severity_claimed)
         return suffix
+
+    async def _dispatch_escalation_attempts(self, session: AsyncSession, task: Task) -> None:
+        if self._stop.is_set() or self._escalation_dispatch_paused:
+            return
+        free = max(0, ESCALATION_MAX_CONCURRENCY - len(self._escalation_inflight))
+        if free <= 0:
+            return
+        queued = (await session.scalars(
+            select(EscalationAttempt)
+            .where(
+                EscalationAttempt.task_id == task.id,
+                EscalationAttempt.status == "queued",
+            )
+            .order_by(EscalationAttempt.created_at.asc())
+            .limit(free)
+        )).all()
+        if self._stop.is_set() or self._escalation_dispatch_paused:
+            return
+        for attempt in queued:
+            if self._stop.is_set() or self._escalation_dispatch_paused:
+                return
+            self.dispatch_escalation_attempt(task.id, attempt.id)
 
     async def _dispatch_killsweep_attempts(self, session: AsyncSession, task: Task) -> None:
         queued = (await session.scalars(
@@ -3370,39 +3450,83 @@ class TaskRunner:
             return False
         return True
 
-    def trigger_escalation(self, task_id: str, finding_id: str, orig_severity: str) -> bool:
-        """AI accepted 后触发扩大危害深挖；finding 级 inflight 去重，单洞只打一次。"""
-        if finding_id in self._escalation_inflight:
+    def dispatch_escalation_attempt(self, task_id: str, attempt_id: str) -> bool:
+        """唤醒一个已持久化的扩大危害 attempt。"""
+        if (
+            self._stop.is_set()
+            or self._escalation_dispatch_paused
+            or attempt_id in self._escalation_inflight
+        ):
             return False
-        self._escalation_inflight.add(finding_id)
-        self._escalation_tasks[finding_id] = asyncio.create_task(
-            self._run_escalation(task_id, finding_id, orig_severity)
+        self._escalation_inflight.add(attempt_id)
+        self._escalation_tasks[attempt_id] = asyncio.create_task(
+            self._run_escalation(task_id, attempt_id)
         )
         return True
 
-    async def _run_escalation(self, task_id: str, finding_id: str, orig_severity: str) -> None:
+    async def _run_escalation(self, task_id: str, attempt_id: str) -> None:
         try:
-            await self._run_escalation_inner(task_id, finding_id, orig_severity)
-        except Exception:
+            await self._run_escalation_inner(task_id, attempt_id)
+        except asyncio.CancelledError:
+            async with SessionLocal() as session:
+                await requeue_escalation_attempt(
+                    session,
+                    attempt_id,
+                    error_kind="cancelled",
+                    error_message="任务控制面取消，扩大危害尝试已重新排队",
+                )
+                await session.commit()
+            raise
+        except Exception as exc:
             async with SessionLocal() as s:
+                await finalize_escalation_attempt(
+                    s,
+                    attempt_id,
+                    status="failed",
+                    error_kind="runtime_error",
+                    error_message=str(exc),
+                )
+                await s.commit()
                 await self._log(s, "escalation", "error",
                                 f"扩大危害深挖异常: {traceback.format_exc()[:400]}", level="error",
-                                finding_id=finding_id)
+                                attempt_id=attempt_id)
         finally:
-            self._escalation_inflight.discard(finding_id)
-            self._escalation_tasks.pop(finding_id, None)
-            self._escalation_cancel_events.pop(finding_id, None)
+            self._escalation_inflight.discard(attempt_id)
+            self._escalation_tasks.pop(attempt_id, None)
+            self._escalation_cancel_events.pop(attempt_id, None)
 
-    async def _run_escalation_inner(self, task_id: str, finding_id: str, orig_severity: str) -> None:
+    async def _run_escalation_inner(self, task_id: str, attempt_id: str) -> None:
         from app.agents.escalate import EscalateHunter
         loop = asyncio.get_running_loop()
 
         async with SessionLocal() as session:
-            f = await session.get(Finding, finding_id)
-            if not f:
+            attempt = await session.get(EscalationAttempt, attempt_id)
+            if not attempt or attempt.task_id != task_id:
                 return
             task = await session.get(Task, task_id)
-            src_type = (task.src_type if task else "edusrc") or "edusrc"
+            if (
+                not task
+                or task.status not in {"running", "idle"}
+                or self._escalation_dispatch_paused
+            ):
+                return
+            if not await claim_escalation_attempt(session, attempt_id):
+                return
+            finding_id = attempt.finding_id
+            orig_severity = attempt.orig_severity
+            round_budget = attempt.round_budget
+            f = await session.get(Finding, finding_id)
+            if not f:
+                await finalize_escalation_attempt(
+                    session,
+                    attempt_id,
+                    status="failed",
+                    error_kind="finding_missing",
+                    error_message="源 Finding 已不存在",
+                )
+                await session.commit()
+                return
+            src_type = task.src_type or "edusrc"
             target_id = f.target_id
             finding_dict = {
                 "title": f.title, "vuln_type": f.vuln_type, "target_url": f.target_url,
@@ -3410,10 +3534,11 @@ class TaskRunner:
                 "raw_request": f.raw_request, "raw_response": f.raw_response,
                 "kill_chain": f.kill_chain, "severity": orig_severity,
             }
+            await session.commit()
 
         llm = _llm_for_task(await self._get_task(task_id))
         cancel_event = threading.Event()
-        self._escalation_cancel_events[finding_id] = cancel_event
+        self._escalation_cancel_events[attempt_id] = cancel_event
 
         def emit(kind: str, data: dict):
             asyncio.run_coroutine_threadsafe(
@@ -3421,10 +3546,22 @@ class TaskRunner:
                 loop,
             )
 
+        async def await_without_abandoning(future: asyncio.Future) -> bool:
+            """Wait for Hunter cleanup even when the owning asyncio task is cancelled."""
+            cancellation_requested = False
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    cancellation_requested = True
+                except Exception:
+                    break
+            return cancellation_requested
+
         def do_hunt() -> dict:
             hunter = EscalateHunter(
                 finding_dict, llm=llm, on_event=emit,
-                src_type=src_type, cancel_event=cancel_event,
+                src_type=src_type, cancel_event=cancel_event, max_rounds=round_budget,
             )
             try:
                 return hunter.run().model_dump(mode="json")
@@ -3448,26 +3585,58 @@ class TaskRunner:
             res = await asyncio.wait_for(asyncio.shield(hunt_future), timeout=ESCALATE_WALL_TIMEOUT)
         except asyncio.TimeoutError:
             cancel_event.set()
-            try:
-                await asyncio.wait_for(asyncio.shield(hunt_future), timeout=WORKER_CLEANUP_TIMEOUT)
-            except Exception:
-                hunt_future.add_done_callback(_consume_task_exception)
-            res = {"escalated": False, "reason": f"扩大危害深挖超时(>{int(ESCALATE_WALL_TIMEOUT)}s)"}
+            cancellation_requested = await await_without_abandoning(hunt_future)
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            message = f"扩大危害深挖超时(>{int(ESCALATE_WALL_TIMEOUT)}s)"
+            async with SessionLocal() as session:
+                await finalize_escalation_attempt(
+                    session,
+                    attempt_id,
+                    status="failed",
+                    error_kind="timeout",
+                    error_message=message,
+                )
+                await session.commit()
+                await self._log(
+                    session,
+                    "escalation",
+                    "error",
+                    message,
+                    level="warn",
+                    finding_id=finding_id,
+                )
+            return
         except asyncio.CancelledError:
             cancel_event.set()
-            hunt_future.add_done_callback(_consume_task_exception)
-            return
+            await await_without_abandoning(hunt_future)
+            raise
         except Exception as e:
             res = {"error": str(e)}
 
         if res.get("error"):
             async with SessionLocal() as s:
                 if self._is_quota_error(str(res["error"])):
+                    await requeue_escalation_attempt(
+                        s,
+                        attempt_id,
+                        error_kind="quota_error",
+                        error_message=str(res["error"]),
+                    )
+                    await s.commit()
                     await self._stop_task_for_quota(s, str(res["error"]), finding_id=finding_id)
                     await self._log(s, "orchestrator", "quota_stop",
                                     f"扩大危害阶段检测到 LLM/API 额度不足，任务已自动停止: {str(res['error'])[:120]}",
                                     level="error", finding_id=finding_id)
                 else:
+                    await finalize_escalation_attempt(
+                        s,
+                        attempt_id,
+                        status="failed",
+                        error_kind="agent_error",
+                        error_message=str(res["error"]),
+                    )
+                    await s.commit()
                     await self._log(s, "escalation", "error", f"扩大危害深挖失败: {res['error']}",
                                     level="warn", finding_id=finding_id)
             return
@@ -3476,11 +3645,28 @@ class TaskRunner:
         if not _escalation_is_significant(orig_severity, res):
             reason = res.get("reason") or "未达到显著升级门槛（等级未提升且影响面无质变）"
             async with SessionLocal() as s:
+                await finalize_escalation_attempt(
+                    s,
+                    attempt_id,
+                    status="skipped",
+                    result=res,
+                    error_kind="not_significant",
+                    error_message=reason,
+                )
+                await s.commit()
                 await self._log(s, "escalation", "escalate_skip",
                                 f"扩大危害未显著，已放弃: {reason[:160]}", finding_id=finding_id)
             return
 
         await self._persist_escalation_finding(task_id, target_id, finding_id, orig_severity, res)
+        async with SessionLocal() as session:
+            await finalize_escalation_attempt(
+                session,
+                attempt_id,
+                status="succeeded",
+                result=res,
+            )
+            await session.commit()
 
     async def _persist_escalation_finding(self, task_id: str, target_id: str, origin_finding_id: str,
                                           orig_severity: str, res: dict) -> None:
@@ -3612,6 +3798,7 @@ class OrchestratorManager:
             self._stopped_task_ids.discard(task_id)
             existing_task = self._tasks.get(task_id)
             if task_id in self._runners and existing_task and not existing_task.done():
+                self._runners[task_id].resume()
                 return
             if existing_task and existing_task.done():
                 self._tasks.pop(task_id, None)
@@ -3619,6 +3806,7 @@ class OrchestratorManager:
             if not runner or runner._stop.is_set():
                 runner = TaskRunner(task_id)
                 self._runners[task_id] = runner
+            runner.resume()
             self._runners[task_id] = runner
             self._tasks[task_id] = asyncio.create_task(runner.run_forever())
 
@@ -3637,9 +3825,10 @@ class OrchestratorManager:
                     await task
 
     async def pause(self, task_id: str) -> None:
-        runner = self._runners.get(task_id)
-        if runner:
-            await runner.pause()
+        async with self._lifecycle_lock(task_id):
+            runner = self._runners.get(task_id)
+            if runner:
+                await runner.pause()
 
     async def restore_on_startup(self) -> None:
         """重启恢复：把 running/idle 的任务重新拉起。"""
@@ -3649,6 +3838,7 @@ class OrchestratorManager:
                 await backfill_archived_signals(session, limit=200)
             except Exception:
                 logger.warning("疑似信号旧归档回填失败", exc_info=True)
+            await recover_escalation_attempts(session)
             queued_attempt_ids = await recover_killsweep_attempts(session)
             await session.commit()
             queued_attempts = []
@@ -3672,6 +3862,7 @@ class OrchestratorManager:
                 await backfill_archived_signals(session, limit=200)
             except Exception:
                 logger.warning("疑似信号旧归档回填失败", exc_info=True)
+            await recover_escalation_attempts(session)
             await recover_killsweep_attempts(session)
             await session.commit()
             rows = (await session.execute(

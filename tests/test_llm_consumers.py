@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -297,3 +298,105 @@ def test_streaming_report_assistant_reports_provider_exhaustion(monkeypatch) -> 
     assert "报告助手暂不可用" in stream
     assert "已完成。" not in stream
     assert "报告助手暂不可用" in finding.assistant_messages[-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nuclei -u https://example.test",
+        "dalfox url https://example.test/?q=x",
+    ],
+)
+def test_enterprise_report_assistant_blocks_automated_scanners(monkeypatch, tmp_path, command: str) -> None:
+    captured: dict[str, Any] = {}
+    real_executor = findings_api.ToolExecutor
+
+    def factory(*args, **kwargs):
+        captured.update(kwargs)
+        kwargs["work_dir"] = str(tmp_path)
+        return real_executor(*args, **kwargs)
+
+    monkeypatch.setattr(findings_api, "ToolExecutor", factory)
+    backend = RecordingBackend([
+        LLMResponse(tool_calls=[ToolCall(
+            id="scan-1",
+            name="run_shell",
+            arguments=json.dumps({"command": command}),
+        )]),
+        LLMResponse(content="已完成最小验证。"),
+    ])
+    finding = SimpleNamespace(
+        id="finding-1",
+        vuln_type="idor",
+        title="Example finding",
+        severity_claimed="中危",
+        target_url="https://example.test/item/1",
+        owner="Example Corp",
+        description="Example evidence",
+        steps=["Request the item"],
+        poc="curl https://example.test/item/1",
+        affected_scope="one item",
+        raw_request="GET /item/1 HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        raw_response="HTTP/1.1 200 OK\r\n\r\n{}",
+        evidence={},
+        kill_chain=[],
+        self_check={},
+    )
+
+    result = findings_api._run_report_assistant(
+        backend,
+        finding,
+        None,
+        findings_api.ReportAssistantRequest(message="verify"),
+        threading.Event(),
+        enterprise=True,
+    )
+
+    assert captured["enterprise"] is True
+    tool_result = result["tool_logs"][0]["result"]
+    assert tool_result["blocked"] is True
+    assert "自动化漏洞扫描" in tool_result["error"]
+
+
+def test_report_assistant_endpoint_propagates_enterprise_mode(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    finding = SimpleNamespace(task_id="task-1", assistant_messages=[])
+    task = SimpleNamespace(id="task-1", src_type="enterprise")
+
+    class Result:
+        def scalar_one_or_none(self):
+            return None
+
+    class Session:
+        async def get(self, model, object_id):
+            if model.__name__ == "Finding":
+                return finding
+            if model.__name__ == "Task":
+                return task
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            return None
+
+    def run_assistant(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"answer": "ok", "tool_logs": []}
+
+    monkeypatch.setattr(findings_api, "_report_assistant_llm", lambda _task: object())
+    monkeypatch.setattr(findings_api, "_run_report_assistant", run_assistant)
+    monkeypatch.setattr(
+        findings_api,
+        "agent_semaphore",
+        lambda _kind: asyncio.Semaphore(1),
+    )
+
+    asyncio.run(findings_api.report_assistant(
+        "finding-1",
+        findings_api.ReportAssistantRequest(message="verify"),
+        Session(),
+    ))
+
+    assert captured["enterprise"] is True

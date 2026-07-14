@@ -32,6 +32,11 @@ from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.settings_service import llm_router_for_task_optional, resolve_engine_config, resolve_skip_score_threshold
 
 _EDUSRC_ORG_FILTER = 'org="China Education and Research Network Center"'
+_EDUSRC_SCOPE_FILTER = (
+    '(domain=".edu.cn" || cert="edu.cn" || '
+    'org="China Education and Research Network Center" || '
+    'org="大学" || org="学院" || org="学校" || org="教育")'
+)
 _PREFILTER_CONCURRENCY = int(os.environ.get("COLLECTOR_PREFILTER_CONCURRENCY", "12"))
 _SCORE_CONCURRENCY = int(os.environ.get("COLLECTOR_SCORE_CONCURRENCY", "8"))
 _TARGET_FILTER_CONCURRENCY = int(os.environ.get("TARGET_FILTER_CONCURRENCY", "6"))
@@ -69,11 +74,23 @@ def _is_edusrc_intent_task(task: Task, raw: str, is_intent: bool) -> bool:
     )
 
 
-def _with_edusrc_org_filter(query: str) -> str:
+def _with_edusrc_scope_filter(query: str) -> str:
     q = (query or "").strip()
-    if not q or _EDUSRC_ORG_FILTER.lower() in q.lower():
+    if not q:
         return q
-    return f"({q}) && {_EDUSRC_ORG_FILTER}"
+    lowered = q.lower()
+    has_anchor = (
+        ".edu.cn" in lowered
+        or _EDUSRC_ORG_FILTER.lower() in lowered
+        or any(
+            field in lowered and keyword in lowered
+            for field in ('org="', 'cert="')
+            for keyword in ("大学", "学院", "学校", "教育", "university", "college")
+        )
+    )
+    if has_anchor:
+        return q
+    return f"({q}) && {_EDUSRC_SCOPE_FILTER}"
 
 
 def _extract_enterprise_domains(raw: str) -> list[str]:
@@ -241,7 +258,7 @@ async def _resolve_query(task: Task, llm: LLMRouter | None) -> tuple[str, str]:
     # 启发式：含 FOFA 字段符号视为语法，否则视为自然语言意图
     looks_like_syntax = any(tok in raw for tok in ("=", "&&", "||", "domain", "title=", "body=", "org="))
     is_intent = intent_mode == "intent" or (intent_mode != "syntax" and raw and not looks_like_syntax)
-    force_edusrc_org = _is_edusrc_intent_task(task, raw, is_intent)
+    force_edusrc_scope = _is_edusrc_intent_task(task, raw, is_intent)
 
     # 企业模式范围硬约束：用户已明确指定资产范围（如 *.21cn.com 这些），
     # 提取根域名作为外层 && 约束，强制包裹后续一切语法，杜绝 LLM 生成的
@@ -262,8 +279,8 @@ async def _resolve_query(task: Task, llm: LLMRouter | None) -> tuple[str, str]:
             return _with_enterprise_scope_filter(q, enterprise_domains)
         if scope_anchors.get("domains") or scope_anchors.get("cert_orgs"):
             return _with_scope_anchors(q, scope_anchors)
-        if force_edusrc_org:
-            return _with_edusrc_org_filter(q)
+        if force_edusrc_scope:
+            return _with_edusrc_scope_filter(q)
         return q
 
     # 用户直接给语法、且没历史 → 第一轮直用原语法（企业模式仍强制套范围约束）

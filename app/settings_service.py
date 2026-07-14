@@ -132,7 +132,7 @@ def _env_defaults() -> dict[str, Any]:
     return {
         "concurrency": 3,
         "skip_score_threshold": float(os.environ.get("SKIP_SCORE_THRESHOLD", "-10")),
-        "worker_prompt_version": normalize_worker_prompt_version(os.environ.get("WORKER_PROMPT_VERSION", "legacy")),
+        "worker_prompt_version": normalize_worker_prompt_version(os.environ.get("WORKER_PROMPT_VERSION", "current")),
         "engine": os.environ.get("SEARCH_ENGINE", get_default_engine()),
     }
 

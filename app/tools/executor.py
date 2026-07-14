@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -19,10 +20,22 @@ from typing import Any, BinaryIO, Optional
 import httpx
 
 from app.config import worker_config
+from app.tools.auth_analyzer import analyze_auth_material as _analyze_auth_material
 from app.tools.decoder import decode_transform as _decode_transform
+from app.tools.evidence import (
+    analyze_api_schema as _analyze_api_schema,
+    compare_http_responses as _compare_http_responses,
+)
 from app.tools.guard import CommandBlocked, check_command
+from app.tools.http_surface import extract_http_surface as _extract_http_surface
 from app.tools.js_analyzer import analyze_javascript as analyze_js_text
 from app.tools.js_analyzer import analyze_url as analyze_js_url
+from app.tools.src_toolkit import (
+    ENTERPRISE_BLOCKED_SRC_TOOLS,
+    SRC_TOOL_NAMES,
+    SrcToolError,
+    build_src_plan,
+)
 from app.tools.waf_advisor import suggest_waf_bypass as _suggest_waf_bypass
 
 _FOFA_BASE = "https://fofa.info"
@@ -172,8 +185,10 @@ class ToolExecutor:
         fofa_key: str = "",
         fofa_base_url: str = "",
         capture_full: bool = False,
+        scope_target: str = "",
     ):
         self.target = target
+        self.scope_target = scope_target or target
         self.cancel_event = cancel_event or threading.Event()
         # 企业模式：对目标生产环境的破坏性命令做额外硬拦截。
         self.enterprise = enterprise
@@ -230,10 +245,28 @@ class ToolExecutor:
         except CommandBlocked as e:
             return {"ok": False, "blocked": True, "error": str(e)}
 
-        capture = self._new_capture("run_shell")
+        return self._run_process(
+            command,
+            timeout=timeout,
+            shell=True,
+            capture_tool="run_shell",
+            display_command=command,
+        )
+
+    def _run_process(
+        self,
+        command: str | list[str],
+        *,
+        timeout: int,
+        shell: bool,
+        capture_tool: str,
+        display_command: str,
+    ) -> dict[str, Any]:
+        """Run one bounded process, preserving the existing capture/cancel contract."""
+        capture = self._new_capture(capture_tool)
         capture_output: Optional[_CaptureWriter] = None
         if capture is not None:
-            capture.write_channel("command", command.encode("utf-8", "surrogatepass"))
+            capture.write_channel("command", display_command.encode("utf-8", "surrogatepass"))
             capture_output = capture.open_channel("output")
 
         start = time.time()
@@ -246,7 +279,7 @@ class ToolExecutor:
         try:
             proc = subprocess.Popen(
                 command,
-                shell=True,
+                shell=shell,
                 cwd=str(self.work_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -332,7 +365,7 @@ class ToolExecutor:
                 f"预览省略约 {omitted_bytes} 字节，{suffix}]..."
             )
         # 人类可读预览仍写工作目录；完整字节由私有 capture spool 单独保存。
-        log_file = self._write_log(f"$ {command}\n\n{full_out}")
+        log_file = self._write_log(f"$ {display_command}\n\n{full_out}")
 
         result = {
             "ok": rc == 0 and not timed_out and not cancelled,
@@ -356,6 +389,97 @@ class ToolExecutor:
                     "elapsed_sec": elapsed,
                 },
             )
+        return result
+
+    def _src_args_with_session(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        values = dict(args)
+        if tool in {"scan_web_ports", "fingerprint_waf"}:
+            return values
+        supplied = _normalize_headers(values.get("headers"))
+        merged = dict(self._session_headers)
+        merged.update(supplied)
+        if self._session_cookies and not any(key.lower() == "cookie" for key in merged):
+            merged["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in self._session_cookies.items()
+            )
+        if merged:
+            values["headers"] = merged
+        return values
+
+    def run_src_tool(self, tool: str, args: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Execute one structured SRC tool plan without invoking a command shell."""
+        name = str(tool or "").strip()
+        if name not in SRC_TOOL_NAMES:
+            return {"ok": False, "kind": "arg_error", "error": f"未知 SRC 工具: {name}"}
+        if self.enterprise and name in ENTERPRISE_BLOCKED_SRC_TOOLS:
+            return {
+                "ok": False,
+                "blocked": True,
+                "kind": "enterprise_policy",
+                "tool": name,
+                "error": "企业 SRC 模式禁止使用 Nuclei 类漏洞扫描工具；请改用已知入口的最小请求验证。",
+            }
+        try:
+            plan = build_src_plan(
+                name,
+                self._src_args_with_session(name, dict(args or {})),
+                scope_target=self.scope_target,
+            )
+        except SrcToolError as exc:
+            return {
+                "ok": False,
+                "blocked": bool(exc.blocked),
+                "kind": "arg_error",
+                "tool": name,
+                "error": str(exc),
+            }
+
+        for index, token in enumerate(plan.argv[:-1]):
+            if token == "-w":
+                wordlist = Path(plan.argv[index + 1])
+                if not wordlist.is_file():
+                    return {
+                        "ok": False,
+                        "kind": "missing_resource",
+                        "tool": name,
+                        "error": f"内置字典不存在: {wordlist}",
+                    }
+
+        binary = shutil.which(plan.binary)
+        if not binary:
+            return {
+                "ok": False,
+                "missing_tool": True,
+                "kind": "missing_tool",
+                "tool": name,
+                "binary": plan.binary,
+                "error": f"SRC 工具 {plan.binary} 未安装；请重新构建包含安全工具层的镜像。",
+            }
+        display_command = subprocess.list2cmdline(list(plan.display_argv))
+        try:
+            check_command(display_command, enterprise=self.enterprise)
+        except CommandBlocked as exc:
+            return {
+                "ok": False,
+                "blocked": True,
+                "kind": "command_policy",
+                "tool": name,
+                "error": str(exc),
+            }
+        command = [binary, *plan.argv[1:]]
+        result = self._run_process(
+            command,
+            timeout=min(plan.timeout, worker_config.shell_timeout_max),
+            shell=False,
+            capture_tool=name,
+            display_command=display_command,
+        )
+        result.update({
+            "tool": name,
+            "binary": plan.binary,
+            "command": display_command,
+            "guidance": plan.guidance,
+        })
         return result
 
     @staticmethod
@@ -414,6 +538,7 @@ class ToolExecutor:
         json_body: Optional[Any] = None,
         follow_redirects: bool = False,
         timeout: int = 20,
+        body_preview_limit: Optional[int] = None,
     ) -> dict[str, Any]:
         # LLM 可能把 headers 传成非 dict 形态（list["K: V"] / "K: V\nK2: V2" / None），
         # 直接喂给 dict()/httpx 会抛 "dictionary update sequence element..." 崩掉整个 agent。
@@ -461,16 +586,20 @@ class ToolExecutor:
         # 模型 submit_finding 时按 prompt 规范从 body 自行裁剪取证，不依赖这份 raw_response。
         raw_req = self._raw_request(req, data, json_body)
 
+        response_headers = dict(resp.headers)
+        set_cookie_headers = resp.headers.get_list("set-cookie")
         result = {
             "ok": True,
             "status_code": resp.status_code,
             "url": str(resp.url),
-            "response_headers": dict(resp.headers),
-            "body": _truncate(body),
+            "response_headers": response_headers,
+            "body": _truncate(body, body_preview_limit) if body_preview_limit else _truncate(body),
             "body_len": len(body),
             "body_truncated": truncated,
             "raw_request": _truncate(raw_req, 1536),
         }
+        if set_cookie_headers:
+            result["set_cookie_headers"] = set_cookie_headers
         if session_applied:
             result["session_applied"] = session_applied
         if session_updated:
@@ -565,6 +694,103 @@ class ToolExecutor:
     def decode_transform(self, value: str = "", mode: str = "auto") -> dict[str, Any]:
         """编码/解码/哈希分析（纯内存，无外部副作用）。详见 tools/decoder.py。"""
         return _decode_transform(value, mode)
+
+    def compare_http_responses(
+        self,
+        baseline: dict[str, Any],
+        candidate: dict[str, Any],
+        ignore_json_paths: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """对比两份已取得的 HTTP 响应，提取可复核的结构差异。"""
+        return _compare_http_responses(baseline, candidate, ignore_json_paths)
+
+    def analyze_api_schema(
+        self,
+        document: str = "",
+        url: str = "",
+        base_url: str = "",
+        focus: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """解析 OpenAPI/Swagger JSON 并排序高价值验证入口。"""
+        capture = None
+        source: dict[str, Any] = {}
+        if not document and url:
+            fetched = self.http_request(
+                url=url,
+                method="GET",
+                follow_redirects=True,
+                body_preview_limit=_HTTP_MAX_BYTES + 512,
+            )
+            capture = fetched.pop("_capture", None)
+            if not fetched.get("ok"):
+                if capture:
+                    fetched["_capture"] = capture
+                return fetched
+            if fetched.get("body_truncated"):
+                result = {"ok": False, "error": "OpenAPI 文档超过 WORKER_HTTP_MAX_BYTES，无法完整解析"}
+                if capture:
+                    result["_capture"] = capture
+                return result
+            document = str(fetched.get("body") or "")
+            base_url = base_url or str(fetched.get("url") or url)
+            source = {
+                "url": fetched.get("url") or url,
+                "status_code": fetched.get("status_code"),
+                "content_type": (fetched.get("response_headers") or {}).get("content-type", ""),
+            }
+        result = _analyze_api_schema(document, base_url, focus)
+        if source:
+            result["source"] = source
+        if capture:
+            result["_capture"] = capture
+        return result
+
+    def extract_http_surface(
+        self,
+        body: str = "",
+        url: str = "",
+        base_url: str = "",
+        response_headers: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """从 HTML 响应提取表单、资源和高价值候选入口。"""
+        capture = None
+        source: dict[str, Any] = {}
+        if not body and url:
+            fetched = self.http_request(
+                url=url,
+                method="GET",
+                follow_redirects=True,
+                body_preview_limit=_HTTP_MAX_BYTES + 512,
+            )
+            capture = fetched.pop("_capture", None)
+            if not fetched.get("ok"):
+                if capture:
+                    fetched["_capture"] = capture
+                return fetched
+            body = str(fetched.get("body") or "")
+            base_url = base_url or str(fetched.get("url") or url)
+            response_headers = response_headers or fetched.get("response_headers")
+            source = {
+                "url": fetched.get("url") or url,
+                "status_code": fetched.get("status_code"),
+                "body_truncated": bool(fetched.get("body_truncated")),
+            }
+        result = _extract_http_surface(body, base_url, response_headers)
+        if source:
+            result["source"] = source
+        if capture:
+            result["_capture"] = capture
+        return result
+
+    def analyze_auth_material(
+        self,
+        request_headers: Optional[dict[str, Any]] = None,
+        response_headers: Optional[dict[str, Any]] = None,
+        set_cookie_headers: Optional[list[str]] = None,
+        body: str = "",
+    ) -> dict[str, Any]:
+        """归纳请求/响应中的鉴权、Cookie、JWT 和 CSRF 材料。"""
+        return _analyze_auth_material(request_headers, response_headers, set_cookie_headers, body)
 
     # ---- fofa_lookup（只读资产测绘，确认归属 + 探攻击面）----
     def fofa_lookup(self, query: str = "", size: int = 10) -> dict[str, Any]:

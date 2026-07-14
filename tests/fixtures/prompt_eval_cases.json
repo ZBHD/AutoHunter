@@ -1,0 +1,27 @@
+[
+  {
+    "id": "evidence_closure",
+    "name": "证据闭环",
+    "required_all": ["raw_request", "raw_response", "check_duplicate_finding", "finish"]
+  },
+  {
+    "id": "business_model",
+    "name": "业务建模与单变量对照",
+    "required_all": ["业务建模", "单变量", "双测试账号", "身份、对象、功能、状态、数量、输出"]
+  },
+  {
+    "id": "low_value_convergence",
+    "name": "低价值信号收敛",
+    "required_all": ["finish(no_vuln)", "200", "空响应", "公开"]
+  },
+  {
+    "id": "impact_proof",
+    "name": "影响与最小证据",
+    "required_all": ["实际危害", "状态变化", "最小证据"]
+  },
+  {
+    "id": "structured_tool_routing",
+    "name": "结构化工具选择",
+    "required_all": ["extract_http_surface", "analyze_api_schema", "analyze_auth_material", "compare_http_responses"]
+  }
+]

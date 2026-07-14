@@ -54,7 +54,7 @@ def generate_query(llm: LLMRouter, intent: str, vuln_types: list[str],
 
 def judge_edu_batch(llm: LLMRouter, assets: list[dict]) -> dict[int, dict]:
     """批量判定资产是否 edu + 归属学校。assets: [{host, ip, org, title}]。
-    返回 {index: {is_edu: bool, school: str}}。"""
+    返回 {index: {is_edu: bool, school: str, reason: str}}。"""
     if not assets:
         return {}
     lines = []
@@ -63,7 +63,7 @@ def judge_edu_batch(llm: LLMRouter, assets: list[dict]) -> dict[int, dict]:
             f"[{i}] host={a.get('host','')} ip={a.get('ip','')} "
             f"org={a.get('org','')} title={a.get('title','')}"
         )
-    user = "# 待判定资产\n" + "\n".join(lines) + "\n\n请逐个判定是否属于中国教育行业，并给出归属学校全称；不要输出理由。"
+    user = "# 待判定资产\n" + "\n".join(lines) + "\n\n请逐个判定是否属于中国教育行业，给出归属学校全称和一句简短依据。"
     msg = llm.chat(
         [{"role": "system", "content": COLLECTOR_EDU_PROMPT_COMPACT},
          {"role": "user", "content": user}],
@@ -79,6 +79,7 @@ def judge_edu_batch(llm: LLMRouter, assets: list[dict]) -> dict[int, dict]:
                 out[int(r["index"])] = {
                     "is_edu": bool(r["is_edu"]),
                     "school": (r.get("school") or "").strip(),
+                    "reason": (r.get("reason") or "").strip()[:300],
                 }
             except Exception:
                 continue

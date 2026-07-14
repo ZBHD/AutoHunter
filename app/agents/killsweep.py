@@ -30,7 +30,7 @@ from app.llm.router import LLMRouter
 from app.missed_signals import detect_tool_signals
 from app.raw_evidence import detach_capture
 from app.tools.executor import ToolExecutor
-from app.tools.schemas import KILLSWEEP_TOOL_SCHEMAS
+from app.tools.schemas import killsweep_tool_schemas
 
 _FOFA_BASE = "https://fofa.info"
 # 通杀分析只做产品指纹、FOFA 圈定、抽样验证，必须有限轮数，避免模型递归空转。
@@ -512,11 +512,17 @@ class KillsweepHunter:
         self.fofa_base_url = fofa_base_url
         self.llm = llm
         self.cancel_event = cancel_event or threading.Event()
+        self.src_type = src_type
+        self._enterprise = is_enterprise_src(src_type)
+        target_url = str(finding.get("target_url") or "")
         self.executor = ToolExecutor(
-            f"killsweep_{finding.get('target_url','x')}",
+            f"killsweep_{target_url or 'x'}",
             cancel_event=self.cancel_event,
+            enterprise=self._enterprise,
             capture_full=True,
+            scope_target=target_url,
         )
+        self._tools = killsweep_tool_schemas(enterprise=self._enterprise)
         self.on_event = on_event or (lambda kind, data: None)
         self._result: Optional[dict] = None
         self._verified_http_results: dict[str, dict[str, Any]] = {}
@@ -527,7 +533,6 @@ class KillsweepHunter:
         self._source_request_shape, self._source_signal_keys = (
             _source_verification_context(finding)
         )
-        self.src_type = src_type
 
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
@@ -562,7 +567,7 @@ class KillsweepHunter:
             rounds += 1
             try:
                 send_messages = compact_messages(messages, rounds)
-                msg = self.llm.chat(send_messages, tools=KILLSWEEP_TOOL_SCHEMAS, tool_choice="auto")
+                msg = self.llm.chat(send_messages, tools=self._tools, tool_choice="auto")
             except Exception as e:
                 self._emit("killsweep_error", error=str(e))
                 return KillsweepResult({"error": f"LLM 调用失败: {e}"})

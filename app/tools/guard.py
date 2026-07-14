@@ -1,8 +1,8 @@
-"""命令安全防护：只拦截会自毁运行环境的命令，不拦攻击类命令。
+"""命令安全防护：拦截运行环境破坏和企业模式不允许的扫描命令。
 
 设计原则（对应设计文档 §11.1）：
-- 无利用限制：攻击 payload、扫描、爆破等一律放行。
-- 仅拦"自毁"：rm -rf /、关闭 redis/pg、改系统配置、关机重启等会搞垮容器/本机的操作。
+- EduSRC/靶场保留原有攻击验证能力，只拦会搞垮容器/本机的自毁操作。
+- 企业 SRC 额外拦截 Nuclei 类自动化漏洞扫描器，要求回到单请求和响应差异验证。
 """
 from __future__ import annotations
 
@@ -34,6 +34,11 @@ _COMPILED = [re.compile(p, re.IGNORECASE) for p in _SELF_DESTRUCT_PATTERNS]
 # 企业是真实生产资产，证明漏洞存在即可，绝不实际造成数据/业务/服务损害。
 # 仅在 src_type=enterprise 时启用；edu/靶场不受此限。
 _ENTERPRISE_DANGER_PATTERNS = [
+    # 企业项目使用单请求手工验证，不运行自动化漏洞扫描器。
+    (r"\b(nuclei|sqlmap(?:\.py)?|dalfox|nikto|xray|afrog|vulmap|wpscan|arachni|zap-baseline(?:\.py)?|zaproxy|nessus|openvas|gvm-cli|pocsuite(?:3)?|poc-suite|jaeles|wapiti|skipfish|commix|xsser|acunetix|awvs|appscan|invicti|netsparker|goby)\b",
+     "禁止自动化漏洞扫描；企业模式使用单请求和响应差异完成最小验证。"),
+    (r"\bnmap\b[\s\S]*(?:--script(?:=|\s+)[^\s]*vuln|--script(?:=|\s+)[^\s]*vulners|-sC\b)",
+     "禁止用 Nmap NSE 做自动化漏洞扫描；企业模式只允许少量 TCP connect 服务确认。"),
     # SQL 写/删/库结构破坏（拦截 sqlmap dump 全库 + 直接 DML/DDL）
     (r"\bsqlmap\b.*--(dump-all|dump\b|os-shell|file-write|sql-shell)",
      "禁止 sqlmap --dump/--dump-all/--os-shell/--file-write/--sql-shell：企业生产库只做存在性验证（布尔/延时/读单条），不批量拖库、不写入。"),

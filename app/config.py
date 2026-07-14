@@ -94,7 +94,7 @@ class WorkerConfig(BaseModel):
     enterprise_round_budget_cap: int = int(os.environ.get("ENTERPRISE_WORKER_ROUND_BUDGET_CAP", "0"))
     enterprise_soft_round_budget_cap: int = int(os.environ.get("ENTERPRISE_WORKER_SOFT_ROUND_BUDGET_CAP", "0"))
     js_tool_always_on: bool = os.environ.get("WORKER_JS_TOOL_ALWAYS_ON", "0").lower() in {"1", "true", "yes"}
-    prompt_version: str = os.environ.get("WORKER_PROMPT_VERSION", "legacy")
+    prompt_version: str = os.environ.get("WORKER_PROMPT_VERSION", "current")
     work_root: str = os.environ.get("WORKER_WORK_ROOT", "/tmp/autohunter/work")
 
     def rounds_for(self, src_type: str | None) -> tuple[int, int]:

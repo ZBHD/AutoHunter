@@ -13,7 +13,7 @@ from app.api.dto import (
 from app.agents import site_collab
 from app.agents.prompts import normalize_src_type
 from app.db.models import (
-    Finding, Killsweep, KillsweepAttempt, KillsweepEvent, KillsweepReanalysisBatch,
+    EscalationAttempt, Finding, Killsweep, KillsweepAttempt, KillsweepEvent, KillsweepReanalysisBatch,
     MissedSignal, MissedSignalDraft, MissedSignalEvent, MissedSignalEvidence,
     RawEvidence, RawEvidenceChunk, Review, Target, Task, TaskEvent, to_cst_iso,
 )
@@ -560,6 +560,7 @@ async def delete_task(task_id: str, session: AsyncSession = Depends(get_session)
     await session.execute(delete(MissedSignalDraft).where(MissedSignalDraft.task_id == task_id))
     await session.execute(delete(MissedSignalEvent).where(MissedSignalEvent.task_id == task_id))
     await session.execute(delete(MissedSignal).where(MissedSignal.task_id == task_id))
+    await session.execute(delete(EscalationAttempt).where(EscalationAttempt.task_id == task_id))
 
     batch_ids = set(
         await session.scalars(

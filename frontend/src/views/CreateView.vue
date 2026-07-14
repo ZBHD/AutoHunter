@@ -20,7 +20,7 @@ const form = reactive({
   src_rules: "",
   use_global_pool: true,
   base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
-  prompt_version: "legacy",
+  prompt_version: "current",
   fofa_key: "", fofa_base_url: "", max_pages: 20, concurrency: 3,
 });
 const inherited = reactive({
