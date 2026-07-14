@@ -9,18 +9,18 @@ BACKUP_KEEP="${BACKUP_KEEP:-10}"
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR" 2>/dev/null || true
 
-if ! docker inspect "$SERVICE" >/dev/null 2>&1; then
+if ! docker container inspect "$SERVICE" >/dev/null 2>&1; then
   printf '%s\n' "No $SERVICE container exists; data backup is not needed yet."
   exit 0
 fi
 
-DATA_VOLUME="$(docker inspect "$SERVICE" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
+DATA_VOLUME="$(docker container inspect "$SERVICE" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
 if [ -z "$DATA_VOLUME" ]; then
   printf '%s\n' "The $SERVICE container has no /app/data volume; refusing to continue." >&2
   exit 1
 fi
 
-IMAGE="$(docker inspect "$SERVICE" --format '{{.Config.Image}}')"
+IMAGE="$(docker container inspect "$SERVICE" --format '{{.Config.Image}}')"
 [ -n "$IMAGE" ] || IMAGE="autohunter:latest"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARCHIVE="autohunter-data-${STAMP}.tar.gz"

@@ -33,6 +33,8 @@ def test_server_update_builds_before_stopping_and_backs_up_before_recreate() -> 
 def test_server_backup_archives_the_persistent_data_volume_read_only() -> None:
     source = _source("backup-data.sh")
 
+    assert 'docker container inspect "$SERVICE"' in source
+    assert 'docker inspect "$SERVICE"' not in source
     assert 'eq .Destination "/app/data"' in source
     assert '"$DATA_VOLUME:/source:ro"' in source
     assert '"$BACKUP_DIR:/backup"' in source
@@ -40,3 +42,10 @@ def test_server_backup_archives_the_persistent_data_volume_read_only() -> None:
     assert "tar -tzf" in source
     assert "sha256sum" in source
     assert "BACKUP_KEEP" in source
+
+
+def test_server_update_reads_previous_image_from_a_container_only() -> None:
+    source = _source("update-server.sh")
+
+    assert 'docker container inspect "$SERVICE"' in source
+    assert 'docker inspect "$SERVICE"' not in source

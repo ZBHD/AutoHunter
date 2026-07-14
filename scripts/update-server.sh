@@ -31,7 +31,7 @@ else
 fi
 docker compose -f "$COMPOSE_FILE" config --quiet
 
-PREVIOUS_IMAGE_ID="$(docker inspect "$SERVICE" --format '{{.Image}}' 2>/dev/null || true)"
+PREVIOUS_IMAGE_ID="$(docker container inspect "$SERVICE" --format '{{.Image}}' 2>/dev/null || true)"
 STOPPED=0
 
 restart_previous_container() {
