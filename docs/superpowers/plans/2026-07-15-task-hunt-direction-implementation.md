@@ -177,7 +177,7 @@ git commit -m "feat: guide workers with task hunt direction"
 **Files:**
 - Modify: `frontend/src/views/CreateView.vue:1-190` — form state, create payload and textarea.
 - Modify: `frontend/src/components/TaskEditModal.vue:35-230` — form state, fill/save and textarea.
-- Test: `frontend/test/task-hunt-direction.test.js` — source-level contract tests following existing Node test conventions.
+- Test: `frontend/tests/taskHuntDirection.test.js` — source-level contract tests following existing Node test conventions.
 
 - [ ] **Step 1: Write failing frontend contract tests**
 
@@ -195,7 +195,7 @@ test("create view submits trimmed hunt direction", () => {
 
 - [ ] **Step 2: Run the frontend contract tests and verify RED**
 
-Run: `node --test frontend/test/task-hunt-direction.test.js`
+Run: `node --test frontend/tests/taskHuntDirection.test.js`
 
 Expected: FAIL because neither view has the new field.
 
@@ -214,14 +214,14 @@ In `TaskEditModal.vue`, initialize the same property, set `form.hunt_direction =
 
 - [ ] **Step 4: Run frontend tests and build**
 
-Run: `node --test frontend/test/task-hunt-direction.test.js` and `npm --prefix frontend run build`
+Run: `node --test frontend/tests/taskHuntDirection.test.js` and `npm --prefix frontend run build`
 
 Expected: contract tests pass and Vite produces a successful production build.
 
 - [ ] **Step 5: Commit the frontend behavior**
 
 ```bash
-git add frontend/src/views/CreateView.vue frontend/src/components/TaskEditModal.vue frontend/test/task-hunt-direction.test.js
+git add frontend/src/views/CreateView.vue frontend/src/components/TaskEditModal.vue frontend/tests/taskHuntDirection.test.js
 git commit -m "feat: add hunt direction task controls"
 ```
 

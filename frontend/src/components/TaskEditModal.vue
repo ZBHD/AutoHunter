@@ -49,6 +49,7 @@ const form = reactive({
   name: "",
   src_type: "edusrc",
   vuln_types: "",
+  hunt_direction: "",
   target_source: "fofa",
   engine: "",
   fofa_query: "",
@@ -88,6 +89,7 @@ function fill(task) {
   form.name = task.name || "";
   form.src_type = task.src_type || "edusrc";
   form.vuln_types = (task.vuln_types || []).join(",");
+  form.hunt_direction = task.hunt_direction || "";
   form.target_source = task.target_source || "fofa";
   form.engine = task.engine || "";
   form.fofa_query = task.fofa_query || "";
@@ -152,6 +154,7 @@ async function save() {
     name: form.name,
     src_type: form.src_type,
     vuln_types: form.vuln_types.split(",").map((s) => s.trim()).filter(Boolean),
+    hunt_direction: form.hunt_direction.trim(),
     target_source: form.target_source,
     engine: form.engine,
     fofa_query: form.fofa_query,
@@ -214,6 +217,10 @@ async function save() {
       </div>
 
       <label>漏洞类型（逗号分隔） <input v-model="form.vuln_types" /></label>
+      <label>指定挖掘方向（可选）
+        <textarea v-model="form.hunt_direction" rows="3" maxlength="2000"
+          placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
+      </label>
       <label v-if="!isSiteMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
       <label v-else>目标相关信息 / 协作重点 / 已有凭据
         <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置，以及【已有的登录凭据】。给了凭据 Agent 会先前台测、再登录进系统内部深挖。&#10;例：后台在 /admin；已有账号 test / Test@123；或 Cookie: JSESSIONID=xxxx"></textarea>
