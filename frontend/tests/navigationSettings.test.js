@@ -40,9 +40,9 @@ test("only full access can open task creation while readonly can open operations
   assert.equal(canAccessRoute("readonly", "/killsweeps"), true);
 });
 
-test("navigation accepts pending and failed badge counts", () => {
+test("navigation only shows the failed killsweep badge", () => {
   const items = primaryNavigation("full", { missedPending: 7, killsweepFailed: 3 });
-  assert.equal(items.find((item) => item.id === "missed")?.badge, 7);
+  assert.equal(items.find((item) => item.id === "missed")?.badge, 0);
   assert.equal(items.find((item) => item.id === "killsweeps")?.badge, 3);
 });
 

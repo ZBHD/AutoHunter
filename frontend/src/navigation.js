@@ -1,6 +1,6 @@
 const NAV_ITEMS = Object.freeze([
   { id: "tasks", label: "任务", to: "/", roles: null },
-  { id: "missed", label: "疑似", to: "/missed-signals", roles: ["full", "readonly"], badgeKey: "missedPending" },
+  { id: "missed", label: "疑似", to: "/missed-signals", roles: ["full", "readonly"] },
   { id: "killsweeps", label: "通杀", to: "/killsweeps", roles: ["full", "readonly"], badgeKey: "killsweepFailed" },
   { id: "settings", label: "设置", to: "/settings", roles: null },
 ]);
