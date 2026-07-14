@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.agents.prompt_profiles import compose_reviewer_policy, normalize_prompt_version
+from app.dedup import normalize_vuln_type
 
 REVIEWER_SYSTEM_PROMPT = """你是 EduSRC 平台最严格、最理性的漏洞审核专家。你的唯一目标：过滤垃圾洞，只放真正有价值、真实可利用的漏洞进最终列表。
 
@@ -380,9 +381,17 @@ ESCALATE_SYSTEM_PROMPT_ENTERPRISE = ESCALATE_SYSTEM_PROMPT.replace(
 - 不跨任务资产、姊妹域或批量目标；扫描器输出不得作为升级证据。
 """
 
+_BACKDOOR_ESCALATION_POLICY = """
+
+# J. 服务器被攻陷 / backdoor_compromised
+原 Finding 的篡改页面、暗链或 webshell 是已确认起点，不是本轮可重复提交的升级结果。先复核当前性并排除跳转、缓存和第三方托管，再沿已观察到的同一目标入口查找初始入口：上传、未授权管理面、组件漏洞、文件写入、泄露凭证或其它可控点。每一步使用最小、可复核的请求。
+只有取得新的 raw_request/raw_response，并证明 RCE、可用凭证、管理员入口、未授权写或规模化影响时，才以真正对应的漏洞类型 submit_escalation。只有原页面、原 webshell 路径或原始证据重复出现时调用 abandon_escalation。
+"""
+
 
 def escalate_system_prompt(src_type: str | bool | None) -> str:
-    return ESCALATE_SYSTEM_PROMPT_ENTERPRISE if is_enterprise_src(src_type) else ESCALATE_SYSTEM_PROMPT
+    base = ESCALATE_SYSTEM_PROMPT_ENTERPRISE if is_enterprise_src(src_type) else ESCALATE_SYSTEM_PROMPT
+    return base + _BACKDOOR_ESCALATION_POLICY
 
 
 def should_escalate(vuln_type: str, title: str, severity: str) -> bool:
@@ -866,6 +875,28 @@ def normalize_worker_prompt_version(version: str | None) -> str:
     return normalize_prompt_version(version)
 
 
+_BACKDOOR_WORKER_POLICY = """
+
+# 疑似后门/服务器被攻陷（backdoor_compromised）
+发现目标自有服务返回与正常业务冲突的赌博/色情/博彩页面、SEO 暗链、deface 或 webshell 时，不要按纯静态页直接 no_vuln。先保留未跟随跳转的 Host、状态码、Location、响应头和正文；需要跟随时同时记录 redirect chain 与 final URL。再加随机 query 或 `Cache-Control: no-cache` 复取，提供证书/备案/官网链接/同站品牌或业务路径等归属依据，并用正常页面或同站身份做对照。
+deface/暗链必须证明恶意内容由目标 origin 当前返回。webshell 必须有当前 URL 可重复、无害的服务端执行证据；只看到 shell.php 文件名、登录页、源码字符串或目录条目不够。域名停放、合法 SSO/活动跳转、白标 SaaS、第三方托管、CDN/WAF 错误页、历史缓存、广告、UGC 和 iframe 不按服务器被攻陷提交。
+证据闭环后先 check_duplicate_finding，再以 vuln_type=backdoor_compromised 提交；raw_request/raw_response 必须来自同次真实请求，描述中区分已证事实、推测和未知初始入口。当前性、归属或响应来源缺一项但可具体补齐时，在 deepen_lead 写明复取、跳转链或对照动作。
+"""
+
+_BACKDOOR_REVIEWER_POLICY = """
+
+# 疑似后门/服务器被攻陷审核（backdoor_compromised）
+完整性事件不要求先证明初始入口，但必须核对目标归属、当前复取和响应来源。归属明确、无缓存复取仍由目标 origin 返回篡改/SEO 暗链且有正常内容对照 -> accepted，高危 7~8；有可重复的服务端命令/脚本执行证据 -> accepted，严重 9~10。当前性、归属或来源对照缺一项且有明确补证动作 -> deepen，并写清下一次复取、跳转链或对照要求。
+域名停放/出售页、合法 SSO/活动跳转、白标 SaaS/第三方托管、CDN/WAF 错误页、历史缓存/历史 FOFA/Wayback、单个关键词、广告、UGC、iframe -> ignored。只有 shell.php 等文件名而无执行证据时不能认定 webshell；有具体可验证动作才 deepen，否则 ignored。异常页面必须经过上述证据矩阵，不能无条件收录。
+"""
+
+_BACKDOOR_COLLECTOR_POLICY = """
+
+# 后门类型查询门槛
+仅因本任务类型包含 backdoor_compromised 才应用本段。查询必须同时带明确的系统、产品或归属锚点；不得只用博彩、色情、暗链、被黑、异常、Error 等宽泛词圈资产。FOFA 命中只用于找候选，不能代替 Worker 对当前响应、归属和 origin 来源的取证。
+"""
+
+
 _WORKER_STRUCTURED_TOOL_GUIDE = """
 
 # 结构化分析工具选择
@@ -885,16 +916,27 @@ def worker_system_prompt(src_type: str | bool | None, version: str | None = None
             base = WORKER_SYSTEM_PROMPT
         else:
             base = WORKER_SYSTEM_PROMPT_COMPACT
-    return base + _WORKER_STRUCTURED_TOOL_GUIDE
+    return base + _BACKDOOR_WORKER_POLICY + _WORKER_STRUCTURED_TOOL_GUIDE
 
 
 def reviewer_system_prompt(src_type: str | bool | None, src_rules: str | None = None) -> str:
     base = ENTERPRISE_REVIEWER_SYSTEM_PROMPT if is_enterprise_src(src_type) else REVIEWER_SYSTEM_PROMPT_COMPACT
-    return compose_reviewer_policy(base, src_rules)
+    return compose_reviewer_policy(base + _BACKDOOR_REVIEWER_POLICY, src_rules)
 
 
-def collector_query_prompt(src_type: str | bool | None) -> str:
-    return ENTERPRISE_COLLECTOR_QUERY_PROMPT_COMPACT if is_enterprise_src(src_type) else COLLECTOR_QUERY_PROMPT_COMPACT
+def collector_query_prompt(
+    src_type: str | bool | None,
+    vuln_types: list[str] | None = None,
+) -> str:
+    base = (
+        ENTERPRISE_COLLECTOR_QUERY_PROMPT_COMPACT
+        if is_enterprise_src(src_type)
+        else COLLECTOR_QUERY_PROMPT_COMPACT
+    )
+    selected = {normalize_vuln_type(value) for value in (vuln_types or [])}
+    if "backdoor_compromised" in selected:
+        return base + _BACKDOOR_COLLECTOR_POLICY
+    return base
 
 
 def collector_default_intent(src_type: str | bool | None) -> str:

@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from app.agents.depth_policy import depth_policy_for
 from app.agents.history import bounded_tool_content, compact_messages
 from app.agents.prompts import escalate_system_prompt, is_enterprise_src
+from app.dedup import normalize_vuln_type
 from app.llm.router import LLMRouter
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import escalate_tool_schemas
@@ -68,10 +69,21 @@ class EscalateHunter:
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
 
+    def _backdoor_focus(self) -> str:
+        if normalize_vuln_type(self.finding.get("vuln_type", "")) != "backdoor_compromised":
+            return ""
+        return (
+            "\n\n# 后门/被攻陷专用目标\n"
+            "先复核当前篡改证据，排除跳转、缓存和第三方托管；再查上传点、未授权管理入口、"
+            "组件漏洞、文件写入和泄露凭证等初始入口。只有证明新的 RCE、可用凭证、管理员入口、"
+            "未授权写或规模化影响时，才携带新的 raw_request 和 raw_response，并使用真正对应的漏洞类型"
+            "提交 submit_escalation。重复原页面、原 webshell 路径或原始证据时调用 abandon_escalation。"
+        )
+
     def _brief(self) -> str:
         f = self.finding
         unit_label = "企业/系统归属" if is_enterprise_src(self.src_type) else "归属"
-        return (
+        brief = (
             f"# 已确认存在的漏洞（你的深挖起点）\n"
             f"- 标题：{f.get('title','')}\n"
             f"- 漏洞类型：{f.get('vuln_type','')}\n"
@@ -92,6 +104,7 @@ class EscalateHunter:
             f"实际拿到敏感数据·写操作·账号接管等新实质危害）就 submit_escalation；只有纯原地打转、"
             f"和原洞完全等价时才 abandon_escalation。"
         )
+        return brief + self._backdoor_focus()
 
     def run(self) -> EscalateResult:
         self._emit("escalate_start", title=self.finding.get("title", ""))

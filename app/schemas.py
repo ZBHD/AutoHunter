@@ -49,7 +49,7 @@ class ChainStep(BaseModel):
 
 class Finding(BaseModel):
     """worker 标准漏洞输出。缺关键字段审核会直接打回。"""
-    vuln_type: str = Field(..., description="漏洞类型，如 sql_injection / rce / captcha_bypass / idor / unauthorized_access")
+    vuln_type: str = Field(..., description="漏洞类型，如 sql_injection / rce / captcha_bypass / idor / unauthorized_access / backdoor_compromised")
     title: str = Field(..., description="漏洞标题，格式：[目标] - [模块] - [简述]")
     severity_claimed: Severity = Field(..., description="worker 自评等级")
     target_url: str = Field(..., description="漏洞所在 URL")
