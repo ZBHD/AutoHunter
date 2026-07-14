@@ -177,7 +177,7 @@ class SrcParseResult:
 
 ### `app/tools/guard.py` 与 `app/api/tasks.py`
 
-- `guard.py` 增加 `check_enterprise_command(command: str, *, scope_target: str, allowed_parsers: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]`，返回校验后的 argv；executor 在企业模式用该 argv 和 `shell=False` 执行。允许的外部可执行文件只有 `curl`/`curl.exe`；允许参数为 `-s/-S/-i/-I/-X/-H/--data/--data-raw/--max-time/--connect-timeout`，URL 参数必须恰好一个且 host 与 `scope_target` 相同，`--max-time <= 30`、请求体 <= 16 KiB；`Host`/代理/解析覆盖类 Header 和 `--connect-to/--resolve` 均拒绝；`-L/--location`、配置文件、输出文件、shell 链接和命令替换均拒绝。解析器命令格式固定为 `python -m app.tools.local_parsers <json|headers|urlencode> --value <TEXT>`，`TEXT` 上限 16 KiB；`allowed_parsers` 保存三个固定模块前缀，用户不能传入脚本路径、文件路径或其它解释器参数。保留现有危险命令黑名单作为兜底。
+- `guard.py` 增加 `check_enterprise_command(command: str, *, scope_target: str, allowed_parsers: Mapping[str, tuple[str, ...]]) -> tuple[str, ...]`，返回校验后的 argv；executor 在企业模式用该 argv 和 `shell=False` 执行。允许的外部可执行文件只有 `curl`/`curl.exe`；允许参数为 `-s/-S/-i/-I/-X/-H/--data/--data-raw/--max-time/--connect-timeout`，URL 参数必须恰好一个且 host 与 `scope_target` 相同，`--max-time <= 30`、请求体 <= 16 KiB；`Host`/代理/解析覆盖类 Header 和 `--connect-to/--resolve` 均拒绝；`-L/--location`、配置文件、输出文件、shell 链接和命令替换均拒绝。解析器命令格式固定为 `python -m app.tools.local_parsers <json|headers|urlencode> --value <TEXT>`，`TEXT` 上限 16 KiB；`allowed_parsers` 保存三个固定模块前缀，用户不得传入脚本路径、文件路径或其它解释器参数。保留现有危险命令黑名单作为兜底。
 - `tasks.py` 在任务 `running` 时拒绝 `src_type` 变更并返回 409；暂停后变更仍沿现有控制面取消和重新派发流程。
 
 ### `app/agents/worker.py`
