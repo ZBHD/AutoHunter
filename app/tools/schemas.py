@@ -14,7 +14,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "发一个 HTTP 请求并返回完整的请求包、响应包、状态码、响应头和响应体。挖洞取证的首选工具。已用 session_set 登记登录态后，本工具会自动携带 Cookie/鉴权头、并自动吸收响应 Set-Cookie，登录后深挖无需每次手拼凭证。",
+            "description": "发一个 HTTP 请求并返回完整的请求包、响应包、状态码、响应头和响应体。挖洞取证的首选工具。会自动携带并吸收 Cookie（含整条重定向链每一跳的 Set-Cookie），登录后深挖无需每次手拼凭证。【登录/CAS/SSO】务必把 follow_redirects 设为 true：一次提交即可走完 302 连环跳，返回的 redirect_chain/final_url 可判断最终是否登录成功。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -23,7 +23,7 @@ TOOL_SCHEMAS = [
                     "headers": {"type": "object", "description": "请求头键值对", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string", "description": "请求体原始字符串（如表单 a=1&b=2）"},
                     "json_body": {"type": "object", "description": "JSON 请求体（与 data 二选一）"},
-                    "follow_redirects": {"type": "boolean", "default": False},
+                    "follow_redirects": {"type": "boolean", "default": False, "description": "是否自动跟随 302/301 跳转。登录/CAS/SSO 走通登录链必须设 true；仅想观察单跳 Location 时才用 false。"},
                 },
                 "required": ["url"],
             },
@@ -352,7 +352,7 @@ KILLSWEEP_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "对某个同款站点发请求，验证它是否同样存在该漏洞（实证通杀）。",
+            "description": "对某个同款站点发请求，验证它是否同样存在该漏洞（实证通杀）。登录/CAS/SSO 请求需设 follow_redirects=true 以保留整条跳转链的会话 Cookie。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -361,7 +361,7 @@ KILLSWEEP_TOOL_SCHEMAS = [
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string"},
                     "json_body": {"type": "object"},
-                    "follow_redirects": {"type": "boolean", "default": False},
+                    "follow_redirects": {"type": "boolean", "default": False, "description": "登录/CAS/SSO 走登录链必须设 true（自动携带每跳 Cookie）；仅观察单跳 Location 时才用 false。"},
                 },
                 "required": ["url"],
             },
@@ -431,7 +431,7 @@ ESCALATE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "http_request",
-            "description": "顺着已确认的入口继续发包，尝试把危害做大（越权写、遍历、改密、接管、命令执行等）。",
+            "description": "顺着已确认的入口继续发包，尝试把危害做大（越权写、遍历、改密、接管、命令执行等）。登录/CAS/SSO 请求需设 follow_redirects=true 以保留整条跳转链的会话 Cookie。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -440,7 +440,7 @@ ESCALATE_TOOL_SCHEMAS = [
                     "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                     "data": {"type": "string"},
                     "json_body": {"type": "object"},
-                    "follow_redirects": {"type": "boolean", "default": False},
+                    "follow_redirects": {"type": "boolean", "default": False, "description": "登录/CAS/SSO 走登录链必须设 true（自动携带每跳 Cookie）。"},
                 },
                 "required": ["url"],
             },

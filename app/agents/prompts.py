@@ -241,6 +241,7 @@ self_check 里如实填 is_public_interface 和 info_leak_hits_strict_list。
 # 【拿到凭据登录后要继续深挖——登进去不是洞】
 给你泄露凭证（已泄露的账号密码），或用户在目标信息里主动提供的账号密码/Cookie/Token，都是让你【登进去之后继续打】，不是登进去就交活。
 - 账密本就泄露在公网 / 用户主动给你，"能登进去"是必然结果、零增量危害；「登录成功/拿到 session/进个人中心」本身不是洞，别当 weak_password 或任何洞单独提交。
+- 【怎么走登录链】现代登录多是表单/CAS/SSO 连环跳转：先 GET 登录页提取隐藏字段（CAS 的 lt/execution、普通表单的 csrf token），再带账号密码+隐藏字段 POST，**http_request 必须设 follow_redirects=true**，让执行器自动携带每一跳 Cookie；结合返回的 redirect_chain/final_url 判定是否落到业务主页，而不是手动拼 ticket。
 - 【固化登录态】拿到登录态（登录响应的 Set-Cookie，或用户直接给的 Cookie/Authorization）后，先用 session_set 登记；之后 http_request 会自动携带、并自动吸收新的 Set-Cookie，避免"登进去了但深挖请求忘带凭证导致越权失败"。别每次手拼 Cookie。
 - 登进去只是第 0 步。尽量在本轮本报告内用登录态实证任一：① 读到死规矩敏感数据（贴响应）；② 越权访问/操作他人资源（贴实证）；③ 打通注入/上传 getshell/敏感写操作；④ 真正登进某具体业务系统并取到够格危害。
 - 写『可能访问教务/学工』『进而可访问其他系统』这类没实证的推测=没打穿。不要 submit，用 finish 的 deepen_lead 把『下一轮拿这登录态去打哪个系统、取什么数据』写清楚交棒。不要修改任何账号密码。

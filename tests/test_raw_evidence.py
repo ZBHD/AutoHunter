@@ -137,6 +137,116 @@ def test_http_full_capture_drains_response_after_preview_limit(tmp_path, monkeyp
     assert request_bytes.endswith(b"\r\n\r\nrequest-body")
 
 
+def test_http_redirect_chain_persists_intermediate_cookies_for_next_request(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[tuple[str, str | None]] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((f"{request.url.host}{request.url.path}", request.headers.get("cookie")))
+        if request.url.host == "auth.test" and request.url.path == "/login":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://app.test/consume",
+                    "set-cookie": "CASTGC=auth-ticket; Path=/",
+                },
+                request=request,
+            )
+        if request.url.host == "app.test" and request.url.path == "/consume":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://app.test/home",
+                    "set-cookie": "JSESSIONID=app-session; Path=/",
+                },
+                request=request,
+            )
+        if request.url.host == "app.test" and request.url.path == "/home":
+            return httpx.Response(200, text="home", request=request)
+        if request.url.host == "app.test" and request.url.path == "/private":
+            if request.headers.get("cookie") == "JSESSIONID=app-session":
+                return httpx.Response(200, text="private", request=request)
+            return httpx.Response(401, text="login required", request=request)
+        return httpx.Response(404, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return real_client(
+            transport=transport,
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout", 20),
+            cookies=kwargs.get("cookies"),
+        )
+
+    monkeypatch.setattr(executor_module.httpx, "Client", client_factory)
+    executor = ToolExecutor("https://auth.test", work_dir=str(tmp_path))
+
+    login = executor.http_request("https://auth.test/login", follow_redirects=True)
+    private = executor.http_request("https://app.test/private")
+
+    assert login["status_code"] == 200
+    assert login["redirect_chain"] == [
+        "302 GET https://auth.test/login",
+        "302 GET https://app.test/consume",
+        "200 GET https://app.test/home",
+    ]
+    assert login["final_url"] == "https://app.test/home"
+    assert private["status_code"] == 200
+    assert ("app.test/home", "JSESSIONID=app-session") in seen
+
+
+def test_http_redirect_cookie_jar_keeps_same_name_cookies_scoped_by_domain(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[tuple[str, str | None]] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((f"{request.url.host}{request.url.path}", request.headers.get("cookie")))
+        if request.url.host == "auth.test" and request.url.path == "/login":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": "https://app.test/home",
+                    "set-cookie": "SID=auth-session; Path=/",
+                },
+                request=request,
+            )
+        if request.url.host == "app.test" and request.url.path == "/home":
+            return httpx.Response(
+                200,
+                headers={"set-cookie": "SID=app-session; Path=/"},
+                text="home",
+                request=request,
+            )
+        if request.url.path == "/whoami":
+            return httpx.Response(200, text=request.headers.get("cookie", ""), request=request)
+        return httpx.Response(404, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return real_client(
+            transport=transport,
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout", 20),
+            cookies=kwargs.get("cookies"),
+        )
+
+    monkeypatch.setattr(executor_module.httpx, "Client", client_factory)
+    executor = ToolExecutor("https://auth.test", work_dir=str(tmp_path))
+
+    executor.http_request("https://auth.test/login", follow_redirects=True)
+    auth_identity = executor.http_request("https://auth.test/whoami")
+    app_identity = executor.http_request("https://app.test/whoami")
+
+    assert auth_identity["body"] == "SID=auth-session"
+    assert app_identity["body"] == "SID=app-session"
+
+
 def test_detach_capture_removes_private_descriptor_from_public_tool_result() -> None:
     from app.raw_evidence import detach_capture
 
