@@ -116,6 +116,13 @@ async def _stored_model_config(session_maker, task_id: str) -> dict:
         return dict(task.model_config_json or {})
 
 
+async def _stored_hunt_direction(session_maker, task_id: str) -> str:
+    async with session_maker() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        return task.hunt_direction
+
+
 async def _insert_task(session_maker, task_id: str, model_config: dict) -> None:
     async with session_maker() as session:
         session.add(
@@ -149,6 +156,94 @@ def test_create_task_persists_and_returns_global_pool_default(task_api) -> None:
     assert asyncio.run(_stored_model_config(session_maker, body["id"])) == {
         "use_global_pool": True
     }
+
+
+def test_create_task_trims_and_persists_hunt_direction(task_api) -> None:
+    client, session_maker = task_api
+
+    response = client.post(
+        "/api/tasks",
+        json={
+            "name": "Directional task",
+            "hunt_direction": "  优先检查后台对象越权  ",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["hunt_direction"] == "优先检查后台对象越权"
+    assert asyncio.run(_stored_hunt_direction(session_maker, body["id"])) == "优先检查后台对象越权"
+
+
+def test_create_task_defaults_hunt_direction_to_empty(task_api) -> None:
+    client, session_maker = task_api
+
+    response = client.post("/api/tasks", json={"name": "Default direction"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["hunt_direction"] == ""
+    assert asyncio.run(_stored_hunt_direction(session_maker, body["id"])) == ""
+
+
+def test_patch_can_modify_and_explicitly_clear_hunt_direction(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post("/api/tasks", json={"name": "Patch direction"}).json()
+
+    updated = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"hunt_direction": "  检查批量导出接口  "},
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["hunt_direction"] == "检查批量导出接口"
+
+    cleared = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"hunt_direction": ""},
+    )
+
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["hunt_direction"] == ""
+    assert asyncio.run(_stored_hunt_direction(session_maker, created["id"])) == ""
+
+
+@pytest.mark.parametrize("method", ["post", "patch"])
+def test_hunt_direction_rejects_more_than_2000_characters(task_api, method) -> None:
+    client, _session_maker = task_api
+    if method == "post":
+        response = client.post(
+            "/api/tasks",
+            json={"name": "Too long", "hunt_direction": "x" * 2001},
+        )
+    else:
+        created = client.post("/api/tasks", json={"name": "Patch too long"}).json()
+        response = client.patch(
+            f"/api/tasks/{created['id']}",
+            json={"hunt_direction": "x" * 2001},
+        )
+
+    assert response.status_code == 422, response.text
+
+
+def test_observer_task_list_and_detail_hide_hunt_direction(task_api) -> None:
+    client, _session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Private direction", "hunt_direction": "敏感挖掘方向"},
+    ).json()
+    headers = {"x-autohunter-token": "observer-token"}
+
+    listed = client.get("/api/tasks", headers=headers)
+    detailed = client.get(f"/api/tasks/{created['id']}", headers=headers)
+
+    assert listed.status_code == 200, listed.text
+    assert detailed.status_code == 200, detailed.text
+    item = next(task for task in listed.json() if task["id"] == created["id"])
+    assert item["hunt_direction"] == ""
+    assert detailed.json()["hunt_direction"] == ""
+    assert "敏感挖掘方向" not in listed.text
+    assert "敏感挖掘方向" not in detailed.text
 
 
 def test_create_dedicated_task_returns_protocol_temperature_without_key(task_api) -> None:

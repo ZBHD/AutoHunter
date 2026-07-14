@@ -10,6 +10,44 @@ from app.db.models import Base, MissedSignal, RawEvidence, Target, Task
 from app.db.session import _auto_migrate, _ensure_secondary_indexes, _ensure_unique_indexes
 
 
+def test_old_tasks_table_gains_hunt_direction_without_data_loss() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                other_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name != "tasks"
+                ]
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.create_all(sync_conn, tables=other_tables)
+                )
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE tasks (
+                        id VARCHAR(32) PRIMARY KEY,
+                        name VARCHAR(200) NOT NULL
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    "INSERT INTO tasks (id, name) VALUES ('legacy-task', 'Legacy task')"
+                )
+
+                await _auto_migrate(conn)
+
+                columns = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
+                assert "hunt_direction" in {row[1] for row in columns.fetchall()}
+                row = await conn.exec_driver_sql(
+                    "SELECT id, name, hunt_direction FROM tasks WHERE id='legacy-task'"
+                )
+                assert row.one() == ("legacy-task", "Legacy task", "")
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_system_settings_table_gains_provider_pool_column() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

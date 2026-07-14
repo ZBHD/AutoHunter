@@ -68,6 +68,7 @@ _MIGRATIONS = [
     ("system_settings", "engines", "JSON DEFAULT '{}'"),
     ("system_settings", "llm_providers", "JSON DEFAULT '[]'"),
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
+    ("tasks", "hunt_direction", "TEXT DEFAULT ''"),
     ("targets", "killsweep_case_id", "VARCHAR(32)"),
     ("killsweeps", "automatic_verdict", "VARCHAR(20) DEFAULT 'pending_validation'"),
     ("killsweeps", "manual_verdict", "VARCHAR(20)"),

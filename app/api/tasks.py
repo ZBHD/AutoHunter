@@ -228,6 +228,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         id=t.id, name=_observer_task_name(t.name, t.id) if observer else t.name, status=t.status, src_type=t.src_type,
         vuln_types=t.vuln_types or [], target_source=t.target_source,
         engine=t.engine or "", fofa_query="" if observer else t.fofa_query, concurrency=t.concurrency,
+        hunt_direction="" if observer else (t.hunt_direction or ""),
         src_rules="" if observer else (t.src_rules or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
         model_config_data=model_config,
@@ -322,7 +323,8 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
     task = Task(
         name=req.name, src_type=normalize_src_type(req.src_type), vuln_types=req.vuln_types,
         src_rules=req.src_rules, target_source=req.target_source,
-        engine=engine_name, fofa_query=req.fofa_query, manual_targets=req.manual_targets,
+        engine=engine_name, fofa_query=req.fofa_query, hunt_direction=req.hunt_direction,
+        manual_targets=req.manual_targets,
         model_config_json=_new_task_model_config(req.model_config_data),
         fofa_config=fofa_cfg, concurrency=req.concurrency,
         status="created",
@@ -460,6 +462,8 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         task.engine = req.engine
     if req.manual_targets is not None:
         task.manual_targets = [t.strip() for t in req.manual_targets if str(t).strip()]
+    if req.hunt_direction is not None:
+        task.hunt_direction = req.hunt_direction
     if req.concurrency is not None:
         task.concurrency = max(1, min(int(req.concurrency), 20))
 
