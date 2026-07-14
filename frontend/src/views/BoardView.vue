@@ -970,15 +970,18 @@ function parseEventTs(ts) {
         :disabled="authRoleRef === 'observer'" @click="selectTaskView('findings')">
         <span class="metric-k">FINDINGS</span><b>{{ stats.findings_total ?? 0 }}</b><em>原始发现</em>
       </button>
-      <div class="metric-card warn">
+      <button type="button" class="metric-card metric-action warn" :class="{ selected: tab === 'review' }"
+        :disabled="authRoleRef === 'observer'" @click="selectTaskView('review')">
         <span class="metric-k">REVIEW</span><b>{{ reviewCount }}</b><em>待复审</em>
-      </div>
-      <div class="metric-card ok">
+      </button>
+      <button type="button" class="metric-card metric-action ok" :class="{ selected: tab === 'submit' }"
+        :disabled="authRoleRef === 'observer'" @click="selectTaskView('submit')">
         <span class="metric-k">READY</span><b>{{ submitCount }}</b><em>待提交</em>
-      </div>
-      <div class="metric-card sweep">
+      </button>
+      <button type="button" class="metric-card metric-action sweep" :class="{ selected: tab === 'killsweep' }"
+        :disabled="authRoleRef === 'observer'" @click="selectTaskView('killsweep')">
         <span class="metric-k">SWEEP</span><b>{{ sweepCount }}</b><em>通杀列</em>
-      </div>
+      </button>
     </div>
 
     <div class="tabs" role="tablist">

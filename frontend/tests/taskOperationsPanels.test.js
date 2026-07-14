@@ -16,6 +16,12 @@ test("task metrics are semantic navigation buttons with persistent views", () =>
   assert.match(board, /class="metric-card metric-action[^"]*"/);
   assert.match(board, /selectTaskView\(['"]scanned['"]\)/);
   assert.match(board, /selectTaskView\(['"]findings['"]\)/);
+  assert.match(board, /selectTaskView\(['"]review['"]\)/);
+  assert.match(board, /selectTaskView\(['"]submit['"]\)/);
+  assert.match(board, /selectTaskView\(['"]killsweep['"]\)/);
+  assert.match(board, /metric-action warn[^>]+tab === 'review'/);
+  assert.match(board, /metric-action ok[^>]+tab === 'submit'/);
+  assert.match(board, /metric-action sweep[^>]+tab === 'killsweep'/);
   assert.match(board, /route\.query\.view/);
   assert.match(board, /ScannedTargetsPanel/);
   assert.match(board, /RawFindingsPanel/);
