@@ -1955,6 +1955,26 @@ main {
 }
 .progress-ring span { font-size: 11px; color: var(--faint); }
 .mission-actions { display: grid; grid-template-columns: 1fr; gap: 8px; width: 86px; }
+.mission-actions button { min-height: 36px; }
+.mission-actions .stop-search {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-color: color-mix(in oklch, var(--warn) 48%, var(--border));
+  font-weight: 600;
+}
+.mission-actions .stop-search:hover {
+  color: var(--warn);
+  background: color-mix(in oklch, var(--warn) 18%, var(--surface));
+  border-color: var(--warn);
+}
+.mission-actions .stop-search:disabled {
+  opacity: .7;
+  color: var(--muted);
+  background: color-mix(in oklch, var(--warn-bg) 60%, var(--surface-2));
+  border-color: color-mix(in oklch, var(--warn) 28%, var(--border));
+}
+.mission-actions .stop-search,
+.mission-actions .stop-task { white-space: nowrap; }
 .mission-progress {
   grid-column: 1 / -1; height: 4px; background: var(--bg); border-radius: 999px;
   overflow: hidden; border: 1px solid var(--border-soft);
@@ -2855,7 +2875,7 @@ main {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     width: auto; gap: 6px;
   }
-  .mission-actions button { font-size: 13px; padding: 10px 6px; }
+  .mission-actions button { min-height: 42px; font-size: 13px; padding: 10px 6px; }
   .mission-actions.readonly-hint {
     grid-column: 1 / -1; text-align: center; padding: 12px;
   }
@@ -3205,6 +3225,11 @@ main {
     max-width: none;
   }
   @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+}
+
+@media (max-width: 360px) {
+  .mission-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mission-actions button { min-height: 42px; }
 }
 
 @media (max-width: 420px) {

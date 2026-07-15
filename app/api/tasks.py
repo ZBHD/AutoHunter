@@ -47,6 +47,7 @@ _STREAM_IMPORTANT_KINDS = frozenset({
     "review_done", "review_deferred", "review_cancelled",
     "reclaim", "recover", "workers_cancelled", "quota_stop",
     "killsweep_done", "killsweep_dedup", "killsweep_error", "killsweep_cancelled",
+    "search_stopped", "search_drained",
 })
 
 
@@ -236,6 +237,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         manual_targets=[] if observer else (t.manual_targets or []),
         model_config_data=model_config,
         fofa_config=_observer_fofa_config() if observer else _public_fofa_config(t),
+        search_enabled=bool(t.search_enabled),
         engine_config={} if observer else {"engine": t.engine or ""},
         llm_usage={} if observer else usage_snapshot(t.id, model_config.get("model", "")),
         created_at=to_cst_iso(t.created_at), updated_at=to_cst_iso(t.updated_at),
@@ -876,6 +878,7 @@ async def start_task(task_id: str, session: AsyncSession = Depends(get_session))
     if not task:
         raise HTTPException(404, "任务不存在")
     task.status = "running"
+    task.search_enabled = True
     # 重启即清空 FOFA 账号失败计数与错误标记：用户通常已换/续了 key，
     # 否则旧计数 ≥ 阈值会导致刚启动又被自动暂停。
     if task.fofa_config and task.fofa_config.get("fofa_auth_fail_count"):
@@ -885,6 +888,33 @@ async def start_task(task_id: str, session: AsyncSession = Depends(get_session))
         task.fofa_config = fc
     await session.commit()
     await manager.ensure_running(task_id)
+    await session.refresh(task)
+    return _task_to_dto(task)
+
+
+@router.post("/{task_id}/stop-search", response_model=TaskResponse)
+async def stop_search(task_id: str, session: AsyncSession = Depends(get_session)):
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+
+    result = await session.execute(
+        update(Task)
+        .where(Task.id == task_id, Task.search_enabled.is_(True))
+        .values(search_enabled=False)
+    )
+    if result.rowcount == 1:
+        session.add(TaskEvent(
+            task_id=task_id,
+            agent="collector",
+            kind="search_stopped",
+            level="info",
+            message="资产搜索已停止，剩余队列将继续处理",
+            payload={},
+        ))
+        await session.commit()
+    else:
+        await session.rollback()
     await session.refresh(task)
     return _task_to_dto(task)
 

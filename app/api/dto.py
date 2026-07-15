@@ -188,6 +188,7 @@ class TaskResponse(BaseModel):
     manual_targets: list[str] = Field(default_factory=list)
     model_config_data: dict = Field(default_factory=dict)
     fofa_config: dict = Field(default_factory=dict)
+    search_enabled: bool = True
     engine_config: dict = Field(default_factory=dict)
     llm_usage: dict = Field(default_factory=dict)
     created_at: str

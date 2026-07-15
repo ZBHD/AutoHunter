@@ -5,11 +5,12 @@ import asyncio
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api import findings as findings_api
 from app.api import tasks as tasks_api
-from app.db.models import Base, Finding, Target, Task
+from app.db.models import Base, Finding, Target, Task, TaskEvent
 from app.db.session import get_session
 
 
@@ -98,6 +99,135 @@ def test_task_stats_done_counts_every_terminal_target(operations_api: TestClient
 
     assert response.status_code == 200
     assert response.json()["stats"]["done"] == 3
+
+
+def test_task_response_exposes_search_enabled(operations_api: TestClient) -> None:
+    response = operations_api.get("/api/tasks/task-ops")
+
+    assert response.status_code == 200
+    assert response.json()["search_enabled"] is True
+
+
+def test_search_stream_marks_stop_and_drain_events_as_important() -> None:
+    assert tasks_api._stream_event_visible("search_stopped", "info") is True
+    assert tasks_api._stream_event_visible("search_drained", "info") is True
+
+
+def test_stop_search_is_atomic_for_concurrent_sessions(
+    tmp_path,
+) -> None:
+    async def stop_concurrently():
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'atomic.db'}")
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with session_maker() as session:
+                session.add(Task(id="task-atomic", name="Atomic", status="running"))
+                session.add_all([
+                    Target(
+                        id="target-atomic-high", task_id="task-atomic", url="https://high.example",
+                        host="high.example", source="fofa", status="queued", priority_score=90,
+                    ),
+                    Target(
+                        id="target-atomic-low", task_id="task-atomic", url="https://low.example",
+                        host="low.example", source="fofa", status="queued", priority_score=10,
+                    ),
+                ])
+                await session.commit()
+
+            get_count = 0
+            both_loaded = asyncio.Event()
+
+            async def wait_for_both_tasks() -> None:
+                nonlocal get_count
+                get_count += 1
+                if get_count == 2:
+                    both_loaded.set()
+                await both_loaded.wait()
+
+            class BarrierSession:
+                def __init__(self, session: AsyncSession):
+                    self._session = session
+
+                async def get(self, *args, **kwargs):
+                    task = await self._session.get(*args, **kwargs)
+                    await wait_for_both_tasks()
+                    return task
+
+                def __getattr__(self, name):
+                    return getattr(self._session, name)
+
+            async with session_maker() as first_session:
+                async with session_maker() as second_session:
+                    results = await asyncio.gather(
+                        tasks_api.stop_search("task-atomic", BarrierSession(first_session)),
+                        tasks_api.stop_search("task-atomic", BarrierSession(second_session)),
+                    )
+
+            async with session_maker() as session:
+                events = (await session.scalars(
+                    select(TaskEvent).where(TaskEvent.task_id == "task-atomic")
+                )).all()
+            return results, events
+        finally:
+            await engine.dispose()
+
+    results, events = asyncio.run(stop_concurrently())
+
+    assert [result.search_enabled for result in results] == [False, False]
+    assert len(events) == 1
+    assert events[0].kind == "search_stopped"
+
+
+def test_stop_search_disables_search_once_and_preserves_queued_targets(
+    operations_api: TestClient,
+) -> None:
+    before = operations_api.get("/api/tasks/task-ops/queue-targets")
+    assert before.status_code == 200
+    queued_ids = [item["id"] for item in before.json()["items"]]
+
+    first = operations_api.post("/api/tasks/task-ops/stop-search")
+    second = operations_api.post("/api/tasks/task-ops/stop-search")
+
+    assert first.status_code == 200
+    assert first.json()["search_enabled"] is False
+    assert second.status_code == 200
+    assert second.json()["search_enabled"] is False
+
+    after = operations_api.get("/api/tasks/task-ops/queue-targets")
+    assert [item["id"] for item in after.json()["items"]] == queued_ids
+
+    events = operations_api.get("/api/tasks/task-ops/board").json()["events"]
+    stopped_events = [event for event in events if event["kind"] == "search_stopped"]
+    assert len(stopped_events) == 1
+    assert stopped_events[0]["agent"] == "collector"
+    assert stopped_events[0]["level"] == "info"
+    assert stopped_events[0]["message"] == "资产搜索已停止，剩余队列将继续处理"
+
+
+def test_stop_search_returns_404_for_missing_task(operations_api: TestClient) -> None:
+    response = operations_api.post("/api/tasks/missing/stop-search")
+
+    assert response.status_code == 404
+
+
+def test_start_task_reenables_search(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped = operations_api.post("/api/tasks/task-ops/stop-search")
+    assert stopped.status_code == 200
+    assert stopped.json()["search_enabled"] is False
+
+    async def no_op(_task_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(tasks_api.manager, "ensure_running", no_op)
+    started = operations_api.post("/api/tasks/task-ops/start")
+
+    assert started.status_code == 200
+    assert started.json()["search_enabled"] is True
 
 
 def test_terminal_targets_are_paginated_and_include_finding_counts(

@@ -229,6 +229,7 @@ export const api = {
   hardTargets: (status, q, opts = {}) => req("GET", `/api/tasks/hard-targets${qs({ status, q, ...opts })}`),
   start: (id) => req("POST", `/api/tasks/${id}/start`),
   pause: (id) => req("POST", `/api/tasks/${id}/pause`),
+  stopSearch: (id) => req("POST", `/api/tasks/${id}/stop-search`),
   stop: (id) => req("POST", `/api/tasks/${id}/stop`),
   results: (id, conf, q) => req("GET", `/api/tasks/${id}/results${qs({ confidence: conf, q })}`),
   reviewQueue: (id, q) => req("GET", `/api/tasks/${id}/review-queue${qs({ q })}`),

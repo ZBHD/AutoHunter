@@ -48,6 +48,44 @@ def test_old_tasks_table_gains_hunt_direction_without_data_loss() -> None:
     asyncio.run(scenario())
 
 
+def test_old_tasks_table_gains_search_enabled_default_without_data_loss() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                other_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name != "tasks"
+                ]
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.create_all(sync_conn, tables=other_tables)
+                )
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE tasks (
+                        id VARCHAR(32) PRIMARY KEY,
+                        name VARCHAR(200) NOT NULL
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    "INSERT INTO tasks (id, name) VALUES ('legacy-search-task', 'Legacy search task')"
+                )
+
+                await _auto_migrate(conn)
+
+                columns = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
+                assert "search_enabled" in {row[1] for row in columns.fetchall()}
+                row = await conn.exec_driver_sql(
+                    "SELECT id, search_enabled FROM tasks WHERE id='legacy-search-task'"
+                )
+                assert row.one() == ("legacy-search-task", 1)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_targets_table_gains_nullable_queue_position_without_data_loss() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
