@@ -9,12 +9,21 @@ from __future__ import annotations
 import json
 import re
 import threading
+from dataclasses import asdict
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlsplit
 
 from pydantic import ValidationError
 
 from app.agents.history import bounded_tool_content, compact_messages
+from app.agents.src_leads import (
+    Lead,
+    SrcCandidate,
+    finalize_leads,
+    lead_key,
+    merge_candidate,
+    resolve_lead,
+)
 from app.deepen_context import render_deepen_brief
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
 from app.config import worker_config
@@ -64,7 +73,7 @@ class Worker:
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
-            capture_full=True,
+            capture_full=True, scope_target=target,
         )
         self.findings: list[Finding] = []
         self.on_event = on_event or (lambda kind, data: None)
@@ -75,6 +84,19 @@ class Worker:
         self.hunt_direction = str(hunt_direction or "").strip()
         # 资产情报：候选归属学校/org/title，供 worker 核实并写进报告 owner
         self.target_meta = target_meta or {}
+        route = self.target_meta.get("playbook_route") or {}
+        self._route_id = str(route.get("route_id") or "")
+        self._pending_leads: dict[str, Lead] = {}
+        self._lead_summary: dict[str, Any] = {}
+        self._lead_summary_finalized = False
+        self._lead_activity_seen = False
+        self._workflow_stage = (
+            "verify"
+            if self.deepen_context or self._route_id == "directed_deepen"
+            else "recon"
+        )
+        self._stage_before_evidence = self._workflow_stage
+        self._current_round = 0
         # 同一 target 历史已提交漏洞摘要，用于 worker 提交前查重（superseded 不传入）
         self.duplicate_history = duplicate_history or []
         # JS 审计工具 schema 体积较大，默认只在目标/情报/响应出现 JS 信号后开放。
@@ -92,7 +114,206 @@ class Worker:
         return worker_tool_schemas(
             enterprise=self._enterprise,
             include_js=self._js_tool_enabled,
+            stage=self._workflow_stage,
+            route_id=self._route_id,
         )
+
+    @staticmethod
+    def _capture_id(result: dict[str, Any]) -> str:
+        capture = result.get("_capture")
+        return str(capture.get("id") or "") if isinstance(capture, dict) else ""
+
+    def _actionable_leads(self) -> list[Lead]:
+        leads = [
+            lead
+            for lead in self._pending_leads.values()
+            if lead.priority >= 8
+            and lead.status in {"pending", "inconclusive"}
+            and lead.attempt_count < 2
+        ]
+        return sorted(leads, key=lambda lead: (-lead.priority, lead.created_round, lead.id))
+
+    def _register_src_leads(
+        self,
+        result: dict[str, Any],
+        *,
+        source_tool: str,
+        round_no: int,
+    ) -> None:
+        summary = result.get("summary")
+        if not isinstance(summary, dict):
+            return
+        capture_id = self._capture_id(result)
+        candidates: dict[tuple[str, str, str, str, str], SrcCandidate] = {}
+        for field in ("head_candidates", "tail_candidates", "priority_candidates"):
+            values = summary.get(field)
+            if not isinstance(values, (list, tuple)):
+                continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    candidate = SrcCandidate(**value)
+                except (TypeError, ValueError):
+                    continue
+                candidates.setdefault(lead_key(candidate), candidate)
+
+        for candidate in candidates.values():
+            fresh = Lead.from_candidate(candidate, round_no=round_no, capture_id=capture_id)
+            fresh.sources = tuple(dict.fromkeys((*fresh.sources, source_tool)))
+            existing = self._pending_leads.get(fresh.id)
+            if existing is None:
+                self._pending_leads[fresh.id] = fresh
+            else:
+                merge_candidate(existing, candidate, capture_id, source_tool)
+        if candidates:
+            self._lead_activity_seen = True
+        if self._actionable_leads():
+            self._workflow_stage = "verify"
+        elif self._workflow_stage == "recon":
+            self._workflow_stage = "locate"
+
+    @staticmethod
+    def _endpoint_url(endpoint: str, method: str) -> str:
+        text = str(endpoint or "").strip()
+        prefix = f"{method.upper()} "
+        return text[len(prefix) :] if text.upper().startswith(prefix) else text
+
+    @staticmethod
+    def _request_parameter_names(args: dict[str, Any], url: str) -> set[str]:
+        names = {
+            str(name)
+            for name, _value in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+            if str(name)
+        }
+        data = args.get("data")
+        if isinstance(data, str):
+            names.update(
+                str(name)
+                for name, _value in parse_qsl(data, keep_blank_values=True)
+                if str(name)
+            )
+        body = args.get("json_body")
+        if isinstance(body, dict):
+            names.update(str(name) for name in body)
+        headers = args.get("headers")
+        if isinstance(headers, dict):
+            names.update(str(name) for name in headers)
+        return names
+
+    def _matching_leads(self, args: dict[str, Any], result: dict[str, Any]) -> list[Lead]:
+        method = str(args.get("method") or "GET").upper()
+        urls = [
+            str(value or "")
+            for value in (args.get("url"), result.get("url"), result.get("final_url"))
+            if str(value or "")
+        ]
+        normalized: set[str] = set()
+        for url in urls:
+            try:
+                candidate = SrcCandidate(
+                    kind="endpoint",
+                    endpoint_key=url,
+                    value=url,
+                    method=method,
+                    parameter="",
+                    location="path",
+                    status_code=result.get("status_code"),
+                    confidence=0,
+                    priority=0,
+                    reason="http_request",
+                )
+            except ValueError:
+                continue
+            normalized.add(self._endpoint_url(candidate.endpoint_key, method).split("?", 1)[0])
+        parameter_names = set().union(
+            *(self._request_parameter_names(args, url) for url in urls)
+        ) if urls else set()
+
+        matches: list[Lead] = []
+        for lead in self._pending_leads.values():
+            if lead.status not in {"pending", "inconclusive"} or lead.method != method:
+                continue
+            endpoint = self._endpoint_url(lead.endpoint_key, lead.method).split("?", 1)[0]
+            if endpoint not in normalized:
+                continue
+            if lead.kind == "parameter" and lead.parameter not in parameter_names:
+                continue
+            matches.append(lead)
+        return matches
+
+    def _resolve_http_leads(
+        self,
+        result: dict[str, Any],
+        args: dict[str, Any],
+        round_no: int,
+    ) -> None:
+        matches = self._matching_leads(args, result)
+        if not matches:
+            if result.get("ok") and self._workflow_stage == "recon":
+                self._workflow_stage = "locate"
+            return
+        if result.get("timed_out"):
+            outcome = "timeout"
+        elif result.get("cancelled"):
+            outcome = "network"
+        elif not result.get("ok"):
+            error = str(result.get("error") or "").lower()
+            outcome = "network" if any(
+                marker in error for marker in ("network", "connect", "timeout", "dns", "http 请求异常")
+            ) else "insufficient"
+        else:
+            try:
+                status = int(result.get("status_code"))
+            except (TypeError, ValueError, OverflowError):
+                status = 0
+            outcome = "failed" if status in {404, 410} else "verified" if status else "insufficient"
+        evidence_id = self._capture_id(result)
+        for lead in matches:
+            resolve_lead(
+                lead,
+                outcome=outcome,
+                round_no=round_no,
+                evidence_id=evidence_id,
+                reason=f"http_{result.get('status_code') or outcome}",
+            )
+        self._workflow_stage = "verify" if self._actionable_leads() else "locate"
+
+    def _resolve_compare_leads(
+        self,
+        result: dict[str, Any],
+        args: dict[str, Any],
+        round_no: int,
+    ) -> None:
+        candidate = args.get("candidate")
+        if not isinstance(candidate, dict) or not result.get("ok"):
+            return
+        request_args = {
+            "url": candidate.get("url") or candidate.get("final_url") or "",
+            "method": candidate.get("method") or "GET",
+        }
+        matches = self._matching_leads(request_args, candidate)
+        for lead in matches:
+            resolve_lead(
+                lead,
+                outcome="verified" if result.get("material_difference") else "failed",
+                round_no=round_no,
+                reason="material_difference" if result.get("material_difference") else "no_material_difference",
+            )
+        if matches:
+            self._workflow_stage = "verify" if self._actionable_leads() else "locate"
+
+    def _finalize_lead_state(self, reason: str, round_no: int) -> dict[str, Any]:
+        if self._lead_summary_finalized:
+            return self._lead_summary
+        summary = finalize_leads(
+            self._pending_leads.values(),
+            reason=reason,
+            round_no=round_no,
+        )
+        self._lead_summary = asdict(summary)
+        self._lead_summary_finalized = True
+        return self._lead_summary
 
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
@@ -242,6 +463,7 @@ class Worker:
             if self.cancel_event.is_set():
                 return self._cancelled_result(rounds)
             rounds += 1
+            self._current_round = rounds
             try:
                 self._emit("llm_round_start", round=rounds)
                 tools = self._available_tool_schemas()
@@ -249,9 +471,12 @@ class Worker:
                 msg = self.llm.chat(send_messages, tools=tools, tool_choice="auto")
             except Exception as e:
                 self._emit("llm_error", error=str(e))
+                lead_summary = self._finalize_lead_state("llm_error", rounds)
                 return WorkerResult(
                     target=self.target, verdict=Verdict.error,
                     findings=self.findings, rounds=rounds, error=f"LLM 调用失败: {e}",
+                    deepen_lead=str(lead_summary.get("deepen_lead") or ""),
+                    lead_summary=lead_summary,
                 )
             if self.cancel_event.is_set():
                 return self._cancelled_result(rounds)
@@ -319,6 +544,16 @@ class Worker:
                         }
                         self._emit("tool_exception", round=rounds, tool=name, error=str(e))
                 if isinstance(result, dict):
+                    if name in SRC_TOOL_NAMES:
+                        self._register_src_leads(
+                            result,
+                            source_tool=name,
+                            round_no=rounds,
+                        )
+                    elif name == "http_request":
+                        self._resolve_http_leads(result, args, rounds)
+                    elif name == "compare_http_responses":
+                        self._resolve_compare_leads(result, args, rounds)
                     capture = detach_capture(result)
                     if capture is not None:
                         preview = self._private_tool_preview(result)
@@ -351,6 +586,8 @@ class Worker:
                     consecutive_blocked = 0
                     consecutive_arg_errors = 0
                     consecutive_network_failures = 0
+                    if self._finished is not None:
+                        break
                     continue
 
                 consecutive_failures += 1
@@ -427,6 +664,16 @@ class Worker:
                     )
                 messages.append({"role": "user", "content": nudge})
 
+        if not self._lead_summary_finalized:
+            final_reason = (
+                str((self._finished or {}).get("summary") or "worker_finish")
+                if self._finished
+                else f"max_rounds_{max_rounds}"
+            )
+            lead_summary = self._finalize_lead_state(final_reason, rounds)
+            if self._finished and not self._finished.get("deepen_lead"):
+                self._finished["deepen_lead"] = str(lead_summary.get("deepen_lead") or "")
+                self._finished["lead_summary"] = lead_summary
         verdict = Verdict(self._finished["verdict"]) if self._finished else Verdict.error
         if self.findings and verdict == Verdict.no_vuln:
             verdict = Verdict.found  # 有漏洞却说 no_vuln，以实际为准
@@ -438,6 +685,7 @@ class Worker:
             rounds=rounds,
             error=None if self._finished else f"达到最大轮数 {max_rounds} 未主动结束",
             deepen_lead=(self._finished or {}).get("deepen_lead", ""),
+            lead_summary=self._lead_summary,
             reported_intel=self._reported_intel,
             reported_coverage=self._reported_coverage,
         )
@@ -510,6 +758,7 @@ class Worker:
 
     def _cancelled_result(self, rounds: int) -> WorkerResult:
         self._emit("worker_cancelled", target=self.target, round=rounds)
+        lead_summary = self._finalize_lead_state("cancelled", rounds)
         return WorkerResult(
             target=self.target,
             verdict=Verdict.error,
@@ -517,6 +766,8 @@ class Worker:
             summary="任务已被 pause/stop 控制面取消，结果由 orchestrator 丢弃。",
             rounds=rounds,
             error="worker cancelled by task control",
+            deepen_lead=str(lead_summary.get("deepen_lead") or ""),
+            lead_summary=lead_summary,
         )
 
     def _deepen_brief(self) -> str:
@@ -727,7 +978,11 @@ class Worker:
 
         if name == "submit_finding":
             self._mark_tool_used(name, rnd)
-            return self._submit_finding(args)
+            self._stage_before_evidence = self._workflow_stage
+            self._workflow_stage = "evidence"
+            result = self._submit_finding(args)
+            self._workflow_stage = "verify" if self._actionable_leads() else "locate"
+            return result
 
         if name == "check_duplicate_finding":
             self._mark_tool_used(name, rnd)
@@ -751,6 +1006,13 @@ class Worker:
                 "summary": args.get("summary", ""),
                 "deepen_lead": (args.get("deepen_lead") or "").strip(),
             }
+            lead_summary = self._finalize_lead_state(
+                self._finished["summary"] or "explicit_finish",
+                rnd,
+            )
+            if not self._finished["deepen_lead"]:
+                self._finished["deepen_lead"] = str(lead_summary.get("deepen_lead") or "")
+            self._finished["lead_summary"] = lead_summary
             self._emit("worker_finish", verdict=self._finished["verdict"],
                        summary=self._finished["summary"][:300],
                        deepen_lead=self._finished["deepen_lead"][:300])
@@ -768,6 +1030,14 @@ class Worker:
 
     def _premature_finish_reason(self, args: dict, rnd: int) -> str:
         if (args.get("verdict") or "no_vuln") != "no_vuln" or self.findings:
+            return ""
+        actionable = self._actionable_leads()
+        if actionable:
+            return (
+                "过早结束：仍有高优先级 SRC 线索未复核。下一步："
+                f"{actionable[0].verify_action}"
+            )
+        if self._lead_activity_seen:
             return ""
         if self.deepen_context:
             return ""
@@ -831,7 +1101,13 @@ class Worker:
 
     def _auto_finish(self, reason: str) -> None:
         verdict = "found" if self.findings else "no_vuln"
-        self._finished = {"verdict": verdict, "summary": reason}
+        lead_summary = self._finalize_lead_state(reason, self._current_round)
+        self._finished = {
+            "verdict": verdict,
+            "summary": reason,
+            "deepen_lead": str(lead_summary.get("deepen_lead") or ""),
+            "lead_summary": lead_summary,
+        }
         self._emit("worker_auto_finish", verdict=verdict, summary=reason[:300])
 
     @staticmethod
