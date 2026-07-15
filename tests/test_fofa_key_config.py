@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 
 import pytest
 from pydantic import ValidationError
@@ -43,6 +44,24 @@ def test_fofa_key_config_accepts_private_https_path() -> None:
     )
 
     assert item.base_url == "https://fofa.internal/private/api"
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("secret-a", "secret-a"),
+        ("Prefix-SECRET-A-Suffix", "secret-a"),
+    ],
+)
+def test_fofa_key_config_rejects_key_in_name(name: str, key: str) -> None:
+    with pytest.raises(ValidationError):
+        FofaKeyConfig(name=name, key=key)
+
+
+def test_fofa_key_config_allows_name_without_key() -> None:
+    item = FofaKeyConfig(name="Primary", key="secret-a")
+
+    assert item.name == "Primary"
 
 
 @pytest.mark.parametrize(

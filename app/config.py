@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _load_dotenv() -> None:
@@ -91,6 +91,13 @@ class FofaKeyConfig(BaseModel):
     @classmethod
     def validate_base_url(cls, value: str) -> str:
         return _validate_http_base_url(value)
+
+    @model_validator(mode="after")
+    def validate_name_does_not_contain_key(self) -> "FofaKeyConfig":
+        normalized_key = self.key.strip()
+        if normalized_key and normalized_key.casefold() in self.name.casefold():
+            raise ValueError("FOFA Key 名称不能包含 Key")
+        return self
 
 
 class LLMProviderConfig(BaseModel):

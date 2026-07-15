@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 
 import pytest
 from pydantic import ValidationError
@@ -270,6 +271,24 @@ def test_nonempty_fofa_pool_wins_over_legacy_key(monkeypatch) -> None:
 
     assert [(item.name, item.key) for item in keys] == [("Primary", "pool-secret")]
     assert keys[0].base_url == "https://fofa.info"
+
+
+def test_malformed_fofa_pool_log_does_not_expose_name_or_key(caplog) -> None:
+    secret = "secret-in-name-VERYSECRET"
+    set_cache(
+        fofa_keys=[
+            {
+                "name": f"prefix-{secret}-suffix",
+                "key": secret,
+            }
+        ]
+    )
+
+    with caplog.at_level(logging.ERROR, logger="autohunter.settings"):
+        assert settings_service.resolve_fofa_keys() == []
+
+    assert secret not in caplog.text
+    assert "name=<invalid>" in caplog.text
 
 
 def test_nonempty_disabled_fofa_pool_does_not_fallback(monkeypatch) -> None:

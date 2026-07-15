@@ -345,10 +345,7 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
             try:
                 keys.append(_fofa_key_from_value(item))
             except (TypeError, ValidationError):
-                logger.error(
-                    "忽略无法解析的缓存 FOFA Key: name=%s",
-                    item.get("name") if isinstance(item, dict) else "<unknown>",
-                )
+                logger.error("忽略无法解析的缓存 FOFA Key: name=<invalid>")
         return keys
 
     fofa = dict(_cache.get("fofa") or {})
