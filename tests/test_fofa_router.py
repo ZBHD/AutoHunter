@@ -49,6 +49,14 @@ def clock(value: datetime):
     return now, advance
 
 
+async def _async_value(value):
+    return value
+
+
+async def _async_error(error):
+    raise error
+
+
 def test_sync_router_is_sticky_after_auth_failover_and_keeps_key_url_pair() -> None:
     calls: list[tuple[str, str]] = []
     router = FofaKeyRouter([key("A", "secret-a"), key("B", "secret-b")], active_name="A")
@@ -684,3 +692,57 @@ def test_merged_rate_failures_preserve_longer_upstream_retry_after() -> None:
         thread.join(timeout=3)
     assert router.keys[0].failure_count == 2
     assert router.keys[0].cooldown_until == start + timedelta(seconds=1000)
+
+
+def test_stale_rate_after_success_epoch_boundary_is_ignored_sync() -> None:
+    router = FofaKeyRouter([key("A", "secret-a")], active_name="A")
+    old_started = threading.Event()
+    release_old = threading.Event()
+
+    def old_operation(_secret: str, _base_url: str) -> None:
+        old_started.set()
+        assert release_old.wait(timeout=2)
+        raise FofaError("old rate", kind="rate_limit")
+
+    def run_old() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(old_operation)
+
+    old = threading.Thread(target=run_old)
+    old.start()
+    assert old_started.wait(timeout=2)
+    assert router.execute_sync(lambda *_: "new success") == "new success"
+    with pytest.raises(FofaPoolExhaustedError):
+        router.execute_sync(lambda *_: (_ for _ in ()).throw(FofaError("new rate", kind="rate_limit")))
+    release_old.set()
+    old.join(timeout=2)
+    assert router.keys[0].failure_count == 1
+
+
+def test_stale_rate_after_success_epoch_boundary_is_ignored_async() -> None:
+    async def scenario() -> None:
+        router = FofaKeyRouter([key("A", "secret-a")], active_name="A")
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+
+        async def old_operation(_secret: str, _base_url: str) -> None:
+            old_started.set()
+            await release_old.wait()
+            raise FofaError("old rate", kind="rate_limit")
+
+        async def run_old() -> None:
+            with pytest.raises(FofaPoolExhaustedError):
+                await router.execute_async(old_operation)
+
+        old_task = asyncio.create_task(run_old())
+        await old_started.wait()
+        assert await router.execute_async(lambda *_: _async_value("new success")) == "new success"
+        with pytest.raises(FofaPoolExhaustedError):
+            await router.execute_async(
+                lambda *_: _async_error(FofaError("new rate", kind="rate_limit"))
+            )
+        release_old.set()
+        await old_task
+        assert router.keys[0].failure_count == 1
+
+    asyncio.run(scenario())

@@ -85,6 +85,7 @@ class _Entry:
     config: FofaKeyConfig
     credential_fingerprint: str
     generation: int = 0
+    success_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class _Candidate:
     base_url: str
     credential_fingerprint: str
     generation: int
+    success_epoch: int
     active_name: str
     active_revision: int
 
@@ -276,6 +278,7 @@ class FofaKeyRouter(Generic[T]):
                         base_url=item.base_url,
                         credential_fingerprint=entry.credential_fingerprint,
                         generation=entry.generation,
+                        success_epoch=entry.success_epoch,
                         active_name=self._active_name,
                         active_revision=self._active_revision,
                     )
@@ -376,6 +379,7 @@ class FofaKeyRouter(Generic[T]):
             item.failure_count = 0
             item.cooldown_until = None
             self._active_name = item.name
+            entry.success_epoch += 1
             change = self._record_state_change(before, entry)
             # Even a ready/active no-op success advances the entry generation,
             # invalidating older in-flight failures for the same credential.
@@ -421,6 +425,7 @@ class FofaKeyRouter(Generic[T]):
             entry.generation <= candidate.generation
             or entry.credential_fingerprint != candidate.credential_fingerprint
             or current_fingerprint != candidate.credential_fingerprint
+            or entry.success_epoch != candidate.success_epoch
         ):
             return False
         if kind is FofaFailureKind.RATE_LIMIT:
