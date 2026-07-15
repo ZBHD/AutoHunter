@@ -146,6 +146,13 @@ def test_src_parser_preserves_head_tail_priority_and_scan_limit() -> None:
     assert parsed.partial is True
 
 
+def test_src_parser_omitted_counts_duplicate_occurrences_by_index() -> None:
+    record = json.dumps({"url": "https://a.test/repeated", "status_code": 200})
+    parsed = parse_src_output("crawl_endpoints", "\n".join([record] * 8))
+    assert parsed.count == 8
+    assert parsed.omitted == 2
+
+
 def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path) -> None:
     output_path = tmp_path / "stdout"
     output_path.write_text(

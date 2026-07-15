@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import re
 import json
+import io
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from app.agents.src_leads import SrcCandidate
@@ -169,10 +170,10 @@ def _new_candidate(
         return None
 
 
-def _json_records(text: str, errors: list[str]) -> list[Mapping[str, Any]]:
+def _json_records(text: str, errors: list[str]) -> Iterator[Mapping[str, Any]]:
     stripped = text.strip()
     if not stripped:
-        return []
+        return
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
@@ -180,24 +181,28 @@ def _json_records(text: str, errors: list[str]) -> list[Mapping[str, Any]]:
     if isinstance(parsed, Mapping):
         results = parsed.get("results")
         if isinstance(results, list):
-            return [item for item in results if isinstance(item, Mapping)]
-        return [parsed]
+            yield from (item for item in results if isinstance(item, Mapping))
+            return
+        yield parsed
+        return
     if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, Mapping)]
-    records: list[Mapping[str, Any]] = []
-    for line_number, line in enumerate(text.splitlines(), 1):
+        yield from (item for item in parsed if isinstance(item, Mapping))
+        return
+    for line_number, line in enumerate(io.StringIO(text), 1):
+        if line_number > _MAX_PARSE_LINES:
+            break
         if not line.strip():
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
-            errors.append(f"line {line_number}: json:{exc.msg}")
+            if len(errors) < 64:
+                errors.append(f"line {line_number}: json:{exc.msg}")
             continue
         if isinstance(value, Mapping):
-            records.append(value)
+            yield value
         elif isinstance(value, list):
-            records.extend(item for item in value if isinstance(item, Mapping))
-    return records
+            yield from (item for item in value if isinstance(item, Mapping))
 
 
 def _record_url(record: Mapping[str, Any]) -> str:
@@ -249,12 +254,9 @@ def _bounded_text(output: str) -> tuple[str, int, bool, bool]:
         if cut >= 0:
             encoded = encoded[:cut]
     text = encoded.decode("utf-8", "replace")
-    lines = text.splitlines()
-    line_partial = len(lines) > _MAX_PARSE_LINES
-    if line_partial:
-        text = "\n".join(lines[:_MAX_PARSE_LINES])
     total_lines = raw.count("\n") + (1 if raw and not raw.endswith(("\n", "\r")) else 0)
-    scanned_lines = min(len(lines), _MAX_PARSE_LINES)
+    line_partial = total_lines > _MAX_PARSE_LINES
+    scanned_lines = min(total_lines, _MAX_PARSE_LINES)
     omitted = max(0, total_lines - scanned_lines)
     if byte_partial and omitted == 0:
         omitted = 1
@@ -279,8 +281,8 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
     name = str(tool or "").strip()
     text, _omitted, partial, remaining_unknown = _bounded_text(output)
     errors: list[str] = []
-    head_candidates: list[SrcCandidate] = []
-    tail_candidates: deque[SrcCandidate] = deque(maxlen=_SUMMARY_WIDTH)
+    head_candidates: list[tuple[int, SrcCandidate]] = []
+    tail_candidates: deque[tuple[int, SrcCandidate]] = deque(maxlen=_SUMMARY_WIDTH)
     priority_candidates: list[tuple[int, SrcCandidate]] = []
     candidate_count = 0
 
@@ -294,8 +296,8 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
         candidate_index = candidate_count
         candidate_count += 1
         if len(head_candidates) < _SUMMARY_WIDTH:
-            head_candidates.append(candidate)
-        tail_candidates.append(candidate)
+            head_candidates.append((candidate_index, candidate))
+        tail_candidates.append((candidate_index, candidate))
         priority_candidates.append((candidate_index, candidate))
         priority_candidates.sort(key=lambda pair: (-pair[1].priority, pair[0]))
         del priority_candidates[_SUMMARY_WIDTH:]
@@ -304,13 +306,13 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
         return SrcParseResult(name, False, 0, (), (), (), 0, (), _next_actions(name), partial, remaining_unknown, "empty")
 
     if name in {"probe_http", "crawl_endpoints", "discover_content", "scan_nuclei", "verify_xss"}:
-        records = _json_records(text, errors)
-        if not records and not errors:
-            errors.append("no JSON records")
-        for record in records:
+        records_seen = False
+        for record in _json_records(text, errors):
+            records_seen = True
             url = _record_url(record)
             if not url:
-                errors.append("record missing url")
+                if len(errors) < 64:
+                    errors.append("record missing url")
                 continue
             request = record.get("request") if isinstance(record.get("request"), Mapping) else {}
             method = request.get("method") if isinstance(request, Mapping) else record.get("method", "GET")
@@ -328,15 +330,17 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 confidence=0.8 if scanner else 0.7, reason=reason,
                 record=record, scanner=scanner,
             ))
-    elif name == "fingerprint_waf":
-        records = _json_records(text, errors)
-        if not records and not errors:
+        if not records_seen and not errors:
             errors.append("no JSON records")
-        for record in records:
+    elif name == "fingerprint_waf":
+        records_seen = False
+        for record in _json_records(text, errors):
+            records_seen = True
             url = _record_url(record)
             firewall = record.get("firewall") or record.get("waf") or record.get("manufacturer") or record.get("name")
             if not url and not firewall:
-                errors.append("record missing target")
+                if len(errors) < 64:
+                    errors.append("record missing target")
                 continue
             add(_new_candidate(
                 "fingerprint", url or str(firewall), url or str(firewall),
@@ -344,10 +348,14 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 priority=6 if record.get("detected", True) else 3,
                 reason=str(firewall or "waf fingerprint"), record=record,
             ))
+        if not records_seen and not errors:
+            errors.append("no JSON records")
     elif name == "discover_parameters":
         current_url = ""
         current_method = "GET"
-        for line_number, line in enumerate(text.splitlines(), 1):
+        for line_number, line in enumerate(io.StringIO(text), 1):
+            if line_number > _MAX_PARSE_LINES:
+                break
             stripped = line.strip()
             if not stripped:
                 continue
@@ -385,7 +393,9 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 ))
     elif name == "scan_web_ports":
         service_re = re.compile(r"^(\d+)/(tcp|udp)\s+open\s*(.*)$", re.I)
-        for line in text.splitlines():
+        for line_number, line in enumerate(io.StringIO(text), 1):
+            if line_number > _MAX_PARSE_LINES:
+                break
             match = service_re.match(line.strip())
             if not match:
                 continue
@@ -402,11 +412,15 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
         errors.append(f"unsupported SRC parser: {name}")
 
     # Keep summaries stable and bounded while count remains the number admitted.
-    head = tuple(head_candidates)
-    tail = tuple(tail_candidates)
+    head = tuple(candidate for _index, candidate in head_candidates)
+    tail = tuple(candidate for _index, candidate in tail_candidates)
     priority = tuple(candidate for _index, candidate in priority_candidates)
-    retained = set(head) | set(tail) | set(priority)
-    omitted_in_window = max(0, candidate_count - len(retained))
+    retained_indices = {
+        *(_index for _index, _candidate in head_candidates),
+        *(_index for _index, _candidate in tail_candidates),
+        *(_index for _index, _candidate in priority_candidates),
+    }
+    omitted_in_window = max(0, candidate_count - len(retained_indices))
     parse_ok = candidate_count > 0
     failure_kind = "" if parse_ok else ("empty" if not text.strip() else "parse_error")
     return SrcParseResult(
@@ -426,7 +440,13 @@ def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:
     channels = capture.get("channels")
     descriptors: Iterable[Any]
     if isinstance(channels, Mapping):
-        descriptors = channels.values()
+        mapped_descriptors: list[Any] = []
+        for channel_name, descriptor in channels.items():
+            if isinstance(descriptor, Mapping) and "name" not in descriptor:
+                mapped_descriptors.append({"name": channel_name, **descriptor})
+            else:
+                mapped_descriptors.append(descriptor)
+        descriptors = mapped_descriptors
     elif isinstance(channels, (list, tuple)):
         descriptors = channels
     else:
