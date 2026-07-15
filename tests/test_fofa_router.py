@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -11,7 +12,9 @@ from app.fofa.client import FofaError
 from app.fofa.router import (
     FofaFailureKind,
     FofaKeyRouter,
+    FofaKeyStateSnapshot,
     FofaPoolExhaustedError,
+    fofa_credential_fingerprint,
 )
 
 
@@ -159,7 +162,7 @@ def test_earliest_retry_and_all_blocked_pool_state() -> None:
     with pytest.raises(FofaPoolExhaustedError) as exc_info:
         router.execute_sync(lambda *_: pytest.fail("cooldown operation must not run"))
     assert exc_info.value.next_retry_at == start + timedelta(minutes=2)
-    assert exc_info.value.failures == []
+    assert {failure.name for failure in exc_info.value.failures} == {"A", "B"}
 
     blocked = FofaKeyRouter(
         [key("A", "a", enabled=False), key("B", "b", runtime_state="auth_invalid")],
@@ -250,7 +253,7 @@ def test_router_copies_input_models_and_now_must_be_aware() -> None:
     router = FofaKeyRouter(configs)
     configs[0].key = "changed"
     configs[0].base_url = "https://changed.example"
-    assert router.keys[0].key == "secret"
+    assert router.keys[0].key_set is True
     assert router.keys[0].base_url == "https://a.fofa.example/api"
 
     naive_router = FofaKeyRouter([key("A", "a")], now=lambda: datetime(2026, 7, 16))
@@ -272,9 +275,11 @@ def test_router_public_types_are_exported_from_package() -> None:
     from app.fofa import (
         FofaFailureKind as ExportedFailureKind,
         FofaKeyRouter as ExportedRouter,
+        FofaKeyStateSnapshot,
         FofaKeyStateChange,
         FofaPoolExhaustedError as ExportedPoolError,
         FofaPoolFailure,
+        fofa_credential_fingerprint,
     )
 
     assert ExportedFailureKind is FofaFailureKind
@@ -282,3 +287,215 @@ def test_router_public_types_are_exported_from_package() -> None:
     assert ExportedPoolError is FofaPoolExhaustedError
     assert FofaKeyStateChange.__module__ == "app.fofa.router"
     assert FofaPoolFailure.__module__ == "app.fofa.router"
+    assert FofaKeyStateSnapshot.__module__ == "app.fofa.router"
+    assert callable(fofa_credential_fingerprint)
+
+
+def test_transient_exception_cause_context_and_traceback_are_fully_redacted() -> None:
+    secret = "a key/with+symbols"
+    encoded = "a%20key%2Fwith%2Bsymbols"
+    plus_encoded = "a+key%2Fwith%2Bsymbols"
+    router = FofaKeyRouter([key("A", secret)])
+
+    def operation(_key: str, _base_url: str) -> None:
+        raise FofaError(
+            f"failure {secret} {encoded} {plus_encoded}",
+            kind="future_kind",
+            code=secret,
+            retry_after=17,
+        )
+
+    with pytest.raises(FofaError) as exc_info:
+        router.execute_sync(operation)
+    error = exc_info.value
+    rendered = "".join(traceback.format_exception(error))
+    for text in (secret, encoded, plus_encoded):
+        assert text not in str(error)
+        assert text not in repr(error)
+        assert text not in rendered
+        assert text not in repr(error.__cause__)
+        assert text not in repr(error.__context__)
+    assert error.kind == FofaFailureKind.TRANSIENT.value
+    assert error.code == "[REDACTED]"
+    assert error.retry_after == 17
+
+
+def test_async_transient_exception_has_no_original_cause_or_context() -> None:
+    secret = "async key/+value"
+    router = FofaKeyRouter([key("A", secret)])
+
+    async def operation(_key: str, _base_url: str) -> None:
+        raise FofaError(f"failure {secret}", kind="future_kind", code=secret, retry_after=19)
+
+    async def scenario() -> FofaError:
+        with pytest.raises(FofaError) as exc_info:
+            await router.execute_async(operation)
+        return exc_info.value
+
+    error = asyncio.run(scenario())
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert error.kind == FofaFailureKind.TRANSIENT.value
+    assert error.code == "[REDACTED]"
+    assert error.retry_after == 19
+
+
+def test_stale_sync_success_cannot_reactivate_old_key_after_other_key_wins() -> None:
+    router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
+    old_started = threading.Event()
+    release_old = threading.Event()
+    results: list[str] = []
+
+    def operation(_key: str, _base_url: str) -> str:
+        if threading.current_thread().name == "old":
+            old_started.set()
+            assert release_old.wait(timeout=2)
+            return "old"
+        if _key == "a":
+            raise FofaError("auth", kind="auth")
+        return "new"
+
+    old = threading.Thread(
+        target=lambda: results.append(router.execute_sync(operation)), name="old"
+    )
+    old.start()
+    assert old_started.wait(timeout=2)
+    fast = threading.Thread(
+        target=lambda: results.append(router.execute_sync(operation)), name="fast"
+    )
+    fast.start()
+    fast.join(timeout=2)
+    release_old.set()
+    old.join(timeout=2)
+    assert sorted(results) == ["new", "old"]
+    assert router.active_name == "B"
+    assert router.keys[0].runtime_state == "auth_invalid"
+
+
+def test_stale_async_success_cannot_reactivate_old_key_after_other_key_wins() -> None:
+    async def scenario() -> None:
+        router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+
+        async def old_operation(secret: str, _base_url: str) -> str:
+            if secret == "a":
+                old_started.set()
+                await release_old.wait()
+                return "old"
+            return "old-b"
+
+        async def fast_operation(secret: str, _base_url: str) -> str:
+            if secret == "a":
+                raise FofaError("auth", kind="auth")
+            return "new"
+
+        old_task = asyncio.create_task(router.execute_async(old_operation))
+        await old_started.wait()
+        assert await router.execute_async(fast_operation) == "new"
+        release_old.set()
+        assert await old_task == "old"
+        assert router.active_name == "B"
+        assert router.keys[0].runtime_state == "auth_invalid"
+
+    asyncio.run(scenario())
+
+
+def test_callback_reentry_is_lock_free_and_revision_ordered() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    events = []
+    router: FofaKeyRouter
+
+    def callback(change) -> None:
+        events.append(change)
+        if change.revision == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+            router.execute_sync(lambda *_: "reentered")
+
+    router = FofaKeyRouter([key("A", "a")], on_state_change=callback)
+
+    def transient() -> None:
+        with pytest.raises(FofaError):
+            router.execute_sync(lambda *_: (_ for _ in ()).throw(FofaError("x", kind="transient")))
+
+    first = threading.Thread(target=transient)
+    first.start()
+    assert entered.wait(timeout=2)
+    second = threading.Thread(target=transient)
+    second.start()
+    second.join(timeout=2)
+    release.set()
+    first.join(timeout=2)
+    assert [event.revision for event in events] == [1, 2, 3]
+
+
+def test_operation_and_callback_can_acquire_router_state_lock_from_other_thread() -> None:
+    lock_probe: list[str] = []
+    callback_probe: list[str] = []
+
+    def callback(_change) -> None:
+        probe = threading.Thread(target=lambda: callback_probe.append(router.active_name))
+        probe.start()
+        probe.join(timeout=1)
+        assert not probe.is_alive()
+
+    router = FofaKeyRouter([key("A", "a")], on_state_change=callback)
+
+    def operation(_secret: str, _base_url: str) -> str:
+        probe = threading.Thread(target=lambda: lock_probe.append(router.active_name))
+        probe.start()
+        probe.join(timeout=1)
+        assert not probe.is_alive()
+        return "ok"
+
+    assert router.execute_sync(operation) == "ok"
+    assert lock_probe == [""]
+    assert callback_probe == ["A"]
+
+
+def test_credential_fingerprint_is_stable_irreversible_and_changes_with_key() -> None:
+    base_url = "https://a.fofa.example/api"
+    first = fofa_credential_fingerprint("A", "secret-a", base_url)
+    same = fofa_credential_fingerprint("A", "secret-a", base_url)
+    changed = fofa_credential_fingerprint("A", "secret-b", base_url)
+    assert first == same
+    assert first != changed
+    assert len(first) == 64
+    assert "secret-a" not in first
+    assert "secret-b" not in changed
+
+    router = FofaKeyRouter([key("A", "secret-a")])
+    snapshot = router.keys[0]
+    assert snapshot.credential_fingerprint == first
+    assert snapshot.key_set is True
+    assert not hasattr(snapshot, "key")
+
+
+def test_preblocked_entries_are_reported_with_safe_fixed_failure_kinds() -> None:
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    now, _advance = clock(start)
+    router = FofaKeyRouter(
+        [
+            key("disabled", "d", enabled=False),
+            key("missing", ""),
+            key("auth", "a", runtime_state="auth_invalid"),
+            key("daily", "q", runtime_state="daily_suspended"),
+            key("rate", "r", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=5)),
+            key("daily_wait", "w", runtime_state="daily_cooldown", cooldown_until=start + timedelta(minutes=2)),
+        ],
+        now=now,
+    )
+    with pytest.raises(FofaPoolExhaustedError) as exc_info:
+        router.execute_sync(lambda *_: pytest.fail("no eligible key"))
+    by_name = {failure.name: failure for failure in exc_info.value.failures}
+    assert by_name["disabled"].kind == "disabled"
+    assert by_name["missing"].kind == "missing_key"
+    assert by_name["auth"].kind == FofaFailureKind.AUTH.value
+    assert by_name["daily"].kind == FofaFailureKind.DAILY_LIMIT.value
+    assert by_name["rate"].kind == FofaFailureKind.RATE_LIMIT.value
+    assert by_name["daily_wait"].kind == FofaFailureKind.DAILY_LIMIT.value
+    assert exc_info.value.next_retry_at == start + timedelta(minutes=2)

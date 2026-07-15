@@ -1,8 +1,12 @@
 """Sticky, failover routing for a pool of FOFA credentials."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import os
 import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -14,6 +18,7 @@ from app.fofa.client import FofaError, redact_fofa_secrets
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+_CREDENTIAL_FINGERPRINT_SECRET = os.urandom(32)
 
 
 class FofaFailureKind(StrEnum):
@@ -21,6 +26,13 @@ class FofaFailureKind(StrEnum):
     RATE_LIMIT = "rate_limit"
     DAILY_LIMIT = "daily_limit"
     TRANSIENT = "transient"
+
+
+def fofa_credential_fingerprint(name: str, key: str, base_url: str) -> str:
+    """Return a process-local, irreversible fingerprint for one credential unit."""
+    parts = [str(name).encode("utf-8"), str(key).encode("utf-8"), str(base_url).encode("utf-8")]
+    canonical = b"".join(len(part).to_bytes(8, "big") + part for part in parts)
+    return hmac.new(_CREDENTIAL_FINGERPRINT_SECRET, canonical, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -32,6 +44,24 @@ class FofaKeyStateChange:
     failure_count: int
     cooldown_until: datetime | None
     active_key_name: str
+    credential_fingerprint: str = ""
+    revision: int = 0
+
+
+@dataclass(frozen=True)
+class FofaKeyStateSnapshot:
+    """Public state view that never carries a configured credential."""
+
+    name: str
+    base_url: str
+    enabled: bool
+    key_set: bool
+    runtime_state: str
+    failure_kind: str
+    failure_count: int
+    cooldown_until: datetime | None
+    credential_fingerprint: str
+    revision: int
 
 
 @dataclass(frozen=True)
@@ -47,8 +77,14 @@ class FofaPoolExhaustedError(RuntimeError):
     def __init__(self, failures: list[FofaPoolFailure], next_retry_at: datetime | None):
         self.failures = list(failures)
         self.next_retry_at = next_retry_at
-        # Do not put credential values (or a credential-oriented repr) in the message.
         super().__init__(f"FOFA 凭据池暂不可用，共 {len(self.failures)} 项")
+
+
+@dataclass
+class _Entry:
+    config: FofaKeyConfig
+    credential_fingerprint: str
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,10 +93,14 @@ class _Candidate:
     name: str
     key: str
     base_url: str
+    credential_fingerprint: str
+    generation: int
+    active_name: str
+    active_revision: int
 
 
 class FofaKeyRouter(Generic[T]):
-    """Selects one key/base URL pair and keeps the successful key sticky."""
+    """Select one key/base URL pair and keep the successful key sticky."""
 
     def __init__(
         self,
@@ -70,11 +110,24 @@ class FofaKeyRouter(Generic[T]):
         on_state_change: Callable[[FofaKeyStateChange], None] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
-        self._keys = [item.model_copy(deep=True) for item in keys]
+        self._entries = [
+            _Entry(
+                config=item.model_copy(deep=True),
+                credential_fingerprint=fofa_credential_fingerprint(
+                    item.name, item.key, item.base_url
+                ),
+            )
+            for item in keys
+        ]
         self._active_name = str(active_name or "")
+        self._active_revision = 0
+        self._state_revision = 0
         self._on_state_change = on_state_change
         self._now = now
         self._lock = threading.RLock()
+        self._pending_callbacks = deque[FofaKeyStateChange]()
+        self._callback_dispatch_lock = threading.RLock()
+        self._callback_dispatching = False
 
     @property
     def active_name(self) -> str:
@@ -82,16 +135,39 @@ class FofaKeyRouter(Generic[T]):
             return self._active_name
 
     @property
-    def keys(self) -> list[FofaKeyConfig]:
-        """Return a deep snapshot so callers cannot mutate router state."""
+    def keys(self) -> list[FofaKeyStateSnapshot]:
+        """Return a deep, credential-free state snapshot."""
+        return self.state_snapshot
+
+    @property
+    def state_snapshot(self) -> list[FofaKeyStateSnapshot]:
         with self._lock:
-            return [item.model_copy(deep=True) for item in self._keys]
+            return [self._snapshot_entry(entry) for entry in self._entries]
+
+    @property
+    def key_states(self) -> list[FofaKeyStateSnapshot]:
+        return self.state_snapshot
 
     def execute_sync(self, operation: Callable[[str, str], T]) -> T:
         return self._execute_sync_ring(operation)
 
     async def execute_async(self, operation: Callable[[str, str], Awaitable[T]]) -> T:
         return await self._execute_async_ring(operation)
+
+    def _snapshot_entry(self, entry: _Entry) -> FofaKeyStateSnapshot:
+        item = entry.config
+        return FofaKeyStateSnapshot(
+            name=item.name,
+            base_url=item.base_url,
+            enabled=item.enabled,
+            key_set=bool(item.key),
+            runtime_state=item.runtime_state,
+            failure_kind=item.failure_kind,
+            failure_count=item.failure_count,
+            cooldown_until=item.cooldown_until,
+            credential_fingerprint=entry.credential_fingerprint,
+            revision=entry.generation,
+        )
 
     def _current_time(self) -> datetime:
         value = self._now()
@@ -110,7 +186,11 @@ class FofaKeyRouter(Generic[T]):
         text = str(message or "")
         with self._lock:
             secrets = sorted(
-                {item.key for item in self._keys if item.key},
+                {
+                    entry.config.key
+                    for entry in self._entries
+                    if entry.config.key
+                },
                 key=len,
                 reverse=True,
             )
@@ -118,40 +198,85 @@ class FofaKeyRouter(Generic[T]):
             text = redact_fofa_secrets(text, secret)
         return text
 
-    def _candidate_snapshot(self) -> tuple[list[_Candidate], datetime | None]:
-        """Take one ordered candidate snapshot while holding the state lock."""
+    @staticmethod
+    def _blocked_failure(entry: _Entry, kind: str, message: str) -> FofaPoolFailure:
+        return FofaPoolFailure(entry.config.name, kind, message)
+
+    def _candidate_snapshot(
+        self,
+    ) -> tuple[list[_Candidate], datetime | None, list[FofaPoolFailure]]:
+        """Take one ordered candidate and pre-blocked snapshot under the state lock."""
         with self._lock:
             now = self._current_time()
             active_index = next(
                 (
                     index
-                    for index, item in enumerate(self._keys)
-                    if item.name == self._active_name
-                    and item.enabled
-                    and bool(item.key)
-                    and item.runtime_state not in {"auth_invalid", "daily_suspended"}
-                    and (item.cooldown_until is None or item.cooldown_until <= now)
+                    for index, entry in enumerate(self._entries)
+                    if entry.config.name == self._active_name
+                    and entry.config.enabled
+                    and bool(entry.config.key)
+                    and entry.config.runtime_state
+                    not in {"auth_invalid", "daily_suspended"}
+                    and (
+                        entry.config.cooldown_until is None
+                        or entry.config.cooldown_until <= now
+                    )
                 ),
                 None,
             )
             start = active_index if active_index is not None else 0
             candidates: list[_Candidate] = []
+            blocked: list[FofaPoolFailure] = []
             earliest_retry: datetime | None = None
-            for offset in range(len(self._keys)):
-                index = (start + offset) % len(self._keys) if self._keys else 0
-                if not self._keys:
+            for offset in range(len(self._entries)):
+                if not self._entries:
                     break
-                item = self._keys[index]
-                if not item.enabled or not item.key:
+                index = (start + offset) % len(self._entries)
+                entry = self._entries[index]
+                item = entry.config
+                if not item.enabled:
+                    blocked.append(self._blocked_failure(entry, "disabled", "已停用"))
                     continue
-                if item.runtime_state in {"auth_invalid", "daily_suspended"}:
+                if item.runtime_state == "auth_invalid":
+                    blocked.append(self._blocked_failure(entry, FofaFailureKind.AUTH.value, "认证失效"))
+                    continue
+                if item.runtime_state == "daily_suspended":
+                    blocked.append(
+                        self._blocked_failure(entry, FofaFailureKind.DAILY_LIMIT.value, "已达每日上限")
+                    )
+                    continue
+                if not item.key:
+                    blocked.append(self._blocked_failure(entry, "missing_key", "未配置密钥"))
                     continue
                 if item.cooldown_until is not None and item.cooldown_until > now:
                     if earliest_retry is None or item.cooldown_until < earliest_retry:
                         earliest_retry = item.cooldown_until
+                    if item.failure_kind in {
+                        FofaFailureKind.RATE_LIMIT.value,
+                        FofaFailureKind.DAILY_LIMIT.value,
+                    }:
+                        cooldown_kind = item.failure_kind
+                    elif item.runtime_state == "daily_cooldown":
+                        cooldown_kind = FofaFailureKind.DAILY_LIMIT.value
+                    elif item.runtime_state == "rate_limited":
+                        cooldown_kind = FofaFailureKind.RATE_LIMIT.value
+                    else:
+                        cooldown_kind = "cooldown"
+                    blocked.append(self._blocked_failure(entry, cooldown_kind, "冷却中"))
                     continue
-                candidates.append(_Candidate(index, item.name, item.key, item.base_url))
-            return candidates, earliest_retry
+                candidates.append(
+                    _Candidate(
+                        index=index,
+                        name=item.name,
+                        key=item.key,
+                        base_url=item.base_url,
+                        credential_fingerprint=entry.credential_fingerprint,
+                        generation=entry.generation,
+                        active_name=self._active_name,
+                        active_revision=self._active_revision,
+                    )
+                )
+            return candidates, earliest_retry, blocked
 
     def _state_fingerprint(self, item: FofaKeyConfig) -> tuple[object, ...]:
         return (
@@ -163,59 +288,108 @@ class FofaKeyRouter(Generic[T]):
             self._active_name,
         )
 
-    def _state_change(
+    def _record_state_change(
         self,
         before: tuple[object, ...],
-        item: FofaKeyConfig,
+        entry: _Entry,
     ) -> FofaKeyStateChange | None:
+        item = entry.config
         after = self._state_fingerprint(item)
         if before == after:
             return None
-        return FofaKeyStateChange(
+        entry.generation += 1
+        self._state_revision += 1
+        if before[-1] != self._active_name:
+            self._active_revision = self._state_revision
+        change = FofaKeyStateChange(
             name=item.name,
-            base_url=item.base_url,
+            base_url=self._redact(item.base_url),
             runtime_state=item.runtime_state,
             failure_kind=item.failure_kind,
             failure_count=item.failure_count,
             cooldown_until=item.cooldown_until,
             active_key_name=self._active_name,
+            credential_fingerprint=entry.credential_fingerprint,
+            revision=self._state_revision,
+        )
+        if self._on_state_change is not None:
+            self._pending_callbacks.append(change)
+        return change
+
+    def _drain_callbacks(self) -> None:
+        callback = self._on_state_change
+        if callback is None:
+            return
+        with self._callback_dispatch_lock:
+            if self._callback_dispatching:
+                return
+            self._callback_dispatching = True
+        try:
+            while True:
+                with self._callback_dispatch_lock:
+                    with self._lock:
+                        if not self._pending_callbacks:
+                            self._callback_dispatching = False
+                            return
+                        change = self._pending_callbacks.popleft()
+                try:
+                    callback(change)
+                except Exception as exc:  # callback failures never affect routing
+                    logger.error("FOFA 状态回调失败：%s", self._redact(exc))
+        finally:
+            with self._callback_dispatch_lock:
+                self._callback_dispatching = False
+
+    def _entry_is_current(self, candidate: _Candidate) -> bool:
+        if candidate.index >= len(self._entries):
+            return False
+        entry = self._entries[candidate.index]
+        current_fingerprint = fofa_credential_fingerprint(
+            entry.config.name, entry.config.key, entry.config.base_url
+        )
+        return (
+            entry.generation == candidate.generation
+            and entry.credential_fingerprint == candidate.credential_fingerprint
+            and current_fingerprint == candidate.credential_fingerprint
+            and entry.config.name == candidate.name
         )
 
-    def _notify(self, change: FofaKeyStateChange | None) -> None:
-        callback = self._on_state_change
-        if change is None or callback is None:
-            return
-        try:
-            callback(change)
-        except Exception as exc:  # callback failures must not affect routing
-            logger.error("FOFA 状态回调失败：%s", self._redact(exc))
+    def _candidate_is_fresh_for_write(self, candidate: _Candidate) -> bool:
+        if not self._entry_is_current(candidate):
+            return False
+        # A request from an older active key must not put that key back in front.
+        return self._active_revision == candidate.active_revision or self._active_name == candidate.name
 
-    def _mark_success(self, candidate: _Candidate) -> None:
-        change: FofaKeyStateChange | None = None
+    def _mark_success(self, candidate: _Candidate) -> bool:
         with self._lock:
-            item = self._keys[candidate.index]
+            if not self._candidate_is_fresh_for_write(candidate):
+                return False
+            entry = self._entries[candidate.index]
+            item = entry.config
             before = self._state_fingerprint(item)
             item.runtime_state = "ready"
             item.failure_kind = ""
             item.failure_count = 0
             item.cooldown_until = None
             self._active_name = item.name
-            change = self._state_change(before, item)
-        self._notify(change)
+            self._record_state_change(before, entry)
+        self._drain_callbacks()
+        return True
 
     def _mark_failure(
         self,
         candidate: _Candidate,
         kind: FofaFailureKind,
         retry_after: int | None,
-    ) -> None:
-        change: FofaKeyStateChange | None = None
+    ) -> bool:
         with self._lock:
-            item = self._keys[candidate.index]
-            before = self._state_fingerprint(item)
-            # A concurrent auth report for an already blocked item is idempotent.
+            if not self._candidate_is_fresh_for_write(candidate):
+                return False
+            entry = self._entries[candidate.index]
+            item = entry.config
             if kind is FofaFailureKind.AUTH and item.runtime_state == "auth_invalid":
-                return
+                return False
+            before = self._state_fingerprint(item)
             item.failure_count = (
                 item.failure_count + 1 if item.failure_kind == kind.value else 1
             )
@@ -225,7 +399,7 @@ class FofaKeyRouter(Generic[T]):
                 item.runtime_state = "auth_invalid"
             elif kind is FofaFailureKind.RATE_LIMIT:
                 item.runtime_state = "rate_limited"
-                delay = min(60 * (2 ** (item.failure_count - 1)), 600)
+                delay = min(60 * (2 ** min(item.failure_count - 1, 4)), 600)
                 if retry_after is not None:
                     delay = max(delay, retry_after)
                 item.cooldown_until = self._current_time() + timedelta(seconds=delay)
@@ -237,8 +411,9 @@ class FofaKeyRouter(Generic[T]):
                     item.cooldown_until = self._current_time() + timedelta(hours=1)
             else:
                 item.runtime_state = "ready"
-            change = self._state_change(before, item)
-        self._notify(change)
+            self._record_state_change(before, entry)
+        self._drain_callbacks()
+        return True
 
     def _safe_error(self, error: BaseException, kind: FofaFailureKind) -> FofaError:
         if isinstance(error, FofaError):
@@ -254,14 +429,20 @@ class FofaKeyRouter(Generic[T]):
             retry_after=retry_after,
         )
 
-    def _pool_failure(self, candidate: _Candidate, error: BaseException, kind: FofaFailureKind) -> FofaPoolFailure:
+    def _pool_failure(
+        self,
+        candidate: _Candidate,
+        error: BaseException,
+        kind: FofaFailureKind,
+    ) -> FofaPoolFailure:
         return FofaPoolFailure(candidate.name, kind.value, self._redact(error))
 
     def _next_retry_at(self) -> datetime | None:
         with self._lock:
             now = self._current_time()
             result: datetime | None = None
-            for item in self._keys:
+            for entry in self._entries:
+                item = entry.config
                 if not item.enabled or not item.key:
                     continue
                 if item.runtime_state in {"auth_invalid", "daily_suspended"}:
@@ -272,41 +453,63 @@ class FofaKeyRouter(Generic[T]):
             return result
 
     def _execute_sync_ring(self, operation: Callable[[str, str], T]) -> T:
-        candidates, _initial_retry = self._candidate_snapshot()
-        failures: list[FofaPoolFailure] = []
+        candidates, _initial_retry, blocked = self._candidate_snapshot()
+        failures: list[FofaPoolFailure] = list(blocked)
         for candidate in candidates:
+            result: T | None = None
+            have_result = False
+            transient_error: FofaError | None = None
+            pool_failure: FofaPoolFailure | None = None
             try:
                 result = operation(candidate.key, candidate.base_url)
+                have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
-                    raise self._safe_error(error, kind) from error
-                retry_after = error.retry_after if isinstance(error, FofaError) else None
-                self._mark_failure(candidate, kind, retry_after)
-                failures.append(self._pool_failure(candidate, error, kind))
+                    transient_error = self._safe_error(error, kind)
+                else:
+                    retry_after = error.retry_after if isinstance(error, FofaError) else None
+                    self._mark_failure(candidate, kind, retry_after)
+                    pool_failure = self._pool_failure(candidate, error, kind)
+            if transient_error is not None:
+                raise transient_error from None
+            if pool_failure is not None:
+                failures.append(pool_failure)
                 continue
-            self._mark_success(candidate)
-            return result
+            if have_result:
+                self._mark_success(candidate)
+                return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 
     async def _execute_async_ring(self, operation: Callable[[str, str], Awaitable[T]]) -> T:
-        candidates, _initial_retry = self._candidate_snapshot()
-        failures: list[FofaPoolFailure] = []
+        candidates, _initial_retry, blocked = self._candidate_snapshot()
+        failures: list[FofaPoolFailure] = list(blocked)
         for candidate in candidates:
+            result: T | None = None
+            have_result = False
+            transient_error: FofaError | None = None
+            pool_failure: FofaPoolFailure | None = None
             try:
                 result = await operation(candidate.key, candidate.base_url)
+                have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
-                    raise self._safe_error(error, kind) from error
-                retry_after = error.retry_after if isinstance(error, FofaError) else None
-                self._mark_failure(candidate, kind, retry_after)
-                failures.append(self._pool_failure(candidate, error, kind))
+                    transient_error = self._safe_error(error, kind)
+                else:
+                    retry_after = error.retry_after if isinstance(error, FofaError) else None
+                    self._mark_failure(candidate, kind, retry_after)
+                    pool_failure = self._pool_failure(candidate, error, kind)
+            if transient_error is not None:
+                raise transient_error from None
+            if pool_failure is not None:
+                failures.append(pool_failure)
                 continue
-            self._mark_success(candidate)
-            return result
+            if have_result:
+                self._mark_success(candidate)
+                return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 
 
@@ -314,6 +517,8 @@ __all__ = [
     "FofaFailureKind",
     "FofaKeyRouter",
     "FofaKeyStateChange",
+    "FofaKeyStateSnapshot",
     "FofaPoolExhaustedError",
     "FofaPoolFailure",
+    "fofa_credential_fingerprint",
 ]
