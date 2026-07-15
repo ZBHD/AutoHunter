@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import json
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -276,20 +277,31 @@ def _next_actions(tool: str) -> tuple[str, ...]:
 
 def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcParseResult:
     name = str(tool or "").strip()
-    text, omitted, partial, remaining_unknown = _bounded_text(output)
+    text, _omitted, partial, remaining_unknown = _bounded_text(output)
     errors: list[str] = []
-    candidates: list[SrcCandidate] = []
+    head_candidates: list[SrcCandidate] = []
+    tail_candidates: deque[SrcCandidate] = deque(maxlen=_SUMMARY_WIDTH)
+    priority_candidates: list[tuple[int, SrcCandidate]] = []
+    candidate_count = 0
 
     def add(candidate: SrcCandidate | None) -> None:
+        nonlocal candidate_count
         if candidate is None:
             return
         if not _candidate_in_scope(candidate, scope_target):
             errors.append(f"scope filtered: {candidate.value or candidate.endpoint_key}")
             return
-        candidates.append(candidate)
+        candidate_index = candidate_count
+        candidate_count += 1
+        if len(head_candidates) < _SUMMARY_WIDTH:
+            head_candidates.append(candidate)
+        tail_candidates.append(candidate)
+        priority_candidates.append((candidate_index, candidate))
+        priority_candidates.sort(key=lambda pair: (-pair[1].priority, pair[0]))
+        del priority_candidates[_SUMMARY_WIDTH:]
 
     if not text.strip():
-        return SrcParseResult(name, False, 0, (), (), (), omitted, (), _next_actions(name), partial, remaining_unknown, "empty")
+        return SrcParseResult(name, False, 0, (), (), (), 0, (), _next_actions(name), partial, remaining_unknown, "empty")
 
     if name in {"probe_http", "crawl_endpoints", "discover_content", "scan_nuclei", "verify_xss"}:
         records = _json_records(text, errors)
@@ -344,6 +356,11 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 current_method, current_url = match.group(1).upper(), match.group(2).rstrip(")],")
                 add(_new_candidate("endpoint", current_url, current_url, method=current_method, reason="arjun endpoint"))
                 continue
+            scanning = re.search(r"\bScanning\s+\[\d+\s*/\s*\d+\]\s*:\s*(https?://\S+)", stripped, re.I)
+            if scanning:
+                current_method, current_url = "GET", scanning.group(1).rstrip(")],")
+                add(_new_candidate("endpoint", current_url, current_url, method=current_method, reason="arjun endpoint"))
+                continue
             found = re.search(
                 r"(?:valid\s+parameters?\s+found|parameters?\s+found|found(?:\s+\d+)?(?:\s+parameters?)?|param(?:eters)?)\s*:?\s*(.+)$",
                 stripped,
@@ -379,21 +396,22 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 location="unknown", priority=6, confidence=0.8,
                 reason=f"nmap {port}/{protocol.lower()}",
             ))
-        if not candidates and not errors:
+        if not head_candidates and not errors:
             errors.append("no open service lines")
     else:
         errors.append(f"unsupported SRC parser: {name}")
 
     # Keep summaries stable and bounded while count remains the number admitted.
-    head = tuple(candidates[:_SUMMARY_WIDTH])
-    tail = tuple(candidates[-_SUMMARY_WIDTH:]) if candidates else ()
-    priority = tuple(sorted(enumerate(candidates), key=lambda pair: (-pair[1].priority, pair[0]))[:_SUMMARY_WIDTH])
-    priority_candidates = tuple(candidate for _index, candidate in priority)
-    parse_ok = bool(candidates)
+    head = tuple(head_candidates)
+    tail = tuple(tail_candidates)
+    priority = tuple(candidate for _index, candidate in priority_candidates)
+    retained = set(head) | set(tail) | set(priority)
+    omitted_in_window = max(0, candidate_count - len(retained))
+    parse_ok = candidate_count > 0
     failure_kind = "" if parse_ok else ("empty" if not text.strip() else "parse_error")
     return SrcParseResult(
-        name, parse_ok, len(candidates), head, tail, priority_candidates,
-        omitted, tuple(errors[:64]), _next_actions(name), partial, remaining_unknown,
+        name, parse_ok, candidate_count, head, tail, priority,
+        omitted_in_window, tuple(errors[:64]), _next_actions(name), partial, remaining_unknown,
         failure_kind,
     )
 
@@ -434,9 +452,6 @@ def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:
             return data.decode("utf-8", "replace"), ""
         except (OSError, ValueError) as exc:
             return "", f"capture output read failed: {exc}"
-    value = capture.get("output")
-    if isinstance(value, str):
-        return value, ""
     return "", "capture output channel not found"
 
 
@@ -444,7 +459,7 @@ def parse_src_capture(tool: str, capture: Mapping[str, Any], scope_target: str) 
     """Read the private output channel and admit only same-scope candidates."""
 
     if not isinstance(capture, Mapping):
-        return SrcParseResult(str(tool or ""), False, 0, (), (), (), 0, ("invalid capture",), _next_actions(str(tool or "")), False, False, "parse_error")
+        return SrcParseResult(str(tool or ""), False, 0, (), (), (), 0, ("invalid capture",), _next_actions(str(tool or "")), True, True, "capture_unavailable")
     output, capture_error = _capture_output(capture)
     result = _parse_src_text(tool, output, scope_target=scope_target)
     capture_partial = str(capture.get("status") or "").lower() in {"partial", "writing", "failed", "legacy_partial"}
@@ -458,8 +473,7 @@ def parse_src_capture(tool: str, capture: Mapping[str, Any], scope_target: str) 
         return SrcParseResult(
             result.tool, False, result.count, result.head_candidates, result.tail_candidates,
             result.priority_candidates, result.omitted, tuple((*result.parse_errors, capture_error))[:64],
-            result.next_actions, result.partial, result.remaining_unknown,
-            "parse_error" if result.count == 0 else result.failure_kind,
+            result.next_actions, True, True, "capture_unavailable",
         )
     return result
 
@@ -609,6 +623,7 @@ def _crawl_endpoints(args: Mapping[str, Any], scope: str) -> SrcToolPlan:
         "katana", "-u", url, "-silent", "-jsonl", "-no-color", "-depth", str(depth),
         "-concurrency", str(concurrency), "-parallelism", "1", "-rate-limit", str(rate),
         "-timeout", str(request_timeout), "-crawl-duration", "120s", "-field-scope", "fqdn",
+        "-crawl-scope", rf"^https?://{re.escape(_host(scope) or _host(url))}(?::\d+)?(?:/|$)",
         "-max-domain-pages", "200", "-max-response-size", "1048576", "-form-extraction",
         "-tech-detect", "-filter-similar", "-disable-update-check",
     ]
@@ -648,9 +663,6 @@ def _discover_content(
         "-maxtime", "180", "-timeout", str(request_timeout), "-mc", ",".join(codes),
     ]
     display = list(argv)
-    if bool(args.get("follow_redirects", False)):
-        argv.append("-r")
-        display.append("-r")
     _header_args(argv, display, _headers(args.get("headers")))
     return _plan(
         "discover_content", argv, display, timeout=210,
@@ -686,9 +698,10 @@ def _discover_parameters(
             raise SrcToolError("include 超过 2000 字符")
         argv.extend(["--include", include])
         display.extend(["--include", "<redacted body>"])
-    if not bool(args.get("follow_redirects", False)):
-        argv.append("--disable-redirects")
-        display.append("--disable-redirects")
+    # Keep accepting the compatibility flag, but Arjun must never follow an
+    # external redirect inside the discovery process.
+    argv.append("--disable-redirects")
+    display.append("--disable-redirects")
     return _plan(
         "discover_parameters", argv, display, timeout=180,
         guidance="发现参数后先用无害值做基线/候选对比，再按参数语义验证鉴权、注入或业务影响。",

@@ -164,6 +164,29 @@ def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path) -> N
     assert any("scope" in error for error in parsed.parse_errors)
 
 
+def test_src_capture_requires_private_output_channel() -> None:
+    parsed = parse_src_capture(
+        "crawl_endpoints",
+        {"output": json.dumps({"url": "https://a.test/preview"})},
+        "https://a.test",
+    )
+    assert parsed.parse_ok is False
+    assert parsed.failure_kind == "capture_unavailable"
+    assert parsed.partial is True
+    assert parsed.remaining_unknown is True
+
+
+def test_arjun_scanning_output_keeps_url_scope_for_parameters() -> None:
+    parsed = parse_src_output(
+        "discover_parameters",
+        "Scanning [1/1]: https://a.test/api/users\n[+] Valid parameter found: id",
+    )
+    assert parsed.count == 2
+    parameter = next(item for item in parsed.head_candidates if item.kind == "parameter")
+    assert "https://a.test/api/users" in parameter.endpoint_key
+    assert parameter.parameter == "id"
+
+
 def test_src_plan_rejects_cross_host_target() -> None:
     with pytest.raises(SrcToolError, match="当前目标") as exc:
         build_src_plan(
@@ -186,6 +209,7 @@ def test_katana_plan_is_same_host_and_resource_bounded() -> None:
     assert plan.argv[plan.argv.index("-concurrency") + 1] == "10"
     assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
     assert plan.argv[plan.argv.index("-field-scope") + 1] == "fqdn"
+    assert plan.argv[plan.argv.index("-crawl-scope") + 1].startswith("^https?://app\\.example\\.test")
     assert plan.argv[plan.argv.index("-max-domain-pages") + 1] == "200"
     assert "-jsonl" in plan.argv
 
@@ -201,7 +225,7 @@ def test_ffuf_plan_requires_fuzz_and_uses_curated_wordlist(tmp_path: Path) -> No
 
     plan = build_src_plan(
         "discover_content",
-        {"url": "https://app.example.test/FUZZ", "wordlist": "api", "rate_limit": 500},
+        {"url": "https://app.example.test/FUZZ", "wordlist": "api", "rate_limit": 500, "follow_redirects": True},
         scope_target="https://app.example.test",
         wordlist_root=tmp_path,
     )
@@ -211,6 +235,7 @@ def test_ffuf_plan_requires_fuzz_and_uses_curated_wordlist(tmp_path: Path) -> No
     assert plan.argv[plan.argv.index("-maxtime") + 1] == "180"
     assert "-noninteractive" in plan.argv
     assert "-json" in plan.argv
+    assert "-r" not in plan.argv
 
 
 def test_arjun_plan_uses_small_wordlist_and_stable_limits(tmp_path: Path) -> None:
@@ -221,6 +246,7 @@ def test_arjun_plan_uses_small_wordlist_and_stable_limits(tmp_path: Path) -> Non
             "method": "JSON",
             "threads": 99,
             "rate_limit": 999,
+            "follow_redirects": True,
         },
         scope_target="https://app.example.test",
         wordlist_root=tmp_path,
@@ -231,6 +257,7 @@ def test_arjun_plan_uses_small_wordlist_and_stable_limits(tmp_path: Path) -> Non
     assert plan.argv[plan.argv.index("-t") + 1] == "5"
     assert plan.argv[plan.argv.index("--rate-limit") + 1] == "20"
     assert "--stable" in plan.argv
+    assert "--disable-redirects" in plan.argv
 
 
 def test_nuclei_requires_explicit_selector_and_builds_targeted_plan() -> None:
