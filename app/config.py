@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _load_dotenv() -> None:
@@ -23,6 +24,36 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+
+FofaRuntimeState = Literal[
+    "ready", "rate_limited", "daily_cooldown", "daily_suspended", "auth_invalid"
+]
+FofaFailureKindValue = Literal["", "auth", "rate_limit", "daily_limit", "transient"]
+
+
+class FofaKeyConfig(BaseModel):
+    """单个 FOFA Key 及其可恢复运行状态。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    key: str = ""
+    enabled: bool = True
+    runtime_state: FofaRuntimeState = "ready"
+    failure_kind: FofaFailureKindValue = ""
+    failure_count: int = Field(default=0, ge=0)
+    cooldown_until: datetime | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized or "/" in normalized or "\\" in normalized:
+            raise ValueError("FOFA Key 名称必须非空且可用于 API 路径")
+        if normalized.casefold() == "order":
+            raise ValueError("FOFA Key 名称不能使用保留字 order")
+        return normalized
 
 
 class LLMProviderConfig(BaseModel):

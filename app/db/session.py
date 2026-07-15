@@ -68,6 +68,7 @@ _MIGRATIONS = [
     ("killsweeps", "affected_table", "JSON DEFAULT '[]'"),
     ("system_settings", "engines", "JSON DEFAULT '{}'"),
     ("system_settings", "llm_providers", "JSON DEFAULT '[]'"),
+    ("system_settings", "fofa_keys", "JSON DEFAULT '[]'"),
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
     ("tasks", "hunt_direction", "TEXT DEFAULT ''"),
     ("tasks", "search_enabled", "BOOLEAN DEFAULT 1"),

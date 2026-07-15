@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import LLMConfig, LLMProviderConfig
+from app.config import FofaKeyConfig, LLMConfig, LLMProviderConfig
 from app.agents.prompts import normalize_worker_prompt_version
 from app.db.models import SystemSettings, Task, to_cst_iso
 from app.db.session import SessionLocal
@@ -35,6 +35,7 @@ _cache: dict[str, Any] = {
     "llm": {},
     "llm_providers": [],
     "fofa": {},
+    "fofa_keys": [],
     "engines": {},
     "defaults": {},
 }
@@ -152,6 +153,7 @@ def effective_settings() -> dict[str, Any]:
         "llm": _merge_section(_cache.get("llm"), _env_llm()),
         "llm_providers": [provider.model_dump(mode="json") for provider in providers],
         "fofa": _merge_section(_cache.get("fofa"), _env_fofa()),
+        "fofa_keys": deepcopy(_cache.get("fofa_keys") or []),
         "engines": _merge_section(_cache.get("engines"), _env_engines()),
         "defaults": _merge_section(_cache.get("defaults"), _env_defaults()),
     }
@@ -292,6 +294,51 @@ def resolve_llm_config(task: Task | None = None) -> LLMConfig:
         providers[0],
     )
     return LLMConfig.model_validate(selected.model_dump())
+
+
+def _fofa_key_from_value(value: Any) -> FofaKeyConfig:
+    if isinstance(value, FofaKeyConfig):
+        return value.model_copy(deep=True)
+    return FofaKeyConfig.model_validate(value)
+
+
+def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
+    """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
+    if task is not None:
+        task_key = str((task.fofa_config or {}).get("key") or "").strip()
+        if task_key:
+            return [FofaKeyConfig(name="Task override", key=task_key)]
+
+    stored_pool = list(_cache.get("fofa_keys") or [])
+    if stored_pool:
+        keys: list[FofaKeyConfig] = []
+        for item in stored_pool:
+            try:
+                keys.append(_fofa_key_from_value(item))
+            except (TypeError, ValidationError):
+                logger.error(
+                    "忽略无法解析的缓存 FOFA Key: name=%s",
+                    item.get("name") if isinstance(item, dict) else "<unknown>",
+                )
+        return keys
+
+    fofa = dict(_cache.get("fofa") or {})
+    engines = dict(_cache.get("engines") or {})
+    engine_fofa = engines.get("fofa") or {}
+    if not isinstance(engine_fofa, dict):
+        engine_fofa = {}
+    key = str(
+        fofa.get("key")
+        or engine_fofa.get("key")
+        or os.environ.get("FOFA_KEY", "")
+    ).strip()
+    return [
+        FofaKeyConfig(
+            name="Legacy Key",
+            key=key,
+            enabled=fofa.get("enabled") is not False,
+        )
+    ]
 
 
 # ── 引擎相关解析函数 ──────────────────────────────────────────
@@ -502,10 +549,18 @@ def _publish_settings_cache(row: SystemSettings) -> None:
         providers = []
     else:
         providers = [deepcopy(raw_providers)]
+    raw_fofa_keys = row.fofa_keys
+    if isinstance(raw_fofa_keys, list):
+        fofa_keys = deepcopy(raw_fofa_keys)
+    elif raw_fofa_keys is None:
+        fofa_keys = []
+    else:
+        fofa_keys = [deepcopy(raw_fofa_keys)]
     _cache = {
         "llm": dict(row.llm or {}),
         "llm_providers": providers,
         "fofa": dict(row.fofa or {}),
+        "fofa_keys": fofa_keys,
         "engines": dict(row.engines or {}),
         "defaults": dict(row.defaults or {}),
         "updated_at": to_cst_iso(row.updated_at),

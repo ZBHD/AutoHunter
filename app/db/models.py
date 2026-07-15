@@ -570,4 +570,5 @@ class SystemSettings(Base):
     engines: Mapped[dict] = mapped_column(JSON, default=dict)   # {engine_name: {key, base_url, ...}}
     defaults: Mapped[dict] = mapped_column(JSON, default=dict)  # concurrency/skip_score_threshold/engine
     llm_providers: Mapped[list] = mapped_column(JSON, default=list)
+    fofa_keys: Mapped[list] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
