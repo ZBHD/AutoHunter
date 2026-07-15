@@ -554,10 +554,14 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
     )
 
 
-def parse_src_output(tool: str, output: str) -> SrcParseResult:
-    """Parse bounded CLI output into normalized, scope-neutral candidates."""
+def parse_src_output(
+    tool: str,
+    output: str,
+    scope_target: str = "",
+) -> SrcParseResult:
+    """Parse bounded CLI output into normalized candidates."""
 
-    return _parse_src_text(tool, output)
+    return _parse_src_text(tool, output, scope_target=scope_target)
 
 
 def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:

@@ -420,7 +420,10 @@ def test_executor_runs_src_plan_without_shell_and_reports_missing_binary(monkeyp
         {"url": "https://app.example.test/?q=1;touch+/tmp/pwn"},
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["process_ok"] is True
+    assert result["parse_ok"] is False
+    assert result["failure_kind"] == "capture_unavailable"
     assert isinstance(captured["command"], list)
     assert captured["shell"] is False
     assert "https://app.example.test/?q=1;touch+/tmp/pwn" in captured["command"]

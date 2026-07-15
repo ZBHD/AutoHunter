@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.tools import executor as executor_module
 from app.tools.executor import ToolExecutor
+from app.tools.src_toolkit import build_src_plan
 
 
 EXPECTED_CHUNK_SIZE = 1024 * 1024
@@ -137,6 +138,337 @@ def test_http_full_capture_drains_response_after_preview_limit(tmp_path, monkeyp
     assert request_bytes.endswith(b"\r\n\r\nrequest-body")
 
 
+@pytest.mark.parametrize("follow_redirects", [False, True])
+def test_http_external_redirect_is_recorded_without_second_request(
+    tmp_path, monkeypatch, follow_redirects
+) -> None:
+    seen: list[str] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": "https://outside.test/landing"},
+            text="redirect",
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return real_client(
+            transport=transport,
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout", 20),
+            cookies=kwargs.get("cookies"),
+        )
+
+    monkeypatch.setattr(executor_module.httpx, "Client", client_factory)
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(tmp_path),
+        scope_target="https://app.test",
+    ).http_request("https://app.test/login", follow_redirects=follow_redirects)
+
+    assert result["ok"] is True
+    assert result["status_code"] == 302
+    assert result["redirect_blocked"] is True
+    assert result["redirect_location"] == "https://outside.test/landing"
+    assert seen == ["https://app.test/login"]
+
+
+def test_http_rejects_initial_cross_scope_url_before_network(tmp_path, monkeypatch) -> None:
+    def fail_client(**_kwargs):
+        raise AssertionError("cross-scope request reached the network")
+
+    monkeypatch.setattr(executor_module.httpx, "Client", fail_client)
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(tmp_path),
+        scope_target="https://app.test",
+    ).http_request("https://outside.test/private")
+
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["failure_kind"] == "scope"
+
+
+def test_http_same_host_redirects_stop_after_three_hops(tmp_path, monkeypatch) -> None:
+    seen: list[str] = []
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        step = int(request.url.path.strip("/") or "0")
+        return httpx.Response(
+            302,
+            headers={"location": f"https://app.test/{step + 1}"},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return real_client(
+            transport=transport,
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout", 20),
+            cookies=kwargs.get("cookies"),
+        )
+
+    monkeypatch.setattr(executor_module.httpx, "Client", client_factory)
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(tmp_path),
+        scope_target="https://app.test",
+    ).http_request("https://app.test/0", follow_redirects=True)
+
+    assert result["status_code"] == 302
+    assert result["redirect_limit_reached"] is True
+    assert seen == ["/0", "/1", "/2", "/3"]
+
+
+def test_run_src_tool_merges_process_and_parse_status(tmp_path, monkeypatch) -> None:
+    payload = b'{"url":"https://app.test/admin","status_code":403}\n'
+    capture = _spool_descriptor(tmp_path, payload)
+    capture["tool"] = "probe_http"
+    plan = build_src_plan(
+        "probe_http",
+        {"url": "https://app.test"},
+        scope_target="https://app.test",
+    )
+    monkeypatch.setattr(executor_module, "build_src_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "ok": True,
+            "return_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": payload.decode(),
+            "_capture": capture,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(Path(executor_module.worker_config.work_root)),
+        capture_full=True,
+        scope_target="https://app.test",
+    ).run_src_tool("probe_http", {"url": "https://app.test"})
+
+    assert result["ok"] is True
+    assert result["process_ok"] is True
+    assert result["parse_ok"] is True
+    assert result["failure_kind"] == ""
+    assert result["summary"]["count"] == 1
+
+
+def test_run_src_tool_marks_preview_fallback_incomplete(tmp_path, monkeypatch) -> None:
+    payload = '{"url":"https://app.test/admin","status_code":403}\n'
+    plan = build_src_plan(
+        "probe_http",
+        {"url": "https://app.test"},
+        scope_target="https://app.test",
+    )
+    monkeypatch.setattr(executor_module, "build_src_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "ok": True,
+            "return_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": payload,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(tmp_path),
+        scope_target="https://app.test",
+    ).run_src_tool("probe_http", {"url": "https://app.test"})
+
+    assert result["process_ok"] is True
+    assert result["parse_ok"] is True
+    assert result["ok"] is False
+    assert result["failure_kind"] == "capture_unavailable"
+    assert result["summary"]["partial"] is True
+    assert result["summary"]["remaining_unknown"] is True
+
+
+def test_run_src_tool_preview_fallback_filters_cross_scope_candidates(
+    tmp_path, monkeypatch
+) -> None:
+    payload = '{"url":"https://outside.test/admin","status_code":403}\n'
+    plan = build_src_plan(
+        "probe_http",
+        {"url": "https://app.test"},
+        scope_target="https://app.test",
+    )
+    monkeypatch.setattr(executor_module, "build_src_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "ok": True,
+            "return_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": payload,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(tmp_path),
+        scope_target="https://app.test",
+    ).run_src_tool("probe_http", {"url": "https://app.test"})
+
+    assert result["summary"]["count"] == 0
+    assert any("scope filtered" in error for error in result["summary"]["parse_errors"])
+
+
+@pytest.mark.parametrize(
+    ("process_fields", "expected_failure"),
+    [
+        ({"ok": False, "return_code": 2}, "nonzero_exit"),
+        ({"ok": False, "return_code": -9, "timed_out": True}, "timeout"),
+        ({"ok": False, "return_code": -9, "cancelled": True}, "cancelled"),
+    ],
+)
+def test_run_src_tool_preserves_candidates_from_failed_process(
+    tmp_path, monkeypatch, process_fields, expected_failure
+) -> None:
+    payload = b'{"url":"https://app.test/admin","status_code":403}\n'
+    capture = _spool_descriptor(tmp_path, payload, status="partial")
+    capture["tool"] = "probe_http"
+    plan = build_src_plan(
+        "probe_http",
+        {"url": "https://app.test"},
+        scope_target="https://app.test",
+    )
+    monkeypatch.setattr(executor_module, "build_src_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "output": payload.decode(),
+            "timed_out": False,
+            "cancelled": False,
+            "_capture": capture,
+            **process_fields,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(Path(executor_module.worker_config.work_root)),
+        capture_full=True,
+        scope_target="https://app.test",
+    ).run_src_tool("probe_http", {"url": "https://app.test"})
+
+    assert result["process_ok"] is False
+    assert result["parse_ok"] is True
+    assert result["ok"] is False
+    assert result["failure_kind"] == expected_failure
+    assert result["summary"]["count"] == 1
+
+
+def test_run_src_tool_successful_empty_output_is_not_a_success(tmp_path, monkeypatch) -> None:
+    capture = _spool_descriptor(tmp_path, b"")
+    capture["tool"] = "probe_http"
+    plan = build_src_plan(
+        "probe_http",
+        {"url": "https://app.test"},
+        scope_target="https://app.test",
+    )
+    monkeypatch.setattr(executor_module, "build_src_plan", lambda *_a, **_k: plan)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "ok": True,
+            "return_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": "",
+            "_capture": capture,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(Path(executor_module.worker_config.work_root)),
+        capture_full=True,
+        scope_target="https://app.test",
+    ).run_src_tool("probe_http", {"url": "https://app.test"})
+
+    assert result["process_ok"] is True
+    assert result["parse_ok"] is False
+    assert result["ok"] is False
+    assert result["failure_kind"] == "empty"
+
+
+def test_probe_follow_redirects_is_resolved_by_executor_before_cli(tmp_path, monkeypatch) -> None:
+    payload = b'{"url":"https://app.test/final","status_code":200}\n'
+    capture = _spool_descriptor(tmp_path, payload)
+    capture["tool"] = "probe_http"
+    plans: list[dict] = []
+
+    def fake_build(tool, args, **kwargs):
+        plans.append(dict(args))
+        return build_src_plan(tool, args, **kwargs)
+
+    monkeypatch.setattr(executor_module, "build_src_plan", fake_build)
+    monkeypatch.setattr(executor_module.shutil, "which", lambda _binary: "httpx")
+    monkeypatch.setattr(
+        ToolExecutor,
+        "http_request",
+        lambda self, **_kwargs: {
+            "ok": True,
+            "status_code": 302,
+            "final_url": "https://app.test/final",
+            "redirect_chain": ["302 GET https://app.test/start", "200 GET https://app.test/final"],
+        },
+    )
+    monkeypatch.setattr(
+        ToolExecutor,
+        "_run_process",
+        lambda *_a, **_k: {
+            "ok": True,
+            "return_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "output": payload.decode(),
+            "_capture": capture,
+        },
+    )
+
+    result = ToolExecutor(
+        "https://app.test",
+        work_dir=str(Path(executor_module.worker_config.work_root)),
+        capture_full=True,
+        scope_target="https://app.test",
+    ).run_src_tool(
+        "probe_http",
+        {"url": "https://app.test/start", "follow_redirects": True},
+    )
+
+    assert result["ok"] is True
+    assert plans[0]["url"] == "https://app.test/start"
+    assert plans[-1]["url"] == "https://app.test/final"
+    assert result["redirect_chain"][-1].endswith("https://app.test/final")
+
+
 def test_http_redirect_chain_persists_intermediate_cookies_for_next_request(
     tmp_path, monkeypatch
 ) -> None:
@@ -149,24 +481,24 @@ def test_http_redirect_chain_persists_intermediate_cookies_for_next_request(
             return httpx.Response(
                 302,
                 headers={
-                    "location": "https://app.test/consume",
+                    "location": "https://auth.test/consume",
                     "set-cookie": "CASTGC=auth-ticket; Path=/",
                 },
                 request=request,
             )
-        if request.url.host == "app.test" and request.url.path == "/consume":
+        if request.url.host == "auth.test" and request.url.path == "/consume":
             return httpx.Response(
                 302,
                 headers={
-                    "location": "https://app.test/home",
+                    "location": "https://auth.test/home",
                     "set-cookie": "JSESSIONID=app-session; Path=/",
                 },
                 request=request,
             )
-        if request.url.host == "app.test" and request.url.path == "/home":
+        if request.url.host == "auth.test" and request.url.path == "/home":
             return httpx.Response(200, text="home", request=request)
-        if request.url.host == "app.test" and request.url.path == "/private":
-            if request.headers.get("cookie") == "JSESSIONID=app-session":
+        if request.url.host == "auth.test" and request.url.path == "/private":
+            if "JSESSIONID=app-session" in str(request.headers.get("cookie")):
                 return httpx.Response(200, text="private", request=request)
             return httpx.Response(401, text="login required", request=request)
         return httpx.Response(404, request=request)
@@ -185,20 +517,24 @@ def test_http_redirect_chain_persists_intermediate_cookies_for_next_request(
     executor = ToolExecutor("https://auth.test", work_dir=str(tmp_path))
 
     login = executor.http_request("https://auth.test/login", follow_redirects=True)
-    private = executor.http_request("https://app.test/private")
+    private = executor.http_request("https://auth.test/private")
 
     assert login["status_code"] == 200
     assert login["redirect_chain"] == [
         "302 GET https://auth.test/login",
-        "302 GET https://app.test/consume",
-        "200 GET https://app.test/home",
+        "302 GET https://auth.test/consume",
+        "200 GET https://auth.test/home",
     ]
-    assert login["final_url"] == "https://app.test/home"
+    assert login["final_url"] == "https://auth.test/home"
+    assert login["raw_request"].startswith("GET /login HTTP/")
     assert private["status_code"] == 200
-    assert ("app.test/home", "JSESSIONID=app-session") in seen
+    assert any(
+        item[0] == "auth.test/home" and "JSESSIONID=app-session" in str(item[1])
+        for item in seen
+    )
 
 
-def test_http_redirect_cookie_jar_keeps_same_name_cookies_scoped_by_domain(
+def test_http_redirect_cookie_jar_keeps_same_name_cookies_scoped_by_path(
     tmp_path, monkeypatch
 ) -> None:
     seen: list[tuple[str, str | None]] = []
@@ -210,19 +546,19 @@ def test_http_redirect_cookie_jar_keeps_same_name_cookies_scoped_by_domain(
             return httpx.Response(
                 302,
                 headers={
-                    "location": "https://app.test/home",
-                    "set-cookie": "SID=auth-session; Path=/",
+                    "location": "https://auth.test/app/home",
+                    "set-cookie": "SID=auth-session; Path=/auth",
                 },
                 request=request,
             )
-        if request.url.host == "app.test" and request.url.path == "/home":
+        if request.url.host == "auth.test" and request.url.path == "/app/home":
             return httpx.Response(
                 200,
-                headers={"set-cookie": "SID=app-session; Path=/"},
+                headers={"set-cookie": "SID=app-session; Path=/app"},
                 text="home",
                 request=request,
             )
-        if request.url.path == "/whoami":
+        if request.url.path.endswith("/whoami"):
             return httpx.Response(200, text=request.headers.get("cookie", ""), request=request)
         return httpx.Response(404, request=request)
 
@@ -240,8 +576,8 @@ def test_http_redirect_cookie_jar_keeps_same_name_cookies_scoped_by_domain(
     executor = ToolExecutor("https://auth.test", work_dir=str(tmp_path))
 
     executor.http_request("https://auth.test/login", follow_redirects=True)
-    auth_identity = executor.http_request("https://auth.test/whoami")
-    app_identity = executor.http_request("https://app.test/whoami")
+    auth_identity = executor.http_request("https://auth.test/auth/whoami")
+    app_identity = executor.http_request("https://auth.test/app/whoami")
 
     assert auth_identity["body"] == "SID=auth-session"
     assert app_identity["body"] == "SID=app-session"
