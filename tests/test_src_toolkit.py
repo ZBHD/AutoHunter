@@ -11,7 +11,12 @@ from app.agents.escalate import EscalateHunter
 from app.agents.history import bounded_tool_content
 from app.agents.worker import Worker
 from app.tools.executor import ToolExecutor
-from app.tools.schemas import ESCALATE_TOOL_SCHEMAS, TOOL_SCHEMAS
+from app.tools.schemas import (
+    ESCALATE_TOOL_SCHEMAS,
+    TOOL_SCHEMAS,
+    escalate_tool_schemas,
+    tool_schemas_for,
+)
 from app.tools.src_toolkit import (
     SRC_TOOL_NAMES,
     SRC_TOOL_CATALOG,
@@ -28,9 +33,61 @@ def _tool_names(schemas: list[dict]) -> set[str]:
     return {item["function"]["name"] for item in schemas}
 
 
-def test_src_tool_schemas_are_available_to_worker_and_escalation() -> None:
+def test_src_tool_schemas_are_available_only_to_worker_role() -> None:
     assert SRC_TOOL_NAMES <= _tool_names(TOOL_SCHEMAS)
-    assert SRC_TOOL_NAMES <= _tool_names(ESCALATE_TOOL_SCHEMAS)
+    assert {"scan_nuclei", "verify_xss"}.isdisjoint(
+        _tool_names(ESCALATE_TOOL_SCHEMAS)
+    )
+    assert {"scan_nuclei", "verify_xss"}.isdisjoint(
+        _tool_names(escalate_tool_schemas())
+    )
+
+
+def test_stage_and_route_schema_visibility_is_fail_closed() -> None:
+    recon = _tool_names(
+        tool_schemas_for("recon", "worker", route_id="spa_js_api")
+    )
+    locate = _tool_names(
+        tool_schemas_for("locate", "worker", route_id="generic_admin_api")
+    )
+    verify = _tool_names(
+        tool_schemas_for("verify", "worker", route_id="generic_admin_api")
+    )
+    evidence = _tool_names(tool_schemas_for("evidence", "worker"))
+    unknown_route = _tool_names(
+        tool_schemas_for("locate", "worker", route_id="unknown_route")
+    )
+
+    assert {"probe_http", "fingerprint_waf", "scan_web_ports"} <= recon
+    assert "discover_content" in locate
+    assert "discover_parameters" not in locate
+    assert {"crawl_endpoints", "discover_content", "discover_parameters"}.isdisjoint(
+        verify
+    )
+    assert {"http_request", "compare_http_responses"} <= verify
+    assert {"submit_finding", "check_duplicate_finding", "finish"} <= evidence
+    assert "discover_parameters" not in unknown_route
+
+
+def test_stage_schema_roles_enterprise_filter_and_names_are_consistent() -> None:
+    worker_verify = _tool_names(tool_schemas_for("verify", "worker"))
+    escalate_verify = _tool_names(tool_schemas_for("verify", "escalate"))
+    enterprise_names = _tool_names(
+        tool_schemas_for("verify", "worker", enterprise=True)
+    )
+
+    assert {"scan_nuclei", "verify_xss"} <= worker_verify
+    assert {"scan_nuclei", "verify_xss"}.isdisjoint(escalate_verify)
+    assert {"http_request", "compare_http_responses"} <= escalate_verify
+    assert all(
+        SRC_TOOL_CATALOG[name].enterprise_allowed
+        for name in enterprise_names & SRC_TOOL_NAMES
+    )
+    for stage in ("recon", "locate", "verify", "evidence"):
+        schemas = tool_schemas_for(stage, "worker")
+        names = [item["function"]["name"] for item in schemas]
+        assert len(names) == len(set(names))
+    assert SRC_TOOL_NAMES <= set(SRC_TOOL_CATALOG)
 
 
 def test_http_probe_builds_bounded_same_host_argv() -> None:
@@ -470,7 +527,9 @@ def test_enterprise_src_hides_and_blocks_nuclei(monkeypatch, tmp_path: Path) -> 
     assert "scan_nuclei" not in _tool_names(hunter._tools)
 
 
-def test_worker_and_escalation_dispatch_src_tools(monkeypatch, tmp_path: Path) -> None:
+def test_worker_dispatches_src_tools_while_escalation_hides_worker_scanners(
+    monkeypatch, tmp_path: Path
+) -> None:
     from app.agents import worker as worker_module
 
     monkeypatch.setattr(worker_module.worker_config, "work_root", str(tmp_path))
@@ -496,17 +555,7 @@ def test_worker_and_escalation_dispatch_src_tools(monkeypatch, tmp_path: Path) -
         {"target_url": "https://app.example.test", "severity": "高危"},
         llm=SimpleNamespace(),
     )
-    monkeypatch.setattr(
-        hunter.executor,
-        "run_src_tool",
-        lambda name, args: calls.append((name, args)) or {"ok": True},
-    )
-    result = hunter._dispatch(
-        "scan_nuclei",
-        {"url": "https://app.example.test", "tags": ["exposure"]},
-    )
-    assert result["ok"] is True
-    assert calls[-1][0] == "scan_nuclei"
+    assert {"scan_nuclei", "verify_xss"}.isdisjoint(_tool_names(hunter._tools))
 
 
 def test_recent_src_tool_output_is_bounded(monkeypatch) -> None:

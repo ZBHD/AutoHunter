@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from app.agents import reviewer as reviewer_module
 from app.agents import worker as worker_module
 from app.agents.collector_llm import generate_query
+from app.agents.playbook_router import render_playbook_block, route_target
 from app.api import findings as findings_api
 from app.deepen_context import build_finding_deepen_context
 from app.llm.protocols import LLMResponse, ToolCall
@@ -30,6 +31,54 @@ class RecordingBackend:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "route_id", "sequence"),
+    [
+        (
+            {"url": "https://example.test", "body": "React webpack <script src=/app.js>"},
+            "spa_js_api",
+            (
+                "probe_http",
+                "crawl_endpoints",
+                "analyze_javascript",
+                "http_request",
+                "compare_http_responses",
+            ),
+        ),
+        (
+            {"url": "https://example.test/admin", "title": "Admin Login"},
+            "generic_admin_api",
+            ("probe_http", "discover_content", "http_request"),
+        ),
+        (
+            {"url": "https://example.test/upload", "body": "upload export order"},
+            "upload_business_idor",
+            (
+                "crawl_endpoints",
+                "discover_parameters",
+                "http_request",
+                "compare_http_responses",
+            ),
+        ),
+        (
+            {
+                "url": "https://example.test/api/item/1",
+                "deepen_context": {"directive": "verify object access", "source": "worker_lead"},
+            },
+            "directed_deepen",
+            ("http_request", "compare_http_responses"),
+        ),
+    ],
+)
+def test_route_plan_exposes_exact_tool_sequence(kwargs, route_id, sequence) -> None:
+    plan = route_target(**kwargs)
+
+    assert plan.route_id == route_id
+    assert plan.tool_sequence == sequence
+    assert plan.as_dict()["tool_sequence"] == list(sequence)
+    assert "下一阶段工具" in render_playbook_block(plan)
 
 
 def _capture_first_worker_messages(monkeypatch, **worker_kwargs):

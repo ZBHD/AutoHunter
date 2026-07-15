@@ -25,6 +25,29 @@ SRC_TOOL_NAMES = frozenset({
     "scan_web_ports",
 })
 ENTERPRISE_BLOCKED_SRC_TOOLS = frozenset({"scan_nuclei", "verify_xss"})
+DEFAULT_ROUTE_TOOL_SEQUENCE = (
+    "probe_http",
+    "crawl_endpoints",
+    "http_request",
+    "compare_http_responses",
+)
+ROUTE_TOOL_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "spa_js_api": (
+        "probe_http",
+        "crawl_endpoints",
+        "analyze_javascript",
+        "http_request",
+        "compare_http_responses",
+    ),
+    "generic_admin_api": ("probe_http", "discover_content", "http_request"),
+    "upload_business_idor": (
+        "crawl_endpoints",
+        "discover_parameters",
+        "http_request",
+        "compare_http_responses",
+    ),
+    "directed_deepen": ("http_request", "compare_http_responses"),
+}
 
 _WORDLIST_FILES = {
     "common": "src-common.txt",
@@ -71,15 +94,16 @@ SRC_TOOL_CATALOG: dict[str, ToolSpec] = {
         ("host",), ("service",), 1, 150, "service",
     ),
     "crawl_endpoints": ToolSpec(
-        "crawl_endpoints", "locate", ("worker",), (), True,
+        "crawl_endpoints", "locate", ("worker",),
+        ("spa_js_api", "generic_admin_api", "upload_business_idor"), True,
         ("url",), ("endpoint", "parameter", "js_asset"), 50, 180, "endpoint",
     ),
     "discover_content": ToolSpec(
-        "discover_content", "locate", ("worker",), (), True,
+        "discover_content", "locate", ("worker",), ("generic_admin_api",), True,
         ("url", "wordlist"), ("endpoint", "path_candidate"), 50, 210, "endpoint",
     ),
     "discover_parameters": ToolSpec(
-        "discover_parameters", "locate", ("worker",), (), True,
+        "discover_parameters", "locate", ("worker",), ("upload_business_idor",), True,
         ("url",), ("parameter",), 20, 180, "parameter",
     ),
     "scan_nuclei": ToolSpec(
@@ -1035,7 +1059,9 @@ def build_src_plan(
 
 
 __all__ = [
+    "DEFAULT_ROUTE_TOOL_SEQUENCE",
     "ENTERPRISE_BLOCKED_SRC_TOOLS",
+    "ROUTE_TOOL_SEQUENCES",
     "SRC_TOOL_NAMES",
     "SRC_TOOL_CATALOG",
     "SrcToolError",
