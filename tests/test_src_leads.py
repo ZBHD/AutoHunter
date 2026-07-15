@@ -148,6 +148,22 @@ def test_single_slash_opaque_authority_is_sanitized(value: str) -> None:
     assert "SECRET" not in repr(candidate)
 
 
+@pytest.mark.parametrize("value", ["https:/user@host/path?token=USERSECRET", "user@host/path?token=RELSECRET"])
+def test_username_only_authority_is_sanitized(value: str) -> None:
+    candidate = _candidate(value=value)
+
+    assert "user@" not in repr(candidate)
+    assert "SECRET" not in repr(candidate)
+
+
+@pytest.mark.parametrize("method", ["PROPFIND", "LOCK", "CUSTOMVERB"])
+def test_url_shaped_targets_accept_extended_method_tokens(method: str) -> None:
+    candidate = _candidate(value=f"{method} https://host/path?token=METHODSECRET")
+
+    assert candidate.value == "https://host/path?token="
+    assert "METHODSECRET" not in repr(candidate)
+
+
 @pytest.mark.parametrize("value", ["OpenSSH 8.2", "Apache httpd 2.4", "Potential SSRF hypothesis"])
 def test_non_http_leading_tokens_are_not_treated_as_methods(value: str) -> None:
     candidate = _candidate(kind="fingerprint", value=value, endpoint_key=value)

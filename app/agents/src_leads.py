@@ -20,7 +20,6 @@ _LOCATIONS = {"path", "query", "body", "header", "cookie", "fragment", "unknown"
 _STATUSES = {"pending", "verified", "failed", "inconclusive", "skipped"}
 _INCONCLUSIVE_OUTCOMES = {"timeout", "network", "insufficient", "inconclusive"}
 _METHOD_PREFIX = re.compile(r"^(?P<method>[A-Za-z]+)\s+(?P<target>.+)$")
-_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
 
 
 def _raw_text(value: object) -> str:
@@ -56,12 +55,12 @@ def _strip_bare_userinfo(path: str) -> str:
     if "@" not in path:
         return path
     prefix, suffix = path.rsplit("@", 1)
-    if ":" in prefix and "/" not in prefix:
+    if prefix and "/" not in prefix and re.fullmatch(r"[^/@:?#\s]+(?::[^/@?#\s]*)?", prefix):
         return suffix
     return path
 
 
-_PATH_USERINFO = re.compile(r"(?:(?<=/)|^)[^/@:?#\s]+:[^/@?#\s]*@")
+_PATH_USERINFO = re.compile(r"(?:(?<=/)|^)[^/@:?#\s]+(?::[^/@?#\s]*)?@")
 
 
 def _scrub_path_userinfo(path: str) -> str:
@@ -77,6 +76,8 @@ def _normalize_opaque_scheme(raw: str) -> str:
     if not match:
         return raw
     scheme = match.group("scheme").lower()
+    if scheme not in {"http:", "https:"}:
+        return raw
     rest = match.group("rest")
     if rest.startswith("//"):
         # Collapse excess slashes so ``https:////user:pass@host`` still gets
@@ -89,13 +90,13 @@ def _normalize_opaque_scheme(raw: str) -> str:
         authority, separator, tail = stripped.partition("/")
         if "@" in authority:
             userinfo, host = authority.rsplit("@", 1)
-            if ":" in userinfo:
+            if userinfo:
                 return f"{scheme}//{host}" + (f"/{tail}" if separator else "")
 
     authority, separator, tail = rest.partition("/")
     if "@" in authority:
         userinfo, host = authority.rsplit("@", 1)
-        if ":" in userinfo:
+        if userinfo:
             return f"{scheme}//{host}" + (f"/{tail}" if separator else "")
     return raw
 
@@ -108,8 +109,6 @@ def _split_http_method_target(raw: str) -> tuple[str, str]:
         return "", raw
     method = match.group("method").upper()
     target = match.group("target")
-    if method not in _HTTP_METHODS:
-        return "", raw
     looks_like_url = (
         target.startswith("/")
         or re.match(r"^https?://", target, re.IGNORECASE) is not None
