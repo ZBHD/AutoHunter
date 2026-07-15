@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from app.engines.base import EngineResult, SearchEngine, register_engine
+from app.fofa.client import FofaError, classify_fofa_failure
 
 BASE = "https://fofa.info"
 
@@ -19,27 +20,48 @@ _FOFA_ALLOWED_HOSTS = {
 }
 
 
-class FofaError(Exception):
-    def __init__(self, message: str, account_error: bool = False):
-        super().__init__(message)
-        self.account_error = account_error
-
-
-_FOFA_ACCOUNT_ERROR_MARKERS = (
-    "820000", "820001", "-700", "账号无效", "账号已过期", "账号过期",
-    "无效的fofa", "无效的 fofa", "f点不足", "f币不足", "余额不足", "配额",
-    "权限不足", "没有权限", "会员", "account invalid", "invalid key",
-    "expired", "insufficient", "quota", "permission", "unauthorized", "forbidden",
-)
-
-
-def _is_account_error(errmsg: str) -> bool:
-    text = str(errmsg or "").lower()
-    return any(m in text for m in _FOFA_ACCOUNT_ERROR_MARKERS)
-
-
 def _qbase64(query: str) -> str:
     return base64.b64encode(query.encode("utf-8")).decode("ascii")
+
+
+def _structured_error(
+    message: str,
+    *,
+    status: int | None = None,
+    retry_after: Any = None,
+    display_message: str | None = None,
+) -> FofaError:
+    kind, code, retry_seconds = classify_fofa_failure(
+        message,
+        status=status,
+        retry_after=retry_after,
+    )
+    return FofaError(
+        display_message or message,
+        kind=kind,
+        code=code,
+        retry_after=retry_seconds,
+    )
+
+
+def _retry_after(response: Any) -> Any:
+    headers = getattr(response, "headers", None)
+    return headers.get("Retry-After") if headers is not None else None
+
+
+def _error_message(data: Any, fallback: str) -> str:
+    if isinstance(data, dict):
+        message = data.get("errmsg") or data.get("message")
+        if message:
+            return str(message)
+    return fallback
+
+
+def _classification_message(message: str, data: Any) -> str:
+    if not isinstance(data, dict):
+        return message
+    error_code = data.get("code") or data.get("errcode") or data.get("error_code")
+    return f"[{error_code}] {message}" if error_code else message
 
 
 @register_engine
@@ -90,15 +112,42 @@ class FofaEngine(SearchEngine):
                 try:
                     data = resp.json()
                 except Exception:
-                    raise FofaError(f"FOFA 返回非 JSON (HTTP {resp.status_code}): {resp.text[:200]}")
+                    message = str(getattr(resp, "text", ""))[:200]
+                    raise _structured_error(
+                        message,
+                        status=resp.status_code,
+                        retry_after=_retry_after(resp),
+                        display_message=(
+                            f"FOFA 返回非 JSON (HTTP {resp.status_code}): {message}"
+                        ),
+                    )
         except FofaError:
             raise
         except httpx.HTTPError as e:
-            raise FofaError(f"FOFA 请求失败: {type(e).__name__}: {e}") from e
+            message = f"{type(e).__name__}: {e}"
+            raise _structured_error(
+                message,
+                display_message=f"FOFA 请求失败: {message}",
+            ) from e
 
+        if not isinstance(data, dict):
+            raise FofaError("FOFA 返回无效 JSON 数据")
+        if not 200 <= resp.status_code < 300:
+            errmsg = _error_message(data, str(getattr(resp, "text", ""))[:200])
+            raise _structured_error(
+                _classification_message(errmsg, data),
+                status=resp.status_code,
+                retry_after=_retry_after(resp),
+                display_message=f"FOFA 返回 HTTP {resp.status_code}: {errmsg}",
+            )
         if data.get("error"):
-            errmsg = data.get("errmsg")
-            raise FofaError(f"FOFA 错误: {errmsg}", account_error=_is_account_error(errmsg))
+            errmsg = _error_message(data, "未知错误")
+            raise _structured_error(
+                _classification_message(errmsg, data),
+                status=resp.status_code,
+                retry_after=_retry_after(resp),
+                display_message=f"FOFA 错误: {errmsg}",
+            )
 
         return EngineResult(
             fields=fields.split(","),
