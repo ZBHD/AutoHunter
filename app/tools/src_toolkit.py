@@ -284,6 +284,7 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
     tail_candidates: deque[tuple[int, SrcCandidate]] = deque(maxlen=_SUMMARY_WIDTH)
     priority_candidates: list[tuple[int, SrcCandidate]] = []
     candidate_count = 0
+    record_limit_hit = False
 
     def add_error(message: str) -> None:
         if len(errors) < 64:
@@ -310,7 +311,10 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
 
     if name in {"probe_http", "crawl_endpoints", "discover_content", "scan_nuclei", "verify_xss"}:
         records_seen = False
-        for record in _json_records(text, errors):
+        for record_number, record in enumerate(_json_records(text, errors), 1):
+            if record_number > _MAX_PARSE_LINES:
+                record_limit_hit = True
+                break
             records_seen = True
             url = _record_url(record)
             if not url:
@@ -336,7 +340,10 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
             add_error("no JSON records")
     elif name == "fingerprint_waf":
         records_seen = False
-        for record in _json_records(text, errors):
+        for record_number, record in enumerate(_json_records(text, errors), 1):
+            if record_number > _MAX_PARSE_LINES:
+                record_limit_hit = True
+                break
             records_seen = True
             url = _record_url(record)
             firewall = record.get("firewall") or record.get("waf") or record.get("manufacturer") or record.get("name")
@@ -411,6 +418,10 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
             add_error("no open service lines")
     else:
         add_error(f"unsupported SRC parser: {name}")
+
+    if record_limit_hit:
+        partial = True
+        remaining_unknown = True
 
     # Keep summaries stable and bounded while count remains the number admitted.
     head = tuple(candidate for _index, candidate in head_candidates)
