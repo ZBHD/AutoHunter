@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 
 from app.engines.base import EngineResult, SearchEngine, register_engine
-from app.fofa.client import FofaError, classify_fofa_failure, redact_fofa_secrets
+from app.fofa.client import (
+    FofaError,
+    classify_fofa_failure,
+    extract_fofa_error,
+    extract_fofa_response_failure,
+    redact_fofa_secrets,
+)
 
 BASE = "https://fofa.info"
 
@@ -52,21 +58,6 @@ def _structured_error(
 def _retry_after(response: Any) -> Any:
     headers = getattr(response, "headers", None)
     return headers.get("Retry-After") if headers is not None else None
-
-
-def _error_message(data: Any, fallback: str) -> str:
-    if isinstance(data, dict):
-        message = data.get("errmsg") or data.get("message")
-        if message:
-            return str(message)
-    return fallback
-
-
-def _classification_message(message: str, data: Any) -> str:
-    if not isinstance(data, dict):
-        return message
-    error_code = data.get("code") or data.get("errcode") or data.get("error_code")
-    return f"[{error_code}] {message}" if error_code else message
 
 
 @register_engine
@@ -116,7 +107,7 @@ class FofaEngine(SearchEngine):
                 resp = await client.get(f"{base}/api/v1/search/all", params=params)
                 if not 200 <= resp.status_code < 300:
                     raise _structured_error(
-                        f"HTTP {resp.status_code}",
+                        extract_fofa_response_failure(resp),
                         status=resp.status_code,
                         retry_after=_retry_after(resp),
                         display_message=f"FOFA 返回 HTTP {resp.status_code}",
@@ -150,9 +141,9 @@ class FofaEngine(SearchEngine):
                 key=api_key,
             )
         if data.get("error"):
-            errmsg = _error_message(data, "未知错误")
+            failure_message, errmsg = extract_fofa_error(data, "未知错误")
             raise _structured_error(
-                _classification_message(errmsg, data),
+                failure_message,
                 status=resp.status_code,
                 retry_after=_retry_after(resp),
                 display_message=f"FOFA 错误: {errmsg}",

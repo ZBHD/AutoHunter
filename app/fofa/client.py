@@ -95,7 +95,7 @@ def _extract_error_code(message: str, status: int | None) -> str:
     for code in _FOFA_KNOWN_CODES:
         if code in message:
             return code
-    if status is not None and status >= 400:
+    if status is not None and not 200 <= status < 300:
         return str(status)
     return ""
 
@@ -128,23 +128,38 @@ def classify_fofa_failure(
     return "transient", code, retry_seconds
 
 
-def _error_message(data: Any, fallback: str) -> str:
-    if not isinstance(data, dict):
-        return fallback
-    for key in ("errmsg", "message"):
-        value = data.get(key)
-        if value:
-            return str(value)
-    if isinstance(data.get("error"), str):
-        return str(data["error"])
-    return fallback
+def extract_fofa_error(data: Any, fallback: str) -> tuple[str, str]:
+    """提取用于分类的完整错误文本和用于展示的原始错误文案。"""
+    if isinstance(data, dict):
+        message = fallback
+        for key in ("errmsg", "message"):
+            value = data.get(key)
+            if value:
+                message = str(value)
+                break
+        else:
+            if isinstance(data.get("error"), str) and data["error"]:
+                message = str(data["error"])
+        error_code = data.get("code") or data.get("errcode") or data.get("error_code")
+        classification_message = f"[{error_code}] {message}" if error_code else message
+        return classification_message, message
+    if isinstance(data, str) and data:
+        message = data[:200]
+        return message, message
+    return fallback, fallback
 
 
-def _classification_message(message: str, data: Any) -> str:
-    if not isinstance(data, dict):
-        return message
-    error_code = data.get("code") or data.get("errcode") or data.get("error_code")
-    return f"[{error_code}] {message}" if error_code else message
+def extract_fofa_response_failure(response: Any) -> str:
+    """尽力从非 2xx 响应提取分类信号；调用方应使用固定展示文案。"""
+    status = int(getattr(response, "status_code", 0) or 0)
+    fallback = f"HTTP {status}"
+    try:
+        data = response.json()
+    except Exception:
+        text = str(getattr(response, "text", ""))[:200]
+        return text or fallback
+    classification_message, _display_message = extract_fofa_error(data, fallback)
+    return classification_message
 
 
 def _retry_after(response: Any) -> Any:
@@ -228,7 +243,7 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
             resp = await client.get(f"{base}/api/v1/search/all", params=params)
             if not 200 <= resp.status_code < 300:
                 raise _structured_error(
-                    f"HTTP {resp.status_code}",
+                    extract_fofa_response_failure(resp),
                     status=resp.status_code,
                     retry_after=_retry_after(resp),
                     display_message=f"FOFA 返回 HTTP {resp.status_code}",
@@ -263,9 +278,9 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
             key=key,
         )
     if data.get("error"):
-        errmsg = _error_message(data, "未知错误")
+        failure_message, errmsg = extract_fofa_error(data, "未知错误")
         raise _structured_error(
-            _classification_message(errmsg, data),
+            failure_message,
             status=resp.status_code,
             retry_after=_retry_after(resp),
             display_message=f"FOFA 错误: {errmsg}",
@@ -297,7 +312,7 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
             response = await client.get(url, params={"key": key})
         if not 200 <= response.status_code < 300:
             raise _structured_error(
-                f"HTTP {response.status_code}",
+                extract_fofa_response_failure(response),
                 status=response.status_code,
                 retry_after=_retry_after(response),
                 display_message=f"FOFA 返回 HTTP {response.status_code}",
@@ -331,9 +346,9 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
             key=key,
         )
     if data.get("error"):
-        message = _error_message(data, "账号不可用")
+        failure_message, message = extract_fofa_error(data, "账号不可用")
         raise _structured_error(
-            _classification_message(message, data),
+            failure_message,
             status=response.status_code,
             retry_after=_retry_after(response),
             display_message=f"FOFA 错误: {message}",

@@ -129,6 +129,13 @@ def test_network_failures_are_transient(message: str) -> None:
     assert classify(message)[0] == "transient"
 
 
+def test_redirect_status_is_used_as_fallback_code() -> None:
+    kind, code, _retry_after = classify("redirect", status=302)
+
+    assert kind == "transient"
+    assert code == "302"
+
+
 def test_search_http_429_raises_structured_rate_limit(monkeypatch) -> None:
     class Response:
         status_code = 429
@@ -432,3 +439,103 @@ def test_engine_classifies_non_2xx_before_json_shape(monkeypatch) -> None:
 
     assert exc_info.value.kind == "rate_limit"
     assert exc_info.value.code == "429"
+
+
+def test_engine_classifies_string_error_field(monkeypatch) -> None:
+    from app.engines.fofa import FofaEngine
+
+    class Response:
+        status_code = 200
+        text = ""
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"error": "daily quota exceeded"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(
+        "app.tools.netguard.assert_safe_outbound_url",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(fofa_client.FofaError) as exc_info:
+        asyncio.run(FofaEngine().search("key", 'domain="example.com"'))
+
+    assert exc_info.value.kind == "daily_limit"
+    assert exc_info.value.retry_after == 3600
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "text"),
+    [
+        (
+            "search",
+            {"error": True, "errmsg": "daily quota exceeded", "code": "820041"},
+            "",
+        ),
+        ("userinfo", "[820041] daily quota exceeded", ""),
+        ("engine", None, "[820041] daily quota exceeded"),
+    ],
+)
+def test_non_2xx_body_daily_limit_overrides_http_rate_status(
+    monkeypatch,
+    endpoint: str,
+    payload,
+    text: str,
+) -> None:
+    from app.engines.fofa import FofaEngine
+
+    class Response:
+        status_code = 429
+        headers = {}
+
+        def __init__(self):
+            self.text = text
+
+        @staticmethod
+        def json():
+            if payload is None:
+                raise ValueError("invalid json")
+            return payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(
+        "app.tools.netguard.assert_safe_outbound_url",
+        lambda *_args, **_kwargs: None,
+    )
+
+    if endpoint == "search":
+        operation = fofa_client.search("key", 'domain="example.com"')
+    elif endpoint == "userinfo":
+        operation = fofa_client.get_userinfo("key")
+    else:
+        operation = FofaEngine().search("key", 'domain="example.com"')
+
+    with pytest.raises(fofa_client.FofaError) as exc_info:
+        asyncio.run(operation)
+
+    assert exc_info.value.kind == "daily_limit"
+    assert exc_info.value.code == "820041"
+    assert exc_info.value.retry_after == 3600
+    assert str(exc_info.value) == "FOFA 返回 HTTP 429"
