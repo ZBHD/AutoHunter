@@ -19,6 +19,8 @@ def _observer_event(event: dict) -> dict:
         "level": event.get("level", "info"),
         "message": event.get("message", ""),
         "ts": event.get("ts"),
+        "site_route": event.get("site_route", ""),
+        "site_recon_mode": event.get("site_recon_mode", ""),
     }
 
 

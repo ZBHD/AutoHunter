@@ -610,6 +610,8 @@ class TaskRunner:
                     "round": item.get("round"),
                     "action": item.get("action"),
                     "mode": item.get("mode"),
+                    "site_route": item.get("site_route"),
+                    "site_recon_mode": item.get("site_recon_mode"),
                     "started_at": item.get("started_at"),
                     "last_activity_at": item.get("last_activity_at"),
                     "findings": item.get("findings"),
@@ -1870,6 +1872,11 @@ class TaskRunner:
                 st["action"] = f"记录情报: {data.get('intel_kind','')}"
             elif kind == "worker_finish":
                 st["action"] = f"收尾: {data.get('verdict','')}"
+            elif kind == "worker_start":
+                if "site_route" in data:
+                    st["site_route"] = data["site_route"]
+                if "site_recon_mode" in data:
+                    st["site_recon_mode"] = data["site_recon_mode"]
 
         def emit(kind: str, data: dict):
             if kind == "tool_capture_private":
@@ -2000,17 +2007,21 @@ class TaskRunner:
                     route = site_collab.route_for_source(tgt.source or "")
                     if route:
                         coverage_block = await self._build_coverage_context(session, task_id, tgt)
-                        target_meta["site_collab_route"] = {
-                            "source": route.source,
-                            "label": route.label,
-                            "focus": route.focus,
-                            "js_first": route.js_first,
-                        }
+                        route_meta = site_collab.runtime_route_meta(
+                            route, task_obj
+                        )
+                        target_meta["site_collab_route"] = route_meta
+                        self._live[target_id]["site_route"] = route_meta["source"]
+                        if route_meta["source"] == "site_map":
+                            self._live[target_id]["site_recon_mode"] = route_meta.get(
+                                "recon_mode", site_collab.SITE_RECON_FULL
+                            )
                         target_meta["site_collab_block"] = site_collab.render_context(
                             route,
                             site_info=(task_obj.fofa_query if task_obj else ""),
                             coverage_block=coverage_block,
                             focus_note=tgt.priority_reason or "",
+                            recon_mode=site_collab.recon_mode_for(task_obj),
                         )
                         self._live[target_id]["mode"] = "site"
                         self._live[target_id]["playbook"] = route.label

@@ -349,7 +349,10 @@ function fmtEvent(ev) {
   if (ev.message) return ev.message;
   const d = ev;
   switch (ev.kind) {
-    case "worker_start": return `开始挖掘 ${d.target || ""}${d.mode === "deepen" ? "（定向深挖）" : ""}`;
+    case "worker_start": {
+      const reconMode = siteReconModeLabel(d);
+      return `开始挖掘 ${d.target || ""}${reconMode ? `（${reconMode}）` : ""}${d.mode === "deepen" ? "（定向深挖）" : ""}`;
+    }
     case "collector_phase": return d.message || phaseLabel(d.phase) || "正在跑过滤器阶段";
     case "finding_submitted": return `🎯 发现漏洞 [${d.severity || ""}] ${d.title || ""}`;
     case "duplicate_checked": return d.duplicate ? `查重重复：${d.title || ""}` : null;
@@ -921,6 +924,11 @@ function parseEventTs(ts) {
   const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(ts);
   return new Date(hasTz ? ts : `${ts}Z`);
 }
+
+function siteReconModeLabel(item) {
+  if (item?.site_route !== "site_map") return "";
+  return item.site_recon_mode === "light" ? "轻量入口盘点" : "完整入口盘点";
+}
 </script>
 
 <template>
@@ -1161,6 +1169,7 @@ function parseEventTs(ts) {
         <div v-for="w in liveWorkers" :key="w.target_id" class="worker-card">
           <div class="wc-top">
             <span class="wc-host">{{ w.host }}</span>
+            <span v-if="siteReconModeLabel(w)" class="wc-recon-mode">{{ siteReconModeLabel(w) }}</span>
             <span class="wc-meta">
               <span v-if="w.score > 0" class="wc-score" :title="w.score_reason">★{{ w.score }}</span>
               第 {{ w.round }} 轮 · {{ elapsed(w.started_at) }}
