@@ -14,6 +14,7 @@ from app.agents import reviewer as reviewer_module
 from app.agents import worker as worker_module
 from app.agents.collector_llm import generate_query
 from app.api import findings as findings_api
+from app.deepen_context import build_finding_deepen_context
 from app.llm.protocols import LLMResponse, ToolCall
 from app.schemas import Finding
 
@@ -126,6 +127,56 @@ def test_worker_keeps_target_level_direction_ahead_of_task_direction(monkeypatch
     assert task_message.index("sentinel-site-route") < direction_index
     assert task_message.index("sentinel-deepen-directive") < direction_index
     assert "以更具体的目标级指令为先" in task_message
+
+
+def test_worker_receives_v1_evidence_layers_without_assistant_answers(monkeypatch) -> None:
+    finding = SimpleNamespace(
+        id="finding-context",
+        title="Context finding",
+        vuln_type="idor",
+        severity_claimed="高危",
+        target_url="https://example.test/api/users/1",
+        description="PRIOR_DESCRIPTION_SENTINEL",
+        affected_scope="PRIOR_SCOPE_SENTINEL",
+        steps=["PRIOR_STEP_SENTINEL"],
+        poc="PRIOR_POC_SENTINEL",
+        raw_request="RAW_REQUEST_SENTINEL",
+        raw_response="RAW_RESPONSE_SENTINEL",
+        evidence={"proof": "RAW_EVIDENCE_SENTINEL"},
+        kill_chain=[],
+        self_check={},
+        assistant_messages=[
+            {"role": "assistant", "content": "ASSISTANT_ANSWER_MUST_NOT_TRANSFER"},
+            {"role": "user", "content": "USER_QUESTION_SENTINEL"},
+        ],
+    )
+    context = build_finding_deepen_context(
+        finding=finding,
+        review=SimpleNamespace(
+            verdict="accepted", confidence="likely", reproduced=False,
+            reviewer_notes="REVIEW_NOTES_SENTINEL", user_notes="", user_edits={},
+        ),
+        directive="VERIFY_DIRECTIVE_SENTINEL",
+        source="user",
+        depth_policy={"objective": "DEPTH_OBJECTIVE_SENTINEL"},
+    )
+
+    messages = _capture_first_worker_messages(monkeypatch, deepen_context=context)
+    task_message = messages[2]["content"]
+
+    for sentinel in (
+        "VERIFY_DIRECTIVE_SENTINEL",
+        "RAW_REQUEST_SENTINEL",
+        "RAW_RESPONSE_SENTINEL",
+        "RAW_EVIDENCE_SENTINEL",
+        "REVIEW_NOTES_SENTINEL",
+        "USER_QUESTION_SENTINEL",
+        "DEPTH_OBJECTIVE_SENTINEL",
+    ):
+        assert sentinel in task_message
+    assert "ASSISTANT_ANSWER_MUST_NOT_TRANSFER" not in task_message
+    assert "[RAW_OBSERVATION]" in task_message
+    assert "[PRIOR_MODEL_CLAIM]" in task_message
 
 
 def test_non_worker_agents_do_not_reference_task_hunt_direction() -> None:

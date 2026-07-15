@@ -9,13 +9,15 @@ import time
 
 from app.agents.depth_policy import depth_policy_for
 from app.db.models import Finding, Target
+from app.deepen_context import build_finding_deepen_context
 
 # 兼容旧调用方的全局常量；实际限制由 finding 等级策略决定。
 DEEPEN_CAP = 3
 
 
 def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
-                  source: str = "ai", severity: str | None = None) -> tuple[bool, str]:
+                  source: str = "ai", severity: str | None = None,
+                  review=None) -> tuple[bool, str]:
     """执行一次深挖回炉。返回 (是否生效, 日志后缀)。
 
     session: 调用方持有的 session（同步操作 ORM 对象属性，由调用方 commit）。
@@ -37,15 +39,13 @@ def apply_deepen(session, finding: Finding, tgt: Target | None, directive: str,
     finding.status = "superseded"
     if finding.dedup_key:
         finding.dedup_key = f"{finding.dedup_key}:sup:{finding.id[:8]}"
-    tgt.deepen_context = {
-        "directive": directive,
-        "vuln_type": finding.vuln_type,
-        "original_title": finding.title,
-        "original_summary": (finding.description or "")[:1000],
-        "from_finding_id": finding.id,
-        "source": source,
-        "depth_policy": policy.as_dict(),
-    }
+    tgt.deepen_context = build_finding_deepen_context(
+        finding=finding,
+        review=review,
+        directive=directive,
+        source=source,
+        depth_policy=policy.as_dict(),
+    )
     tgt.deepen_count += 1
     tgt.status = "queued"
     # Manual ordering is 1-based. Newer negative timestamps sort before every

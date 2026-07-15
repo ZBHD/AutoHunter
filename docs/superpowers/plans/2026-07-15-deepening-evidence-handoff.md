@@ -20,6 +20,7 @@
   - `prior_claims`: description, affected scope, steps, PoC, attack chain, and Worker self-check.
   - `review_assessment`: AI/human review fields, always labelled as assessment rather than observation.
 - Assistant-role report-assistant messages are excluded from Worker input. Only recent user-role messages are inherited.
+- Human-edited report fields from `Review.user_edits` override the original Finding values in the handoff.
 - Every text field records `text`, `truncated`, and `original_chars` so the next model knows when evidence is partial.
 - The rendered handoff is capped at 18,000 characters using per-field limits and must not log evidence content.
 - Raw observations are wrapped as untrusted data, and closing delimiter strings are neutralized before rendering.
@@ -120,17 +121,17 @@ DEEPEN_CONTEXT_SCHEMA_VERSION = 1
 DEEPEN_RENDER_MAX_CHARS = 18_000
 
 FIELD_LIMITS = {
-    "description": 1_000,
-    "affected_scope": 800,
-    "steps": 1_200,
-    "poc": 1_600,
-    "raw_request": 2_500,
-    "raw_response": 3_500,
-    "evidence": 1_800,
-    "kill_chain": 1_000,
-    "self_check": 800,
-    "reviewer_notes": 900,
-    "user_notes": 600,
+    "description": 800,
+    "affected_scope": 500,
+    "steps": 800,
+    "poc": 1_000,
+    "raw_request": 2_000,
+    "raw_response": 3_000,
+    "evidence": 1_500,
+    "kill_chain": 700,
+    "self_check": 500,
+    "reviewer_notes": 700,
+    "user_notes": 400,
 }
 
 
@@ -173,29 +174,37 @@ def recent_user_questions(messages: Any) -> list[str]:
     return rows[-3:]
 
 
+def _effective_finding_value(finding: Any, review: Any, key: str) -> Any:
+    edits = _value(review, "user_edits", {})
+    if isinstance(edits, Mapping) and key in edits and edits[key] is not None:
+        return edits[key]
+    return _value(finding, key)
+
+
 def build_finding_deepen_context(
     *, finding: Any, review: Any, directive: str, source: str,
     depth_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    cleaned_directive = directive.strip()[:1200]
     return {
         "schema_version": DEEPEN_CONTEXT_SCHEMA_VERSION,
         "kind": "finding_deepen",
-        "directive": directive.strip(),
+        "directive": cleaned_directive,
         "vuln_type": str(_value(finding, "vuln_type")),
-        "original_title": str(_value(finding, "title"))[:500],
-        "original_summary": str(_value(finding, "description"))[:1000],
+        "original_title": str(_effective_finding_value(finding, review, "title"))[:500],
+        "original_summary": str(_effective_finding_value(finding, review, "description"))[:1000],
         "from_finding_id": str(_value(finding, "id")),
         "source": source,
         "depth_policy": dict(depth_policy or {}),
         "source_finding": {
             "id": str(_value(finding, "id")),
-            "title": str(_value(finding, "title"))[:500],
+            "title": str(_effective_finding_value(finding, review, "title"))[:500],
             "vuln_type": str(_value(finding, "vuln_type"))[:80],
             "severity": str(_value(finding, "severity_claimed"))[:10],
             "target_url": str(_value(finding, "target_url"))[:1000],
         },
         "user_intent": {
-            "directive": directive.strip(),
+            "directive": cleaned_directive,
             "recent_questions": recent_user_questions(_value(finding, "assistant_messages", [])),
         },
         "raw_observations": {
@@ -203,7 +212,9 @@ def build_finding_deepen_context(
             for name in ("raw_request", "raw_response", "evidence")
         },
         "prior_claims": {
-            name: bounded_field(_value(finding, name), FIELD_LIMITS[name])
+            name: bounded_field(
+                _effective_finding_value(finding, review, name), FIELD_LIMITS[name],
+            )
             for name in ("description", "affected_scope", "steps", "poc", "kill_chain", "self_check")
         },
         "review_assessment": {
@@ -308,10 +319,16 @@ def render_deepen_brief(target: str, context: Mapping[str, Any]) -> str:
         "<untrusted_raw_observations>", raw, "</untrusted_raw_observations>",
         "[PRIOR_MODEL_CLAIM] 上一轮声明需要独立复核：", claims,
         "[REVIEW_ASSESSMENT] 审核意见不是原始证据：", review,
+        "[DEPTH_POLICY] 本等级深挖目标与证据要求：",
+        json.dumps(context.get("depth_policy") or {}, ensure_ascii=False),
         "[USER_HISTORY] 用户最近关注的问题：" + json.dumps(questions, ensure_ascii=False),
-        "先复核原始观察，再围绕 USER_DIRECTIVE 做最小验证；新结论必须附本轮请求响应。",
+        "先复核原始观察，再围绕 USER_DIRECTIVE 做最小验证；打穿后提交完整利用链和本轮请求响应；"
+        "确认打不穿时调用 finish(verdict=no_vuln) 并说明证据缺口。",
     ])
-    return text[:DEEPEN_RENDER_MAX_CHARS]
+    if len(text) <= DEEPEN_RENDER_MAX_CHARS:
+        return text
+    suffix = "\n</untrusted_raw_observations>\n[HANDOFF_RENDER_TRUNCATED]"
+    return text[:DEEPEN_RENDER_MAX_CHARS - len(suffix)] + suffix
 ```
 
 Move today's `_deepen_brief()` formatting into `render_legacy_deepen_brief()` without changing its output. In `Worker._deepen_brief()`, use only:
@@ -349,7 +366,7 @@ git commit -m "Feat：按证据可信层渲染深挖上下文"
 
 - [ ] **Step 1: Write failing integration tests for both callers**
 
-Add one test that calls `apply_deepen(session, finding, target, "VERIFY_DIRECTIVE", source="user", severity="高危", review=review)` and asserts `schema_version == 1`, full evidence sentinels exist, `depth_policy` remains present, and `queue_position < 0`. Add a second test around `TaskRunner._apply_deepen()` proving an AI `rv` mapping reaches `review_assessment`.
+Add one test that calls `apply_deepen(session, finding, target, "VERIFY_DIRECTIVE", source="user", severity="高危", review=review)` and asserts `schema_version == 1`, full evidence sentinels exist, values in `review.user_edits` override the original title/description/steps/PoC, `depth_policy` remains present, and `queue_position < 0`. Add a second test around `TaskRunner._apply_deepen()` proving an AI `rv` mapping reaches `review_assessment`.
 
 Run: `python -m pytest -q tests/test_deepen_context.py tests/test_task_queue.py -k deepen`
 

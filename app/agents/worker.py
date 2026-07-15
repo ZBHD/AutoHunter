@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from pydantic import ValidationError
 
 from app.agents.history import bounded_tool_content, compact_messages
+from app.deepen_context import render_deepen_brief
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
 from app.config import worker_config
 from app import dedup
@@ -519,37 +520,7 @@ class Worker:
         )
 
     def _deepen_brief(self) -> str:
-        ctx = self.deepen_context or {}
-        directive = ctx.get("directive", "").strip()
-        original = ctx.get("original_title", "") or ctx.get("vuln_type", "")
-        summary = (ctx.get("original_summary", "") or "").strip()
-        parts = [
-            f"目标：{self.target}",
-            "",
-            "⚡ 这是一次【定向深挖任务】，不是普通自由挖掘。",
-            f"上一轮在此目标发现了线索：{original}",
-        ]
-        if summary:
-            parts.append(f"原始线索摘要：{summary[:800]}")
-        policy = ctx.get("depth_policy")
-        if isinstance(policy, dict):
-            objective = str(policy.get("objective") or "").strip()
-            requirements = policy.get("evidence_requirements") or []
-            if objective:
-                parts.append(f"本等级深挖目标：{objective}")
-            if requirements:
-                parts.append("本等级证据要求：" + "；".join(str(item) for item in requirements[:4]))
-        parts += [
-            "",
-            "审核判定：线索真实有价值，但利用链没打穿，所以打回让你专门攻这一个点。",
-            f"👉 你这一轮的唯一任务：{directive}",
-            "",
-            "要求：",
-            "1. 直奔主题，优先把上面这条利用链打穿，不要重新从头泛泛侦察。",
-            "2. 打穿了（取到真实数据/造成实锤危害）就用 submit_finding 提交完整利用链 + 原始请求响应证据。",
-            "3. 反复尝试确实打不穿、证明只是理论可能，就 finish(verdict=no_vuln) 并说明卡在哪，绝不交半成品。",
-        ]
-        return "\n".join(parts)
+        return render_deepen_brief(self.target, self.deepen_context or {})
 
     def _dispatch(self, name: str, args: dict, rnd: int) -> dict:
         if name == "http_request":

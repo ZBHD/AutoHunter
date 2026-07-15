@@ -93,6 +93,11 @@ class WorkerConfig(BaseModel):
     soft_round_budget_cap: int = int(os.environ.get("WORKER_SOFT_ROUND_BUDGET_CAP", "0"))
     enterprise_round_budget_cap: int = int(os.environ.get("ENTERPRISE_WORKER_ROUND_BUDGET_CAP", "0"))
     enterprise_soft_round_budget_cap: int = int(os.environ.get("ENTERPRISE_WORKER_SOFT_ROUND_BUDGET_CAP", "0"))
+    deepen_context_max_chars: int = Field(
+        default=int(os.environ.get("DEEPEN_CONTEXT_MAX_CHARS", "18000")),
+        ge=4000,
+        le=40000,
+    )
     js_tool_always_on: bool = os.environ.get("WORKER_JS_TOOL_ALWAYS_ON", "0").lower() in {"1", "true", "yes"}
     prompt_version: str = os.environ.get("WORKER_PROMPT_VERSION", "current")
     work_root: str = os.environ.get("WORKER_WORK_ROOT", "/tmp/autohunter/work")

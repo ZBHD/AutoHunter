@@ -41,6 +41,7 @@ from app.db.models import (
     Review, Target, Task, TaskEvent,
 )
 from app.db.session import SessionLocal
+from app.deepen_context import handoff_audit_metadata
 from app.events import bus
 from app.escalation_service import (
     claim_attempt as claim_escalation_attempt,
@@ -3049,7 +3050,21 @@ class TaskRunner:
         tgt = await session.get(Target, finding.target_id)
         _ok, suffix = apply_deepen(session, finding, tgt,
                                    rv.get("deepen_directive") or "", source="ai",
-                                   severity=rv.get("severity_final") or finding.severity_claimed)
+                                   severity=rv.get("severity_final") or finding.severity_claimed,
+                                   review=rv)
+        if _ok:
+            session.add(TaskEvent(
+                task_id=finding.task_id,
+                agent="reviewer",
+                kind="deepen_context_built",
+                level="info",
+                message="AI 审核打回已生成结构化证据交接",
+                payload={
+                    "finding_id": finding.id,
+                    "target_id": finding.target_id,
+                    **handoff_audit_metadata(getattr(tgt, "deepen_context", None)),
+                },
+            ))
         return suffix
 
     async def _dispatch_escalation_attempts(self, session: AsyncSession, task: Task) -> None:

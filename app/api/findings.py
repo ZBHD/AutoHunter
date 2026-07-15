@@ -21,6 +21,7 @@ from app.agents.prompts import is_enterprise_src
 from app.settings_service import llm_router_for_task
 from app.db.models import Finding, Killsweep, Review, Target, Task, TaskEvent, to_cst_iso
 from app.db.session import get_session
+from app.deepen_context import handoff_audit_metadata
 from app.events import bus
 from app.killsweep_service import apply_manual_verdict, queue_initial_attempt
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
@@ -1143,13 +1144,26 @@ async def user_deepen(finding_id: str, req: DeepenRequest,
         (r.user_severity or r.severity_final) if r else None
     ) or f.severity_claimed
     ok, suffix = apply_deepen(
-        session, f, tgt, directive, source="user", severity=effective_severity
+        session, f, tgt, directive, source="user", severity=effective_severity,
+        review=r,
     )
     if not ok:
         # 深挖失败：回滚一切改动，绝不把 user_status 污染成 deepening，
         # 否则该漏洞会从复审/驳回列表消失又进不了深挖，变成查不到的"幽灵数据"。
         await session.rollback()
         raise HTTPException(409, f"无法深挖：{suffix.strip(' →')}")
+    session.add(TaskEvent(
+        task_id=f.task_id,
+        agent="reviewer",
+        kind="deepen_context_built",
+        level="info",
+        message="人工继续深挖已生成结构化证据交接",
+        payload={
+            "finding_id": f.id,
+            "target_id": f.target_id,
+            **handoff_audit_metadata(getattr(tgt, "deepen_context", None)),
+        },
+    ))
     if r:
         # 把这次人工动作记到审核记录上：复审备注 + 标记非通过非驳回（已回炉，从复审/驳回列表移走）
         r.deepen_directive = directive
