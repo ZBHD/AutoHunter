@@ -233,6 +233,7 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
     }
     try:
         result = await request_async(
+            key,
             base,
             purpose="search",
             params=params,
@@ -305,6 +306,7 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
         raise FofaError("缺少 FOFA key", account_error=True)
     try:
         result = await request_async(
+            key,
             base_url or BASE,
             purpose="info",
             params={"key": key},

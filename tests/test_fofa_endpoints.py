@@ -4,7 +4,13 @@ import asyncio
 
 import httpx
 
-from app.fofa.endpoints import request_async, request_sync
+from app.fofa.endpoints import (
+    FofaEndpointCandidate,
+    FofaTransportResult,
+    endpoint_candidates,
+    request_async,
+    request_sync,
+)
 
 
 class _AsyncClient:
@@ -81,7 +87,7 @@ def test_full_api_php_is_called_without_path_rewrite(monkeypatch) -> None:
     )
 
     assert result.resolved_url == "https://fofa.example/api.php"
-    assert result.endpoint_mode == "api_php"
+    assert result.endpoint_mode == "exact"
     assert _AsyncClient.calls == [("GET", "https://fofa.example/api.php")]
 
 
@@ -100,6 +106,83 @@ def test_known_standard_path_404_is_not_retried(monkeypatch) -> None:
     assert _AsyncClient.calls == [("GET", "https://fofa.example/api/v1/search/all")]
 
 
+def test_endpoint_candidates_are_immutable_and_include_fallback() -> None:
+    candidates = endpoint_candidates("https://fofa.example/api.php", purpose="search")
+
+    assert isinstance(candidates[0], FofaEndpointCandidate)
+    assert candidates[0].url == "https://fofa.example/api.php"
+    assert candidates[0].mode == "exact"
+    assert candidates[1].mode == "fallback"
+    assert isinstance(candidates, tuple)
+
+    try:
+        candidates[0].url = "https://changed.example"
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("endpoint candidates must be immutable")
+
+
+def test_transport_result_is_public_dataclass() -> None:
+    assert issubclass(FofaTransportResult, object)
+    assert FofaTransportResult.__dataclass_params__.frozen is True
+
+
+def test_api_php_405_retries_post_and_keeps_exact_url(monkeypatch) -> None:
+    _AsyncClient.calls = []
+    _AsyncClient.responses = [httpx.Response(405), httpx.Response(200, json={"ok": True})]
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: _AsyncClient())
+    monkeypatch.setattr("app.tools.netguard.assert_safe_outbound_url", lambda *_args, **_kwargs: None)
+
+    result = asyncio.run(
+        request_async("KEY", "https://fofa.example/api.php", purpose="search")
+    )
+
+    assert result.endpoint_mode == "exact"
+    assert result.category == "ok"
+    assert _AsyncClient.calls == [
+        ("GET", "https://fofa.example/api.php"),
+        ("POST", "https://fofa.example/api.php"),
+    ]
+
+
+def test_api_php_404_falls_back_and_terminal_endpoint_is_classified(monkeypatch) -> None:
+    _AsyncClient.calls = []
+    _AsyncClient.responses = [httpx.Response(404), httpx.Response(405)]
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: _AsyncClient())
+    monkeypatch.setattr("app.tools.netguard.assert_safe_outbound_url", lambda *_args, **_kwargs: None)
+
+    result = asyncio.run(
+        request_async("KEY", "https://fofa.example/api.php", purpose="search")
+    )
+
+    assert result.endpoint_mode == "fallback"
+    assert result.category == "endpoint"
+    assert result.http_status == 405
+    assert _AsyncClient.calls == [
+        ("GET", "https://fofa.example/api.php"),
+        ("GET", "https://fofa.example/api/v1/search/all"),
+    ]
+
+
+def test_explicit_key_is_added_to_transport_params(monkeypatch) -> None:
+    captured: list[dict] = []
+
+    class Client(_AsyncClient):
+        async def get(self, url, **kwargs):
+            captured.append(dict(kwargs.get("params") or {}))
+            return await super().get(url, **kwargs)
+
+    _AsyncClient.calls = []
+    _AsyncClient.responses = [httpx.Response(200, json={"ok": True})]
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr("app.tools.netguard.assert_safe_outbound_url", lambda *_args, **_kwargs: None)
+
+    asyncio.run(request_async("KEY", "https://fofa.example", purpose="search"))
+
+    assert captured == [{"key": "KEY"}]
+
+
 def test_custom_path_retries_post_then_reports_same_url(monkeypatch) -> None:
     _AsyncClient.calls = []
     _AsyncClient.responses = [httpx.Response(405), httpx.Response(200, json={"ok": True})]
@@ -111,7 +194,7 @@ def test_custom_path_retries_post_then_reports_same_url(monkeypatch) -> None:
     )
 
     assert result.resolved_url == "https://fofa.example/private/search/"
-    assert result.endpoint_mode == "custom_post"
+    assert result.endpoint_mode == "exact"
     assert _AsyncClient.calls == [
         ("GET", "https://fofa.example/private/search/"),
         ("POST", "https://fofa.example/private/search/"),
@@ -129,7 +212,7 @@ def test_custom_404_falls_back_to_same_origin_standard_path(monkeypatch) -> None
     )
 
     assert result.resolved_url == "https://fofa.example/api/v1/search/all"
-    assert result.endpoint_mode == "standard_fallback"
+    assert result.endpoint_mode == "fallback"
     assert result.http_status == 200
     assert _SyncClient.calls == [
         ("GET", "https://fofa.example/private/search"),
@@ -148,7 +231,7 @@ def test_custom_auth_failure_does_not_switch_path(monkeypatch) -> None:
     )
 
     assert result.resolved_url == "https://fofa.example/private/search"
-    assert result.endpoint_mode == "custom_get"
+    assert result.endpoint_mode == "exact"
     assert result.http_status == 401
     assert result.category == "auth"
     assert len(_AsyncClient.calls) == 1
