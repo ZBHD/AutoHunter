@@ -15,14 +15,18 @@
 - Create: `tests/test_fofa_key_config.py` - Key 模型、每项 `base_url` 校验、旧库迁移、缓存解析测试。
 - Create: `tests/test_fofa_errors.py` - FOFA 错误结构与优先级测试。
 - Create: `tests/test_fofa_router.py` - 纯 Router 粘性、轮换、冷却和并发测试。
+- Create: `tests/test_fofa_endpoints.py` - 根地址、完整地址、方法协商、路径回退和同步/异步传输测试。
+- Create: `tests/test_netguard.py` - 凭证出站 URL 的代理合成 DNS 与字面 IP 回归测试。
 - Create: `tests/test_fofa_key_api.py` - Key 池 CRUD、检测、脱敏和竞态测试。
 - Create: `frontend/src/fofaKeys.js` - Key 列表、可用性、排序和健康结果纯函数。
 - Create: `frontend/tests/fofaKeys.test.js` - 前端纯函数与接线契约测试。
 - Create: `frontend/src/components/FofaKeysPanel.vue` - 与 LLM Provider 面板同风格的 FOFA Key 管理面板。
 - Create: `app/fofa/router.py` - 同步/异步统一的 FOFA Key Router。
+- Create: `app/fofa/endpoints.py` - 用户地址解析、候选生成和命中端点元数据。
 - Modify: `app/config.py` - 增加带安全 HTTP(S) `base_url` 的 `FofaKeyConfig`，复用 LLM 基址校验。
 - Modify: `app/db/models.py`, `app/db/session.py` - 增加 `fofa_keys` 列和旧库自动迁移。
-- Modify: `app/fofa/client.py`, `app/engines/fofa.py` - 统一结构化错误分类。
+- Modify: `app/fofa/client.py`, `app/engines/fofa.py` - 统一结构化错误分类与 FOFA 传输。
+- Modify: `app/tools/netguard.py` - 允许普通域名的代理合成 DNS，继续阻断字面保留 IP。
 - Modify: `app/settings_service.py`, `app/api/dto.py`, `app/api/settings.py` - Key 池解析、CRUD、状态持久化和检测 API。
 - Modify: `app/agents/collector.py`, `app/tools/executor.py`, `app/agents/worker.py`, `app/agents/killsweep.py`, `app/orchestrator.py`, `app/api/tasks.py` - 所有 FOFA 调用接入 Router，并只在任务重启时清理任务级覆盖状态。
 - Modify: `tests/test_settings_service.py`, `tests/test_llm_provider_api.py`, `tests/test_killsweep_service.py` - 兼容与集成回归。
@@ -475,6 +479,101 @@ git commit -m "功能：实现 FOFA Key 粘性轮换路由器"
 
 ---
 
+### Task 3B: Resolve Arbitrary FOFA-Compatible Endpoints
+
+**Files:**
+- Create: `app/fofa/endpoints.py`
+- Create: `tests/test_fofa_endpoints.py`
+- Create: `tests/test_netguard.py`
+- Modify: `app/fofa/client.py`
+- Modify: `app/engines/fofa.py`
+- Modify: `app/tools/netguard.py`
+- Modify: `app/fofa/__init__.py`
+
+- [ ] **Step 1: Write failing endpoint and transport tests**
+
+Use an `httpx.MockTransport` or a small injected fake transport and assert these exact contracts:
+
+```python
+def test_root_address_appends_standard_search_path():
+    assert resolve_endpoint("https://fofa.info", purpose="search").url == (
+        "https://fofa.info/api/v1/search/all"
+    )
+
+def test_full_api_php_is_called_without_appending():
+    candidate = resolve_endpoint("http://fofapi.services/api.php", purpose="search")
+    assert candidate.url == "http://fofapi.services/api.php"
+    assert candidate.mode == "exact"
+
+def test_405_tries_post_then_does_not_mark_key_invalid():
+    result = run_search_with_resolver(
+        "http://mirror.example/api.php",
+        responses=[(405, ""), (200, '{"results": [], "size": 0}')],
+    )
+    assert result.method_sequence == ["GET", "POST"]
+    assert result.category == "ok"
+
+def test_exact_404_falls_back_to_same_origin_standard_path():
+    result = run_search_with_resolver(
+        "https://mirror.example/gateway",
+        responses=[(404, ""), (200, '{"results": [], "size": 0}')],
+    )
+    assert result.resolved_url == "https://mirror.example/api/v1/search/all"
+    assert result.endpoint_mode == "fallback"
+
+def test_auth_or_5xx_does_not_try_a_different_path():
+    result = run_search_with_resolver(
+        "https://mirror.example/gateway",
+        responses=[(401, "invalid key")],
+    )
+    assert result.method_sequence == ["GET"]
+    assert result.error.kind == "auth"
+```
+
+Also cover `info` probes, exact known `/api/v1/search/all` and `/api/v1/info/my`, non-JSON endpoint errors, synchronous transport parity, returned `resolved_url`/`endpoint_mode`/`http_status`, and `http://fofapi.services/api.php` being accepted by the URL guard when DNS resolves to `198.18.0.250`.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `python -m pytest -q tests/test_fofa_endpoints.py tests/test_netguard.py`
+
+Expected: collection fails because the resolver and shared transport do not exist; existing fixed-path callers cannot satisfy the exact URL assertions.
+
+- [ ] **Step 3: Implement the central resolver and transport**
+
+Create `app/fofa/endpoints.py` with immutable `FofaEndpointCandidate` and `FofaTransportResult` records plus these functions:
+
+```python
+def endpoint_candidates(base_url: str, *, purpose: Literal["search", "info"]) -> tuple[FofaEndpointCandidate, ...]: ...
+async def request_async(key: str, base_url: str, *, purpose: Literal["search", "info"], params: Mapping[str, Any], json_body: Mapping[str, Any] | None = None) -> FofaTransportResult: ...
+def request_sync(key: str, base_url: str, *, purpose: Literal["search", "info"], params: Mapping[str, Any], json_body: Mapping[str, Any] | None = None) -> FofaTransportResult: ...
+```
+
+Generate only one standard candidate for a root URL. For an exact path, try the exact URL first; on `404/405` try POST after a GET `405`, then try the same-origin standard path. Stop immediately on `401/403`, `429`, daily quota, any other 4xx, 5xx, timeout, connection error, or valid JSON error payload. Run `assert_safe_outbound_url()` on every candidate URL before sending it, passing the existing FOFA host allow-list. Keep the key in query parameters for FOFA-compatible calls and redact it in every raised `FofaError`.
+
+Refactor `app/fofa/client.py` and `app/engines/fofa.py` to build FOFA parameters once and consume this transport; return the transport metadata to health probes while preserving `search()` and `FofaEngine.search()` result shapes. Remove all direct `f"{base}/api/v1/..."` concatenation from FOFA consumers.
+
+Update `app/tools/netguard.py` so a hostname resolving to `198.18.0.0/15` is allowed only when the URL host is a name (never a literal IP); metadata hosts and all other private/reserved/link-local results remain blocked.
+
+- [ ] **Step 4: Run GREEN and commit**
+
+Run:
+
+```powershell
+python -m pytest -q tests/test_fofa_endpoints.py tests/test_netguard.py tests/test_fofa_errors.py
+python -m pytest -q tests/test_fofa_errors.py -x --count=10
+```
+
+Expected: endpoint and existing error tests pass, with no direct fixed-path request remaining in FOFA client or engine.
+
+Commit:
+
+```powershell
+git add app/fofa/endpoints.py app/fofa/client.py app/fofa/__init__.py app/engines/fofa.py app/tools/netguard.py tests/test_fofa_endpoints.py tests/test_netguard.py
+git commit -m "功能：统一 FOFA 自定义端点传输"
+```
+
+---
+
 ### Task 4: Add Masked CRUD And Health APIs
 
 **Files:**
@@ -561,7 +660,7 @@ DELETE /api/settings/fofa-keys/{name}
 POST   /api/settings/fofa-keys/{name}/test
 ```
 
-`public_settings_view()` returns `fofa_keys` including each item’s `base_url`; `run_settings_health_check()` returns `fofa_results` for pool mode and retains `fofa_result` for legacy mode. Every single-item and one-click probe calls the item’s own `key + base_url` and applies SSRF validation per endpoint. Apply probe results atomically only when the full credential fingerprint still matches.
+`public_settings_view()` returns `fofa_keys` including each item’s `base_url`; `run_settings_health_check()` returns `fofa_results` for pool mode and retains `fofa_result` for legacy mode. Every result includes `category`, `resolved_url`, `endpoint_mode` and `http_status`. Root addresses use the info probe; full/custom paths use a minimal search probe through the central resolver. Display `endpoint` when all eligible endpoint candidates return `404/405`; keep timeout/network/5xx as `transient`. Every single-item and one-click probe calls the item’s own `key + base_url` and applies SSRF validation per candidate endpoint. Apply probe results atomically only when the full credential fingerprint still matches. Only `auth` may persist `auth_invalid`; rate/daily enter their cooldown states, while `endpoint` and `transient` preserve `ready`.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -655,7 +754,7 @@ Catch `FofaPoolExhaustedError` once. Store only pool-level `next_retry_at`, summ
 
 - [ ] **Step 5: Integrate synchronous consumers and injection points**
 
-Add `fofa_router` constructor parameters to `ToolExecutor` and `KillsweepHunter`. Wrap their current HTTP operations:
+Add `fofa_router` constructor parameters to `ToolExecutor` and `KillsweepHunter`. Wrap their operations with Router and call `app.fofa.endpoints.request_sync()` inside the selected credential operation; neither consumer may concatenate an API path:
 
 ```python
 return self.fofa_router.execute_sync(
@@ -668,7 +767,7 @@ return self.fofa_router.execute_sync(
 )
 ```
 
-Build the Router on the orchestrator event loop before dispatching Worker/Killsweep to threads, matching the LLM disable callback pattern. Pass each selected `key + base_url` pair through Collector, Worker and Killsweep operations; preserve task override endpoint behavior and keep the old `fofa_base_url` only for Legacy/old-task fallback. Remove long-lived global raw Key injection after all call sites migrate.
+Build the Router on the orchestrator event loop before dispatching Worker/Killsweep to threads, matching the LLM disable callback pattern. Pass each selected `key + base_url` pair through Collector, Worker and Killsweep operations; preserve task override endpoint behavior and keep the old `fofa_base_url` only for Legacy/old-task fallback. Remove long-lived global raw Key injection after all call sites migrate. Assert with `rg` that `/api/v1/search/all` appears only in `app/fofa/endpoints.py` and tests.
 
 Update `start_task()` so it clears `daily_suspended`, failure count and pool-wait markers only from task-level `fofa_config` state. It must leave every item in global `SystemSettings.fofa_keys` unchanged.
 
@@ -893,6 +992,9 @@ git commit -m "文档：说明 FOFA 多 Key 轮换与兼容优先级"
 - [ ] 手动停用与运行阻断彼此独立，检测成功保留手动开关。
 - [ ] CRUD、健康检测、日志、事件和抓包证据均无明文或 URL 编码后的 Key。
 - [ ] 每个 Key 的健康检测、单项检测和 SSRF 防护均针对其自身端点执行。
+- [ ] 根地址自动拼标准路径，完整地址保持原样；只有明确 `404/405` 才同源回退，`405` 可协商 POST。
+- [ ] 域名的 `198.18.0.0/15` 代理映射可用，字面保留 IP、元数据主机和真实内网解析仍被阻断。
+- [ ] 检测结果包含实际 URL、端点模式和分类；路径错误、超时、网络错误、5xx 都不会误封 Key。
 - [ ] Collector、Worker、Killsweep 的 FOFA 请求全部经过 Router。
 - [ ] 设置页视觉和交互与 LLM Provider 面板一致。
 - [ ] 后端全量测试、前端测试和生产构建全部通过。

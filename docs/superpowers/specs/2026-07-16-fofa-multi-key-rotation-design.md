@@ -1,7 +1,7 @@
 # FOFA 多 Key 运行时轮换设计
 
 日期：2026-07-16
-状态：设计已确认，等待文档复核
+状态：设计已确认，按实施计划开发中
 
 ## 1. 目标与边界
 
@@ -57,6 +57,20 @@ FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的�
 
 全局候选条件为 `enabled=true`，运行状态未进入 `auth_invalid` 或 `daily_suspended`，并且 `cooldown_until` 已到期。当前游标优先；游标失效时从列表首项开始顺序寻找候选。
 
+### 3.3 端点输入与解析
+
+`base_url` 在界面上统一称为“FOFA 地址”，服务端原样保存用户填写并通过基础 URL 安全校验，不在保存时猜测或改写路径。调用时由 `app/fofa/endpoints.py` 按请求用途生成候选：
+
+- 根地址（如 `https://fofa.info`）按用途拼接官方 `/api/v1/info/my` 或 `/api/v1/search/all`。
+- 已知官方完整路径直接使用，不重复拼接。
+- 其他非根路径（如 `http://fofapi.services/api.php`）优先精确请求该 URL。
+- 精确 URL 只有明确返回 `404` 或 `405` 时，才回退同源标准路径；认证失败、限流、每日额度、5xx 和网络异常均不触发路径回退。
+- 精确搜索端点先使用 GET；明确返回 `405` 时用同一 URL 和同一参数尝试 POST。标准 FOFA 路径继续使用 GET。
+
+搜索、账号探测、同步 Worker 和 Killsweep 共用这一解析器与传输层，业务调用方不再自行拼接路径。健康检测对根地址优先使用不消耗搜索额度的 info 探测，对完整或自定义路径使用最小搜索探测，并返回实际命中的 `resolved_url`、`endpoint_mode`、HTTP 状态和诊断分类。
+
+SSRF 校验仍逐候选执行。云元数据主机、URL 中的字面私有/保留 IP 和解析到真实内网的域名继续阻断；为兼容系统代理的 DNS 映射，普通域名解析到 `198.18.0.0/15` 可通过，直接填写该网段 IP 仍阻断。
+
 ## 4. Router 架构
 
 新增 `app/fofa/router.py`，包含以下职责：
@@ -88,12 +102,14 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 ## 6. 错误分类与恢复
 
-`FofaEngine.search` 保持 `FofaError` 兼容，同时补充结构化 `kind`、`code` 和 `retry_after`。上游错误只分为 `auth`、`rate_limit`、`daily_limit`、`transient` 四类，Router 再把错误映射为运行状态：
+`FofaEngine.search` 保持 `FofaError` 兼容，同时补充结构化 `kind`、`code` 和 `retry_after`。运行时错误分为 `auth`、`rate_limit`、`daily_limit`、`transient` 四类，Router 再把错误映射为运行状态；健康检测另外提供 `endpoint` 诊断分类，用于明确指出所有候选均返回 `404/405`，但它不会把 Key 标记失效：
 
 - `auth`：认证、权限、过期、账号无效等；映射为 `auth_invalid`，持久阻断当前 Key 并立即尝试下一个。
 - `rate_limit`：HTTP 429、Q3005、Too Many Requests 等；映射为 `rate_limited`，指数退避 60、120、240、480、600 秒，到期自动回池。
 - `daily_limit`：FOFA `820041`、每日上限、每日额度等；先映射为 `daily_cooldown`，每次进入 1 小时冷却并在到期后自动回池。同一 Key 连续 12 次仍返回该错误时转为 `daily_suspended`。全局 Key 由检测成功或替换 Key 恢复；任务级单 Key 还可以由任务重启恢复。
 - `transient`：网络错误、5xx、非 JSON、端点瞬时异常；运行状态保持 `ready`，本轮结束，下轮继续使用当前游标。
+
+探测结果面向用户区分 `ok`、`auth`、`rate_limit`、`daily_limit`、`endpoint`、`transient`。临时网络错误、超时、5xx 和端点路径错误都不会进入 `auth_invalid`；路径回退成功后记录实际端点，后续请求仍可从用户输入重新解析并自动恢复。
 
 每日额度匹配优先级高于通用 quota 和账号错误，避免把额度耗尽误判成认证失效。连续次数按 Key 分别统计；池中存在其他可用 Key 时任务继续执行。
 
@@ -114,7 +130,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 新增 DTO 校验：名称非空且可寻址、名称大小写不敏感唯一、启用项必须有 Key、Key 脱敏占位只能表示保留原值、`base_url` 为安全绝对 HTTP(S) URL、顺序请求必须覆盖全部名称。单项检测和一键检测均使用该项自己的 `key + base_url`，SSRF 校验对每个端点分别执行。
 
-`GET /api/settings` 增加 `fofa_keys` 脱敏列表。`POST /api/settings/health-check` 增加 `fofa_results[]`，每项包含 `name`、`ok`、`latency_ms`、`enabled`、`runtime_state`、`auto_blocked`、`stale` 和脱敏后的 `error`。旧单 Key 场景继续返回兼容字段 `fofa_result`。
+`GET /api/settings` 增加 `fofa_keys` 脱敏列表。`POST /api/settings/health-check` 增加 `fofa_results[]`，每项包含 `name`、`ok`、`latency_ms`、`enabled`、`runtime_state`、`auto_blocked`、`stale`、`category`、`resolved_url`、`endpoint_mode`、`http_status` 和脱敏后的 `error`。旧单 Key 场景继续返回兼容字段 `fofa_result`。
 
 一键检测会并行检测所有已配置 Key，包括手动停用项；成功只清除运行阻断，保留 `enabled=false` 的手动状态。认证类失败写入 `runtime_state=auth_invalid`，每日额度和限流结果写入对应状态。替换 Key 时清空该项的失败次数、冷却和运行阻断；删除或停用当前 Key 时，游标顺序移动到下一个候选；重新排序按名称保留当前 Key。
 
@@ -137,7 +153,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 ## 10. 测试与验收
 
-后端 Router 单测覆盖粘性选择、顺序故障切换、单圈上限、四类失败、冷却到期恢复、全池耗尽、并发幂等、状态指纹竞态和日志脱敏。
+后端 Router 单测覆盖粘性选择、顺序故障切换、单圈上限、四类失败、冷却到期恢复、全池耗尽、并发幂等、状态指纹竞态和日志脱敏。端点测试覆盖根地址拼接、完整地址不拼接、GET 到 POST 的 `405` 协商、只在 `404/405` 后同源回退、实际端点回报、同步/异步一致性和代理合成 DNS。
 
 设置 API 单测覆盖 CRUD、排序、重复名称、Key 脱敏、启用空 Key 校验、单项检测、一键检测全部 Key、手动停用保留、认证阻断恢复和旧配置回退。
 
@@ -149,4 +165,4 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 ## 11. 明确的非目标
 
-本设计不引入所有搜索引擎的通用凭据池，不改变 FOFA 查询语法、分页语义和任务级配置格式，不把手动停用项自动打开，也不在 API 响应中暴露任何 Key 内容。
+本设计不引入所有搜索引擎的通用凭据池，不改变 FOFA 查询语法、分页语义和任务级配置格式，不把手动停用项自动打开，也不在 API 响应中暴露任何 Key 内容。第三方地址需兼容 FOFA 的 Key、查询参数和响应结构；参数或响应完全不同的私有协议后续通过显式适配器扩展，不在本次自动猜测。
