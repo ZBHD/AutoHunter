@@ -197,7 +197,14 @@ def request_sync(
     except netguard.SsrfBlocked:
         raise
     except httpx.HTTPError as exc:
-        return FofaTransportResult(None, initial.url, initial.mode, None, "network", error=exc)
+        return FofaTransportResult(
+            None,
+            initial.url,
+            initial.mode,
+            None,
+            "network",
+            error=RuntimeError(type(exc).__name__),
+        )
 
 
 async def request_async(
@@ -235,7 +242,14 @@ async def request_async(
     except netguard.SsrfBlocked:
         raise
     except httpx.HTTPError as exc:
-        return FofaTransportResult(None, initial.url, initial.mode, None, "network", error=exc)
+        return FofaTransportResult(
+            None,
+            initial.url,
+            initial.mode,
+            None,
+            "network",
+            error=RuntimeError(type(exc).__name__),
+        )
 
 
 request_fofa_sync = request_sync

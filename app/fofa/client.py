@@ -271,7 +271,9 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
                 key=key,
             ) from None
     except SsrfBlocked as exc:
-        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
+        safe_message = redact_fofa_secrets(str(exc), key)
+        exc.args = (safe_message,)
+        raise FofaError(f"FOFA base_url 不被允许：{safe_message}") from None
     except FofaError:
         raise
     except httpx.HTTPError as e:
@@ -344,7 +346,9 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
                 key=key,
             ) from None
     except SsrfBlocked as exc:
-        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
+        safe_message = redact_fofa_secrets(str(exc), key)
+        exc.args = (safe_message,)
+        raise FofaError(f"FOFA base_url 不被允许：{safe_message}") from None
     except FofaError:
         raise
     except httpx.HTTPError as exc:

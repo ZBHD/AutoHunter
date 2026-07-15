@@ -292,6 +292,38 @@ def test_upstream_error_does_not_echo_plain_or_encoded_key(monkeypatch, endpoint
     assert encoded_plus not in repr(exc_info.value)
 
 
+@pytest.mark.parametrize("endpoint", ["search", "userinfo"])
+def test_ssrf_error_does_not_echo_plain_or_encoded_key(monkeypatch, endpoint: str) -> None:
+    key = "fofa/probe+secret-SSRF"
+    encoded = quote(key, safe="")
+    encoded_plus = quote_plus(key)
+    message = f"blocked {key} {encoded} {encoded_plus}"
+
+    def blocked(*_args, **_kwargs):
+        from app.tools.netguard import SsrfBlocked
+
+        raise SsrfBlocked(message)
+
+    monkeypatch.setattr("app.fofa.endpoints.netguard.assert_safe_outbound_url", blocked)
+    operation = (
+        fofa_client.search(key, 'domain="example.com"')
+        if endpoint == "search"
+        else fofa_client.get_userinfo(key)
+    )
+
+    with pytest.raises(fofa_client.FofaError) as exc_info:
+        asyncio.run(operation)
+
+    error = exc_info.value
+    rendered = str(error) + repr(error)
+    assert key not in rendered
+    assert encoded not in rendered
+    assert encoded_plus not in rendered
+    assert error.__cause__ is None
+    assert error.__context__ is not None
+    assert key not in repr(error.__context__)
+
+
 def test_search_data_error_prefers_daily_limit(monkeypatch) -> None:
     class Response:
         status_code = 200

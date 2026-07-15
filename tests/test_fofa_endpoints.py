@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -181,6 +182,56 @@ def test_explicit_key_is_added_to_transport_params(monkeypatch) -> None:
     asyncio.run(request_async("KEY", "https://fofa.example", purpose="search"))
 
     assert captured == [{"key": "KEY"}]
+
+
+def test_sync_network_error_does_not_expose_key(monkeypatch) -> None:
+    key = "sync key/with+symbols"
+    encoded = quote(key, safe="")
+    plus_encoded = quote_plus(key, safe="")
+
+    class Client(_SyncClient):
+        def get(self, url, **_kwargs):
+            raise httpx.ConnectError(
+                f"connect failed {key} {encoded} {plus_encoded}",
+                request=httpx.Request("GET", f"https://fixture.example/{encoded}"),
+            )
+
+    monkeypatch.setattr(httpx, "Client", lambda **_kwargs: Client())
+    monkeypatch.setattr("app.tools.netguard.assert_safe_outbound_url", lambda *_args, **_kwargs: None)
+
+    result = request_sync(key, "https://fixture.example", purpose="search")
+
+    assert result.category == "network"
+    assert result.error is not None
+    rendered = str(result.error) + repr(result.error)
+    assert key not in rendered
+    assert encoded not in rendered
+    assert plus_encoded not in rendered
+
+
+def test_async_network_error_does_not_expose_key(monkeypatch) -> None:
+    key = "async key/with+symbols"
+    encoded = quote(key, safe="")
+    plus_encoded = quote_plus(key, safe="")
+
+    class Client(_AsyncClient):
+        async def get(self, url, **_kwargs):
+            raise httpx.ReadTimeout(
+                f"timeout {key} {encoded} {plus_encoded}",
+                request=httpx.Request("GET", f"https://fixture.example/{encoded}"),
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr("app.tools.netguard.assert_safe_outbound_url", lambda *_args, **_kwargs: None)
+
+    result = asyncio.run(request_async(key, "https://fixture.example", purpose="search"))
+
+    assert result.category == "network"
+    assert result.error is not None
+    rendered = str(result.error) + repr(result.error)
+    assert key not in rendered
+    assert encoded not in rendered
+    assert plus_encoded not in rendered
 
 
 def test_custom_path_retries_post_then_reports_same_url(monkeypatch) -> None:
