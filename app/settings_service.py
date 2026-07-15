@@ -305,9 +305,19 @@ def _fofa_key_from_value(value: Any) -> FofaKeyConfig:
 def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
     """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
     if task is not None:
-        task_key = str((task.fofa_config or {}).get("key") or "").strip()
+        task_config = task.fofa_config or {}
+        task_key = str(task_config.get("key") or "").strip()
         if task_key:
-            return [FofaKeyConfig(name="Task override", key=task_key)]
+            task_base_url = str(task_config.get("base_url") or "").strip()
+            if not task_base_url:
+                task_base_url = resolve_fofa_base_url()
+            return [
+                FofaKeyConfig(
+                    name="Task override",
+                    key=task_key,
+                    base_url=task_base_url,
+                )
+            ]
 
     stored_pool = list(_cache.get("fofa_keys") or [])
     if stored_pool:
@@ -336,6 +346,7 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
         FofaKeyConfig(
             name="Legacy Key",
             key=key,
+            base_url=resolve_fofa_base_url(),
             enabled=fofa.get("enabled") is not False,
         )
     ]

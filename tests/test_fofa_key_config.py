@@ -19,6 +19,50 @@ def test_fofa_key_config_normalizes_name_and_runtime_defaults() -> None:
     assert item.cooldown_until is None
 
 
+def test_fofa_key_config_defaults_official_base_url() -> None:
+    item = FofaKeyConfig(name="A", key="secret-a")
+
+    assert item.base_url == "https://fofa.info"
+
+
+def test_fofa_key_config_accepts_private_http_path() -> None:
+    item = FofaKeyConfig(
+        name="Private",
+        key="secret-a",
+        base_url="  http://fofa.internal:8080/api/v1  ",
+    )
+
+    assert item.base_url == "http://fofa.internal:8080/api/v1"
+
+
+def test_fofa_key_config_accepts_private_https_path() -> None:
+    item = FofaKeyConfig(
+        name="Private HTTPS",
+        key="secret-a",
+        base_url="https://fofa.internal/private/api",
+    )
+
+    assert item.base_url == "https://fofa.internal/private/api"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://user:password@fofa.example",
+        "https://fofa.example/api?token=secret",
+        "https://fofa.example/api#fragment",
+        "https://fofa.example:bad/api",
+        "https://fofa.example:99999/api",
+        "file:///tmp/fofa",
+        "//fofa.example/api",
+        "https:///api",
+    ],
+)
+def test_fofa_key_config_rejects_unsafe_base_url(base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        FofaKeyConfig(name="A", key="secret-a", base_url=base_url)
+
+
 @pytest.mark.parametrize("state", ["unknown", "disabled", "cooling"])
 def test_fofa_key_config_rejects_unknown_runtime_state(state: str) -> None:
     with pytest.raises(ValidationError):
@@ -45,6 +89,7 @@ def test_fofa_key_config_repr_hides_key() -> None:
     item = FofaKeyConfig(name="A", key=secret)
 
     assert secret not in repr(item)
+    assert secret not in str(item)
 
 
 @pytest.mark.parametrize(

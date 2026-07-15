@@ -26,6 +26,28 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def _validate_http_base_url(value: str) -> str:
+    """校验并保留 HTTP(S) 基址的路径部分。"""
+    normalized = str(value or "").strip()
+    try:
+        parsed = urlparse(normalized)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("must be an absolute HTTP(S) URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        raise ValueError("must be an absolute HTTP(S) URL")
+    return normalized
+
+
 FofaRuntimeState = Literal[
     "ready", "rate_limited", "daily_cooldown", "daily_suspended", "auth_invalid"
 ]
@@ -39,6 +61,7 @@ class FofaKeyConfig(BaseModel):
 
     name: str
     key: str = Field(default="", repr=False)
+    base_url: str = "https://fofa.info"
     enabled: bool = True
     runtime_state: FofaRuntimeState = "ready"
     failure_kind: FofaFailureKindValue = ""
@@ -64,6 +87,11 @@ class FofaKeyConfig(BaseModel):
             raise ValueError("cooldown_until 必须包含时区")
         return value.astimezone(timezone.utc)
 
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return _validate_http_base_url(value)
+
 
 class LLMProviderConfig(BaseModel):
     """单个 LLM provider 的配置。"""
@@ -87,24 +115,7 @@ class LLMProviderConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def _http_base_url(cls, value: str) -> str:
-        normalized = str(value or "").strip()
-        try:
-            parsed = urlparse(normalized)
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError as exc:
-            raise ValueError("must be an absolute HTTP(S) URL") from exc
-        if (
-            parsed.scheme.lower() not in {"http", "https"}
-            or not hostname
-            or (port is not None and not 1 <= port <= 65535)
-            or parsed.username is not None
-            or parsed.password is not None
-            or bool(parsed.query)
-            or bool(parsed.fragment)
-        ):
-            raise ValueError("must be an absolute HTTP(S) URL")
-        return normalized
+        return _validate_http_base_url(value)
 
     @field_validator("api_key")
     @classmethod

@@ -5,7 +5,7 @@
 
 ## 1. 目标与边界
 
-FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的管理体验：增删改、启停、排序、单项检测和一键检测。运行时采用粘性顺序轮换：当前 Key 持续服务，只有出现可轮换的失败时才切到下一个可用 Key。
+FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的管理体验：增删改、启停、排序、单项检测和一键检测。每个 Key 与自己的 `base_url` 组成不可拆分的凭据单元，运行时采用粘性顺序轮换：当前单元持续服务，只有出现可轮换的失败时才切到下一个可用单元。
 
 任务级 `fofa_config.key` 保持单 Key 显式覆盖。任务使用任务级 Key 时，调用路径绕过全局池；任务未设置覆盖值时，使用全局 FOFA Key 池。现有旧版 `fofa.key`、`FOFA_KEY` 和相关更新接口继续保留兼容行为。
 
@@ -13,7 +13,7 @@ FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的�
 
 ## 2. 方案决策
 
-采用独立 FOFA Key 池方案，在 `SystemSettings` 增加 `fofa_keys` JSON 列，结构和 LLM 的 `llm_providers` 对齐。FOFA 端点、分页、默认意图模式继续放在现有 `fofa` 配置中。
+采用独立 FOFA Key 池方案，在 `SystemSettings` 增加 `fofa_keys` JSON 列，结构和 LLM 的 `llm_providers` 对齐。分页、默认意图模式继续放在现有 `fofa` 配置中；端点随每个 Key 持久化。
 
 不采用把 Key 数组混入现有 `fofa` JSON 的方案，避免凭据池、分页参数和运行状态混在一个配置对象内。不扩展为所有搜索引擎的通用凭据池，保持本次改动聚焦。
 
@@ -28,6 +28,7 @@ FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的�
   {
     "name": "主账号",
     "key": "FOFA_KEY_VALUE",
+    "base_url": "https://fofa.info",
     "enabled": true,
     "runtime_state": "ready",
     "failure_kind": "",
@@ -41,6 +42,7 @@ FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的�
 
 - `name`：大小写不敏感唯一名称，作为 API 路径和轮换日志标识。
 - `key`：服务端保存明文，API 和前端只返回统一脱敏占位。
+- `base_url`：该 Key 使用的绝对 HTTP(S) API 基址，可保留私有部署路径；与 `key` 作为同一个凭据单元原子轮换和检测。禁止 userinfo、query、fragment、非法端口和空 host。
 - `enabled`：用户手动开关，表示该 Key 是否加入候选集合。
 - `runtime_state`：运行状态，取值为 `ready`、`rate_limited`、`daily_cooldown`、`daily_suspended`、`auth_invalid`。
 - `failure_kind`：最近一次结构化失败类型，取值为 `auth`、`rate_limit`、`daily_limit`、`transient` 或空字符串。
@@ -66,15 +68,15 @@ FOFA 全局配置支持多个 API Key，并提供与 LLM Provider 池一致的�
 
 `settings_service.fofa_router_for_task(task)` 根据任务解析结果返回 Router：
 
-1. 任务包含 `fofa_config.key` 时返回单 Key 适配器，不共享全局状态；错误分类与冷却逻辑保持一致，状态写入该任务的 `fofa_config`。
+1. 任务包含 `fofa_config.key` 时返回单 Key 适配器，不共享全局状态；任务同时读取 `fofa_config.base_url`，缺省时回退旧全局端点。错误分类与冷却逻辑保持一致，状态写入该任务的 `fofa_config`。
 2. 任务使用全局池时，按池配置指纹缓存进程级 Router，跨任务共享粘性游标。
-3. 配置 CRUD 或刷新缓存后，旧指纹 Router 失效并按 `active_key_name` 重建。
+3. 配置 CRUD 或刷新缓存后，旧指纹 Router 失效并按 `active_key_name` 重建；指纹包含每项 `key + base_url`。
 
-Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router 发送请求。调用方保留原有业务结果格式，Router 只负责 Key 选择、重试和状态。
+Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router 发送请求，操作/租约同时接收选中项的 `key` 与 `base_url`。调用方保留原有业务结果格式，Router 只负责凭据单元选择、重试和状态。
 
 ## 5. 单次请求流程
 
-1. Router 在锁内读取当前 Key 和候选快照，随后释放锁执行网络请求。
+1. Router 在锁内读取当前凭据单元（`key` 与 `base_url`）和候选快照，随后释放锁执行网络请求。
 2. 请求成功：推进业务分页游标，清除该 Key 的失败状态，并把该 Key 记录为 `active_key_name`。
 3. 请求失败：用 `FofaError.kind/code/retry_after` 分类，更新当前 Key 状态，按列表顺序选择下一个候选。
 4. 同一个业务请求中，每个 Key 最多尝试一次，候选数量达到上限后结束本轮。
@@ -82,7 +84,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 6. 全部 Key 处于冷却状态时，返回包含最早 `cooldown_until` 的池耗尽结果，任务进入等待；冷却期间静默跳过。
 7. 全部候选均为认证失效或 `daily_suspended` 时，任务暂停并记录汇总原因。全局池等待设置更新或检测恢复；任务级单 Key 覆盖还可以通过任务重启清除自身暂停状态。
 
-运行时状态写回使用 Key 名称和配置指纹做条件校验。检测或编辑期间发生配置变化时，旧请求结果标记 `stale`，当前配置保持原样。
+运行时状态写回使用 Key 名称和包含 `key + base_url` 的配置指纹做条件校验。检测或编辑期间发生任一字段变化时，旧请求结果标记 `stale`，当前配置保持原样。
 
 ## 6. 错误分类与恢复
 
@@ -110,7 +112,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 | PUT | `/api/settings/fofa-keys/order` | 提交完整顺序 |
 | POST | `/api/settings/fofa-keys/{name}/test` | 检测单个 Key |
 
-新增 DTO 校验：名称非空且可寻址、名称大小写不敏感唯一、启用项必须有 Key、Key 脱敏占位只能表示保留原值、顺序请求必须覆盖全部名称。
+新增 DTO 校验：名称非空且可寻址、名称大小写不敏感唯一、启用项必须有 Key、Key 脱敏占位只能表示保留原值、`base_url` 为安全绝对 HTTP(S) URL、顺序请求必须覆盖全部名称。单项检测和一键检测均使用该项自己的 `key + base_url`，SSRF 校验对每个端点分别执行。
 
 `GET /api/settings` 增加 `fofa_keys` 脱敏列表。`POST /api/settings/health-check` 增加 `fofa_results[]`，每项包含 `name`、`ok`、`latency_ms`、`enabled`、`runtime_state`、`auto_blocked`、`stale` 和脱敏后的 `error`。旧单 Key 场景继续返回兼容字段 `fofa_result`。
 
@@ -125,11 +127,11 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 - 冷却剩余时间、最近检测延迟和自动阻断提示。
 - 空池时的只读 Legacy Key 行。
 
-现有 FOFA 端点、最大页数、page_size 和默认意图模式字段保留在同一设置区。页面顶部的一键检测沿用现有健康检查入口，LLM 和 FOFA 结果并列展示。
+现有 FOFA 全局端点字段仅作为 Legacy/旧任务兼容回退；最大页数、page_size 和默认意图模式字段保留在同一设置区。页面每个 Key 行展示并编辑自己的 `base_url`。页面顶部的一键检测沿用现有健康检查入口，LLM 和 FOFA 结果并列展示。
 
 ## 9. 兼容与迁移
 
-数据库迁移为 `system_settings` 增加 `fofa_keys JSON DEFAULT '[]'`，旧行自动使用空数组。池为空时继续解析存储值 `fofa.key`、环境变量 `FOFA_KEY` 和旧引擎配置回退；前端以只读 Legacy Key 展示。
+数据库迁移为 `system_settings` 增加 `fofa_keys JSON DEFAULT '[]'`，旧行自动使用空数组。池为空时继续解析存储值 `fofa.key`、环境变量 `FOFA_KEY` 和旧引擎配置回退；Legacy 单元的端点按存储 `fofa.base_url` > `FOFA_BASE_URL` > 默认官网解析，`engines.fofa.base_url` 只保留现有旧引擎兼容语义。非空池中缺省端点由模型补齐为 `https://fofa.info`，且不再回退 Legacy；前端以只读 Legacy Key 展示。
 
 新池产生后，全局运行时使用新池；旧单 Key 值保留在原配置中，便于回滚和已有脚本读取。任务级 `fofa_config.key` 继续优先。旧 `PUT /api/settings` 对 `fofa.key` 的更新语义保持。
 
