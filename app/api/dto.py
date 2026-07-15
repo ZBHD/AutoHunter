@@ -19,10 +19,17 @@ LLMProtocol = Literal["openai_chat", "anthropic_messages", "openai_responses"]
 
 def _validated_http_url(value: str) -> str:
     normalized = str(value or "").strip()
-    parsed = urlparse(normalized)
+    try:
+        parsed = urlparse(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "must be an absolute HTTP(S) URL without credentials or query"
+        ) from exc
     if (
         parsed.scheme.lower() not in {"http", "https"}
         or not parsed.hostname
+        or (port is not None and not 1 <= port <= 65535)
         or parsed.username is not None
         or parsed.password is not None
         or bool(parsed.query)
@@ -318,4 +325,74 @@ class LLMProviderOrderDTO(BaseModel):
         normalized = [str(name or "").strip() for name in names]
         if any(not name for name in normalized):
             raise ValueError("provider names must not be empty")
+        return normalized
+
+
+class FofaKeyDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    key: str = ""
+    base_url: str = "https://fofa.info"
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if (
+            not normalized
+            or normalized.casefold() == "order"
+            or any(char in normalized for char in "/\\?#")
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise ValueError("FOFA Key name is reserved or cannot be used in a URL path")
+        return normalized
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str) -> str:
+        return _validated_http_url(value)
+
+    @model_validator(mode="after")
+    def _enabled_requires_key(self):
+        if self.enabled and not self.key:
+            raise ValueError("enabled FOFA Key requires key")
+        return self
+
+
+class FofaKeyUpdateDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: Optional[str] = None
+    base_url: Optional[str] = None
+    enabled: Optional[bool] = None
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, value: str | None) -> str | None:
+        return None if value is None else str(value).strip()
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url(cls, value: str | None) -> str | None:
+        return None if value is None else _validated_http_url(value)
+
+
+class FofaKeyOrderDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    names: list[str]
+
+    @field_validator("names")
+    @classmethod
+    def _normalized_names(cls, names: list[str]) -> list[str]:
+        normalized = [str(name or "").strip() for name in names]
+        if any(not name for name in normalized):
+            raise ValueError("FOFA Key names must not be empty")
         return normalized

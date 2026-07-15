@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from pydantic import ValidationError
@@ -23,7 +24,14 @@ from app.agents.prompts import normalize_worker_prompt_version
 from app.db.models import SystemSettings, Task, to_cst_iso
 from app.db.session import SessionLocal
 from app.engines import get_engine, list_engines, get_default_engine
-from app.fofa.client import get_userinfo as get_fofa_userinfo
+from app.fofa import endpoints as fofa_endpoints
+from app.fofa.client import (
+    _FOFA_ALLOWED_HOSTS,
+    classify_fofa_failure,
+    extract_fofa_error,
+    extract_fofa_response_failure,
+    redact_fofa_secrets,
+)
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
 from app.llm.router import LLMRouter
 
@@ -65,6 +73,26 @@ class LLMProviderOrderError(ValueError):
 
 
 class LLMProviderValidationError(ValueError):
+    pass
+
+
+class FofaKeyConflictError(ValueError):
+    pass
+
+
+class FofaKeyNotFoundError(ValueError):
+    pass
+
+
+class FofaKeyOrderError(ValueError):
+    pass
+
+
+class FofaKeyValidationError(ValueError):
+    pass
+
+
+class FofaKeyReadOnlyError(ValueError):
     pass
 
 
@@ -513,6 +541,130 @@ def _provider_list_response(providers: list[LLMProviderConfig]) -> dict[str, Any
     return {"providers": [_provider_api_view(provider) for provider in providers]}
 
 
+def _fofa_name_key(name: str) -> str:
+    return str(name or "").strip().casefold()
+
+
+def _fofa_payload(item: FofaKeyConfig) -> dict[str, Any]:
+    return item.model_dump(mode="json")
+
+
+def _fofa_fingerprint(item: FofaKeyConfig) -> str:
+    return _settings_fingerprint(_fofa_payload(item))
+
+
+def _validated_fofa_key(
+    value: Any, *, allow_masked_key: bool = False
+) -> FofaKeyConfig:
+    try:
+        item = _fofa_key_from_value(value)
+    except (TypeError, ValidationError) as exc:
+        raise FofaKeyValidationError("FOFA Key 配置无效") from exc
+    normalized_name = str(item.name or "").strip()
+    if (
+        not normalized_name
+        or normalized_name.casefold() == "order"
+        or any(char in normalized_name for char in "/\\?#")
+        or any(ord(char) < 32 for char in normalized_name)
+    ):
+        raise FofaKeyValidationError("FOFA Key 名称无效")
+    if item.enabled and not str(item.key or "").strip():
+        raise FofaKeyValidationError("启用的 FOFA Key 必须配置 Key")
+    if item.key and is_masked_secret(item.key) and not allow_masked_key:
+        raise FofaKeyValidationError("脱敏占位不能作为新的 FOFA Key")
+    return item
+
+
+def _stored_fofa_keys(row: SystemSettings) -> list[FofaKeyConfig]:
+    if not isinstance(row.fofa_keys, list):
+        raise FofaKeyValidationError("数据库中的 FOFA Key 池格式无效，已拒绝修改")
+    items: list[FofaKeyConfig] = []
+    names: set[str] = set()
+    for value in row.fofa_keys or []:
+        try:
+            item = _validated_fofa_key(value, allow_masked_key=False)
+        except FofaKeyValidationError as exc:
+            logger.error("数据库中存在无法解析的 FOFA Key，已拒绝修改: name=<invalid>")
+            raise FofaKeyValidationError(
+                "数据库中存在无效 FOFA Key，已拒绝修改以避免数据丢失"
+            ) from exc
+        name_key = _fofa_name_key(item.name)
+        if name_key in names:
+            raise FofaKeyValidationError("数据库中存在重名 FOFA Key，已拒绝修改")
+        names.add(name_key)
+        items.append(item)
+    return items
+
+
+def _legacy_fofa_key_from_row(row: SystemSettings) -> FofaKeyConfig:
+    config = _fofa_probe_config_from_row(row)
+    return FofaKeyConfig(
+        name="Legacy Key",
+        key=config["key"],
+        base_url=config["base_url"],
+        enabled=config["enabled"],
+    )
+
+
+def _active_fofa_name(row: SystemSettings, items: list[FofaKeyConfig]) -> str:
+    configured = str((row.fofa or {}).get("active_key_name") or "").strip()
+    wanted = _fofa_name_key(configured)
+    for item in items:
+        if wanted and _fofa_name_key(item.name) == wanted:
+            return item.name
+    return next((item.name for item in items if item.enabled), "")
+
+
+def _set_fofa_active_name(row: SystemSettings, items: list[FofaKeyConfig]) -> str:
+    active = _active_fofa_name(row, items)
+    active_item = next(
+        (item for item in items if _fofa_name_key(item.name) == _fofa_name_key(active)),
+        None,
+    )
+    if active_item is None or not active_item.enabled:
+        active = next((item.name for item in items if item.enabled), "")
+    fofa = dict(row.fofa or {})
+    fofa["active_key_name"] = active
+    row.fofa = fofa
+    return active
+
+
+def _fofa_api_view(
+    item: FofaKeyConfig,
+    *,
+    active_name: str = "",
+    read_only: bool = False,
+) -> dict[str, Any]:
+    return {
+        "name": item.name,
+        "key": mask_secret(item.key),
+        "key_set": bool(item.key),
+        "base_url": item.base_url,
+        "enabled": item.enabled,
+        "runtime_state": item.runtime_state,
+        "failure_kind": item.failure_kind,
+        "failure_count": item.failure_count,
+        "cooldown_until": (
+            item.cooldown_until.isoformat().replace("+00:00", "Z")
+            if item.cooldown_until
+            else None
+        ),
+        "read_only": read_only,
+        "source": "legacy" if read_only else "database",
+        "is_active": _fofa_name_key(item.name) == _fofa_name_key(active_name),
+    }
+
+
+def _fofa_list_response(
+    items: list[FofaKeyConfig], *, active_name: str = ""
+) -> dict[str, Any]:
+    return {
+        "fofa_keys": [
+            _fofa_api_view(item, active_name=active_name) for item in items
+        ]
+    }
+
+
 def public_settings_view() -> dict[str, Any]:
     """API 返回：密钥脱敏。"""
     eff = effective_settings()
@@ -520,6 +672,31 @@ def public_settings_view() -> dict[str, Any]:
     fofa = eff["fofa"]
     engines = eff.get("engines", {})
     defaults = eff["defaults"]
+    raw_fofa_keys = eff.get("fofa_keys") or []
+    fofa_keys_view: list[dict[str, Any]] = []
+    if raw_fofa_keys:
+        try:
+            items = [_validated_fofa_key(value) for value in raw_fofa_keys]
+            active_name = str(fofa.get("active_key_name") or "")
+            if not any(
+                _fofa_name_key(item.name) == _fofa_name_key(active_name)
+                for item in items
+            ):
+                active_name = next((item.name for item in items if item.enabled), "")
+            fofa_keys_view = [
+                _fofa_api_view(item, active_name=active_name) for item in items
+            ]
+        except FofaKeyValidationError:
+            fofa_keys_view = []
+    else:
+        legacy = resolve_fofa_keys()[0]
+        fofa_keys_view = [
+            _fofa_api_view(
+                legacy,
+                active_name=legacy.name if legacy.enabled else "",
+                read_only=True,
+            )
+        ]
 
     # 构建引擎列表视图
     engines_view = {}
@@ -555,6 +732,7 @@ def public_settings_view() -> dict[str, Any]:
             "key": mask_secret(fofa.get("key") or ""),
             "key_set": bool(fofa.get("key")),
         },
+        "fofa_keys": fofa_keys_view,
         "engines": engines_view,
         "defaults": {
             "concurrency": int(defaults.get("concurrency") or 3),
@@ -812,6 +990,147 @@ async def get_llm_provider(
     raise LLMProviderNotFoundError(f"Provider 不存在: {name}")
 
 
+async def list_fofa_keys(
+    session: AsyncSession, *, include_legacy: bool = True
+) -> dict[str, Any]:
+    row = await refresh_cache(session)
+    items = _stored_fofa_keys(row)
+    if items:
+        return _fofa_list_response(items, active_name=_active_fofa_name(row, items))
+    if not include_legacy:
+        return {"fofa_keys": []}
+    legacy = _legacy_fofa_key_from_row(row)
+    return {
+        "fofa_keys": [
+            _fofa_api_view(
+                legacy,
+                active_name=legacy.name if legacy.enabled else "",
+                read_only=True,
+            )
+        ]
+    }
+
+
+def _reject_legacy_fofa_mutation(
+    row: SystemSettings, name: str, items: list[FofaKeyConfig]
+) -> None:
+    if not items and _fofa_name_key(name) == _fofa_name_key("Legacy Key"):
+        raise FofaKeyReadOnlyError("Legacy Key 为只读兼容配置")
+
+
+async def create_fofa_key(
+    session: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
+    item = _validated_fofa_key(payload)
+    async with _provider_write_transaction(session) as row:
+        items = _stored_fofa_keys(row)
+        wanted = _fofa_name_key(item.name)
+        if any(_fofa_name_key(current.name) == wanted for current in items):
+            raise FofaKeyConflictError(f"FOFA Key 名称已存在: {item.name}")
+        items.append(item)
+        row.fofa_keys = [_fofa_payload(current) for current in items]
+        active_name = _set_fofa_active_name(row, items)
+        await session.commit()
+        _publish_settings_cache(row)
+        return _fofa_list_response(items, active_name=active_name)
+
+
+async def update_fofa_key(
+    session: AsyncSession, name: str, patch: dict[str, Any]
+) -> dict[str, Any]:
+    async with _provider_write_transaction(session) as row:
+        items = _stored_fofa_keys(row)
+        _reject_legacy_fofa_mutation(row, name, items)
+        wanted = _fofa_name_key(name)
+        index = next(
+            (i for i, item in enumerate(items) if _fofa_name_key(item.name) == wanted),
+            None,
+        )
+        if index is None:
+            raise FofaKeyNotFoundError(f"FOFA Key 不存在: {name}")
+
+        current = items[index]
+        merged = _fofa_payload(current)
+        credentials_changed = False
+        for key, value in patch.items():
+            if value is None:
+                continue
+            if key == "key" and (
+                not str(value or "").strip() or is_masked_secret(value)
+            ):
+                continue
+            if key in {"key", "base_url"} and merged.get(key) != value:
+                credentials_changed = True
+            merged[key] = value
+        merged["name"] = current.name
+        if credentials_changed:
+            merged.update(
+                runtime_state="ready",
+                failure_kind="",
+                failure_count=0,
+                cooldown_until=None,
+            )
+        items[index] = _validated_fofa_key(merged)
+        row.fofa_keys = [_fofa_payload(item) for item in items]
+        active_name = _set_fofa_active_name(row, items)
+        await session.commit()
+        _publish_settings_cache(row)
+        return _fofa_list_response(items, active_name=active_name)
+
+
+async def delete_fofa_key(session: AsyncSession, name: str) -> dict[str, Any]:
+    async with _provider_write_transaction(session) as row:
+        items = _stored_fofa_keys(row)
+        _reject_legacy_fofa_mutation(row, name, items)
+        wanted = _fofa_name_key(name)
+        kept = [item for item in items if _fofa_name_key(item.name) != wanted]
+        if len(kept) == len(items):
+            raise FofaKeyNotFoundError(f"FOFA Key 不存在: {name}")
+        row.fofa_keys = [_fofa_payload(item) for item in kept]
+        active_name = _set_fofa_active_name(row, kept)
+        await session.commit()
+        _publish_settings_cache(row)
+        return _fofa_list_response(kept, active_name=active_name)
+
+
+async def reorder_fofa_keys(
+    session: AsyncSession, names: list[str]
+) -> dict[str, Any]:
+    async with _provider_write_transaction(session) as row:
+        items = _stored_fofa_keys(row)
+        if not items:
+            raise FofaKeyReadOnlyError("Legacy Key 为只读兼容配置")
+        requested = [_fofa_name_key(name) for name in names]
+        existing = [_fofa_name_key(item.name) for item in items]
+        if (
+            len(requested) != len(existing)
+            or len(set(requested)) != len(requested)
+            or set(requested) != set(existing)
+        ):
+            raise FofaKeyOrderError("排序必须包含所有 FOFA Key 名称且不能重复")
+        by_name = {_fofa_name_key(item.name): item for item in items}
+        ordered = [by_name[name] for name in requested]
+        row.fofa_keys = [_fofa_payload(item) for item in ordered]
+        active_name = _active_fofa_name(row, ordered)
+        await session.commit()
+        _publish_settings_cache(row)
+        return _fofa_list_response(ordered, active_name=active_name)
+
+
+async def get_fofa_key(
+    session: AsyncSession, name: str, *, include_legacy: bool = False
+) -> FofaKeyConfig:
+    row = await refresh_cache(session)
+    items = _stored_fofa_keys(row)
+    wanted = _fofa_name_key(name)
+    for item in items:
+        if _fofa_name_key(item.name) == wanted:
+            return item
+    if not items and include_legacy and wanted == _fofa_name_key("Legacy Key"):
+        raise FofaKeyReadOnlyError("Legacy Key 为只读兼容配置")
+    raise FofaKeyNotFoundError(f"FOFA Key 不存在: {name}")
+
+
 def _redact_provider_error(text_value: str, provider: LLMProviderConfig) -> str:
     return _sanitize_error_detail(
         str(text_value or ""), redact_values=(provider.api_key,)
@@ -858,23 +1177,229 @@ async def probe_llm_provider(provider: LLMProviderConfig) -> dict[str, Any]:
 
 async def probe_fofa_key(key: str, base_url: str) -> dict[str, Any]:
     started = time.perf_counter()
-    error = ""
+    normalized_key = str(key or "").strip()
+    normalized_url = str(base_url or "").strip()
+    metadata = {
+        "resolved_url": normalized_url,
+        "endpoint_mode": "",
+        "http_status": None,
+    }
+    category = "transient"
+    error = "未配置 FOFA Key"
     ok = False
-    if not str(key or "").strip():
-        error = "未配置 FOFA key"
-    else:
+    if normalized_key:
+        path = urlsplit(normalized_url).path
+        purpose = "info" if path in {"", "/", "/api/v1/info/my"} else "search"
+        params = (
+            {}
+            if purpose == "info"
+            else {
+                "qbase64": "Kg==",
+                "fields": "host",
+                "page": "1",
+                "size": "1",
+                "full": "false",
+            }
+        )
         try:
-            await get_fofa_userinfo(key, base_url)
-            ok = True
-        except Exception as exc:
-            if getattr(exc, "account_error", False):
-                error = "FOFA Key 无效、额度不足或无权限"
+            transport = await fofa_endpoints.request_async(
+                normalized_key,
+                normalized_url,
+                purpose=purpose,
+                params=params,
+                timeout=15,
+                allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+            )
+            metadata = {
+                "resolved_url": transport.resolved_url,
+                "endpoint_mode": transport.endpoint_mode,
+                "http_status": transport.http_status,
+            }
+            response = transport.response
+            transport_category = str(transport.category or "transient")
+            if transport_category == "endpoint":
+                category = "endpoint"
+                error = f"FOFA endpoint returned HTTP {transport.http_status or 0}"
+            elif transport_category in {"network", "http_5xx", "http_error"}:
+                category = "transient"
+                error = "FOFA 服务暂时不可用"
+            elif response is None:
+                category = "transient"
+                error = "FOFA 服务返回为空"
+            elif transport_category in {"auth", "rate_limit", "daily_limit"}:
+                category = transport_category
+                error = extract_fofa_response_failure(response)
             else:
-                error = "FOFA 服务不可用，请检查 Key、端点或网络"
+                try:
+                    data = response.json()
+                except Exception:
+                    data = None
+                if not isinstance(data, dict):
+                    category = "transient"
+                    error = "FOFA 服务返回非 JSON 数据"
+                elif transport_category == "ok" and not data.get("error"):
+                    category = "ok"
+                    error = ""
+                    ok = True
+                else:
+                    message = extract_fofa_response_failure(response)
+                    if isinstance(data, dict):
+                        message, display = extract_fofa_error(data, message)
+                    else:
+                        display = message
+                    if transport_category == "endpoint":
+                        category = "endpoint"
+                    else:
+                        classified, _code, _retry = classify_fofa_failure(
+                            message, status=transport.http_status
+                        )
+                        category = classified if classified in {
+                            "auth", "rate_limit", "daily_limit"
+                        } else "transient"
+                    error = display or "FOFA 检测失败"
+        except Exception as exc:
+            category = "transient"
+            error = f"FOFA 检测失败: {type(exc).__name__}"
+    error = _sanitize_error_detail(error, redact_values=(normalized_key,))
     return {
         "ok": ok,
         "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
         "error": error,
+        "category": category,
+        **metadata,
+    }
+
+
+def _fofa_auto_blocked(item: FofaKeyConfig) -> bool:
+    return item.runtime_state in {
+        "auth_invalid",
+        "rate_limited",
+        "daily_cooldown",
+        "daily_suspended",
+    }
+
+
+def _apply_fofa_probe_state(
+    item: FofaKeyConfig, result: dict[str, Any], *, now: datetime | None = None
+) -> FofaKeyConfig:
+    updated = item.model_copy(deep=True)
+    category = str(result.get("category") or "transient")
+    if result.get("ok"):
+        updated.runtime_state = "ready"
+        updated.failure_kind = ""
+        updated.failure_count = 0
+        updated.cooldown_until = None
+        return updated
+
+    state_kind = category if category in {"auth", "rate_limit", "daily_limit"} else "transient"
+    updated.failure_count = (
+        updated.failure_count + 1 if updated.failure_kind == state_kind else 1
+    )
+    updated.failure_kind = state_kind
+    updated.cooldown_until = None
+    current_time = now or datetime.now(timezone.utc)
+    if category == "auth":
+        updated.runtime_state = "auth_invalid"
+    elif category == "rate_limit":
+        updated.runtime_state = "rate_limited"
+        delay = min(60 * (2 ** min(updated.failure_count - 1, 4)), 600)
+        updated.cooldown_until = current_time + timedelta(seconds=delay)
+    elif category == "daily_limit":
+        if updated.failure_count >= 12:
+            updated.runtime_state = "daily_suspended"
+        else:
+            updated.runtime_state = "daily_cooldown"
+            updated.cooldown_until = current_time + timedelta(hours=1)
+    else:
+        updated.runtime_state = "ready"
+    return updated
+
+
+def _safe_fofa_probe_result(
+    result: dict[str, Any], *, secrets: tuple[str, ...]
+) -> dict[str, Any]:
+    def redact(value: Any) -> str:
+        text_value = str(value or "")
+        for secret in secrets:
+            text_value = redact_fofa_secrets(text_value, secret)
+        return _sanitize_error_detail(text_value, redact_values=secrets)
+
+    category = str(result.get("category") or ("ok" if result.get("ok") else "transient"))
+    return {
+        "ok": bool(result.get("ok")),
+        "latency_ms": max(0, int(result.get("latency_ms") or 0)),
+        "error": redact(result.get("error")),
+        "category": category,
+        "resolved_url": redact(result.get("resolved_url")),
+        "endpoint_mode": str(result.get("endpoint_mode") or ""),
+        "http_status": result.get("http_status"),
+    }
+
+
+async def test_fofa_key(
+    session: AsyncSession, name: str
+) -> dict[str, Any]:
+    row = await refresh_cache(session)
+    items = _stored_fofa_keys(row)
+    _reject_legacy_fofa_mutation(row, name, items)
+    wanted = _fofa_name_key(name)
+    snapshot = next(
+        (item for item in items if _fofa_name_key(item.name) == wanted), None
+    )
+    if snapshot is None:
+        raise FofaKeyNotFoundError(f"FOFA Key 不存在: {name}")
+    fingerprint = _fofa_fingerprint(snapshot)
+    await session.rollback()
+    try:
+        raw_result = await probe_fofa_key(snapshot.key, snapshot.base_url)
+    except Exception as exc:
+        raw_result = {
+            "ok": False,
+            "latency_ms": 0,
+            "error": str(exc),
+            "category": "transient",
+            "resolved_url": snapshot.base_url,
+            "endpoint_mode": "",
+            "http_status": None,
+        }
+    probe_result = _safe_fofa_probe_result(raw_result, secrets=(snapshot.key,))
+
+    async with _provider_write_transaction(session) as current_row:
+        current_items = _stored_fofa_keys(current_row)
+        index = next(
+            (
+                i
+                for i, item in enumerate(current_items)
+                if _fofa_name_key(item.name) == wanted
+            ),
+            None,
+        )
+        current = current_items[index] if index is not None else None
+        matches = bool(
+            current
+            and hmac.compare_digest(_fofa_fingerprint(current), fingerprint)
+        )
+        if matches and current is not None and index is not None:
+            current = _apply_fofa_probe_state(current, probe_result)
+            current_items[index] = current
+            current_row.fofa_keys = [_fofa_payload(item) for item in current_items]
+        await session.commit()
+        await session.refresh(current_row)
+        _publish_settings_cache(current_row)
+        final_items = _stored_fofa_keys(current_row)
+        final = next(
+            (item for item in final_items if _fofa_name_key(item.name) == wanted),
+            snapshot,
+        )
+        active_name = _active_fofa_name(current_row, final_items)
+
+    return {
+        "fofa_key": {
+            **_fofa_api_view(final, active_name=active_name),
+            "auto_blocked": _fofa_auto_blocked(final),
+            "stale": not matches,
+            **probe_result,
+        }
     }
 
 
@@ -888,8 +1413,13 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
         _provider_name_key(provider.name): _provider_fingerprint(provider)
         for provider in providers
     }
-    fofa_snapshot = _fofa_probe_config_from_row(row)
-    fofa_fingerprint = _settings_fingerprint(fofa_snapshot)
+    stored_fofa_keys = _stored_fofa_keys(row)
+    uses_legacy_fofa = not stored_fofa_keys
+    fofa_snapshots = stored_fofa_keys or [_legacy_fofa_key_from_row(row)]
+    fofa_fingerprints = {
+        _fofa_name_key(item.name): _fofa_fingerprint(item)
+        for item in fofa_snapshots
+    }
 
     # Do not retain a SQLite read transaction while waiting on external services.
     await session.rollback()
@@ -899,7 +1429,7 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
         secret
         for secret in [
             *(provider.api_key for provider in providers),
-            fofa_snapshot["key"],
+            *(item.key for item in fofa_snapshots),
         ]
         if secret
     )
@@ -926,28 +1456,28 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
             ),
         }
 
-    async def probe_fofa() -> dict[str, Any]:
+    async def probe_fofa(item: FofaKeyConfig) -> dict[str, Any]:
         async with semaphore:
             try:
-                result = await probe_fofa_key(
-                    fofa_snapshot["key"], fofa_snapshot["base_url"]
-                )
+                result = await probe_fofa_key(item.key, item.base_url)
             except Exception as exc:
-                result = {"ok": False, "latency_ms": 0, "error": str(exc)}
-        return {
-            "ok": bool(result.get("ok")),
-            "latency_ms": max(0, int(result.get("latency_ms") or 0)),
-            "error": _sanitize_error_detail(
-                str(result.get("error") or ""), redact_values=all_secrets
-            ),
-        }
+                result = {
+                    "ok": False,
+                    "latency_ms": 0,
+                    "error": str(exc),
+                    "category": "transient",
+                    "resolved_url": item.base_url,
+                    "endpoint_mode": "",
+                    "http_status": None,
+                }
+        return _safe_fofa_probe_result(result, secrets=all_secrets)
 
     gathered = await asyncio.gather(
         *(probe_provider(provider) for provider in providers),
-        probe_fofa(),
+        *(probe_fofa(item) for item in fofa_snapshots),
     )
-    provider_probe_results = list(gathered[:-1])
-    fofa_probe_result = gathered[-1]
+    provider_probe_results = list(gathered[: len(providers)])
+    fofa_probe_results = list(gathered[len(providers) :])
 
     provider_results: list[dict[str, Any]] = []
     async with _provider_write_transaction(session) as current_row:
@@ -999,19 +1529,73 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
                 }
             )
 
-        current_fofa = _fofa_probe_config_from_row(current_row)
-        fofa_stale = not hmac.compare_digest(
-            _settings_fingerprint(current_fofa), fofa_fingerprint
-        )
-        fofa_enabled = current_fofa["enabled"]
-        fofa_auto_disabled = False
-        if not fofa_stale:
-            desired_fofa_enabled = bool(fofa_probe_result["ok"])
-            fofa_auto_disabled = fofa_enabled and not desired_fofa_enabled
-            fofa_enabled = desired_fofa_enabled
-            stored_fofa = dict(current_row.fofa or {})
-            stored_fofa["enabled"] = desired_fofa_enabled
-            current_row.fofa = stored_fofa
+        fofa_results: list[dict[str, Any]] = []
+        legacy_fofa_result: dict[str, Any] | None = None
+        current_fofa_items = _stored_fofa_keys(current_row)
+        if uses_legacy_fofa:
+            snapshot = fofa_snapshots[0]
+            probe_result = fofa_probe_results[0]
+            current_legacy = _legacy_fofa_key_from_row(current_row)
+            fofa_stale = not hmac.compare_digest(
+                _fofa_fingerprint(current_legacy),
+                fofa_fingerprints[_fofa_name_key(snapshot.name)],
+            )
+            fofa_enabled = current_legacy.enabled
+            fofa_auto_disabled = False
+            if not fofa_stale:
+                desired_fofa_enabled = bool(probe_result["ok"])
+                fofa_auto_disabled = fofa_enabled and not desired_fofa_enabled
+                fofa_enabled = desired_fofa_enabled
+                stored_fofa = dict(current_row.fofa or {})
+                stored_fofa["enabled"] = desired_fofa_enabled
+                current_row.fofa = stored_fofa
+            legacy_fofa_result = {
+                "name": "FOFA",
+                "ok": probe_result["ok"],
+                "latency_ms": probe_result["latency_ms"],
+                "error": probe_result["error"],
+                "enabled": fofa_enabled,
+                "auto_disabled": fofa_auto_disabled,
+                "stale": fofa_stale,
+            }
+        else:
+            current_by_name = {
+                _fofa_name_key(item.name): (index, item)
+                for index, item in enumerate(current_fofa_items)
+            }
+            current_payloads = [
+                _fofa_payload(item) for item in current_fofa_items
+            ]
+            for snapshot, probe_result in zip(fofa_snapshots, fofa_probe_results):
+                name_key = _fofa_name_key(snapshot.name)
+                found = current_by_name.get(name_key)
+                current_index, current_item = found if found else (None, None)
+                matches = bool(
+                    current_item
+                    and hmac.compare_digest(
+                        _fofa_fingerprint(current_item),
+                        fofa_fingerprints[name_key],
+                    )
+                )
+                if matches and current_item is not None and current_index is not None:
+                    current_item = _apply_fofa_probe_state(
+                        current_item, probe_result
+                    )
+                    current_fofa_items[current_index] = current_item
+                    current_payloads[current_index] = _fofa_payload(current_item)
+                display_item = current_item or snapshot
+                fofa_results.append(
+                    {
+                        "name": snapshot.name,
+                        **probe_result,
+                        "enabled": display_item.enabled,
+                        "runtime_state": display_item.runtime_state,
+                        "auto_blocked": _fofa_auto_blocked(display_item),
+                        "stale": not matches,
+                    }
+                )
+            if current_payloads != list(current_row.fofa_keys or []):
+                current_row.fofa_keys = current_payloads
 
         if provider_payloads != list(current_row.llm_providers or []):
             current_row.llm_providers = provider_payloads
@@ -1027,19 +1611,24 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
             public_providers = [
                 _provider_api_view(_legacy_provider_from_row(current_row), read_only=True)
             ]
+        final_fofa_items = _stored_fofa_keys(current_row)
+        final_active_name = _active_fofa_name(current_row, final_fofa_items)
+        public_fofa_keys = [
+            _fofa_api_view(item, active_name=final_active_name)
+            for item in final_fofa_items
+        ]
 
-    return {
+    response = {
         "checked_at": to_cst_iso(datetime.now(timezone.utc)),
         "provider_results": provider_results,
-        "fofa_result": {
-            "name": "FOFA",
-            **fofa_probe_result,
-            "enabled": fofa_enabled,
-            "auto_disabled": fofa_auto_disabled,
-            "stale": fofa_stale,
-        },
         "providers": public_providers,
     }
+    if uses_legacy_fofa:
+        response["fofa_result"] = legacy_fofa_result
+    else:
+        response["fofa_results"] = fofa_results
+        response["fofa_keys"] = public_fofa_keys
+    return response
 
 
 def _provider_mutation_lock() -> asyncio.Lock:
