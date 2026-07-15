@@ -194,7 +194,17 @@ def _iter_json_array(
             if text[cursor] == "]":
                 if saw_value and len(errors) < 64:
                     errors.append("json array: trailing comma")
-                if not allow_suffix and text[cursor + 1 :].strip() and len(errors) < 64:
+                suffix = text[cursor + 1 :].strip()
+                if allow_suffix:
+                    # FFUF wraps its results array in an object.  Keep the
+                    # array streaming path, but still detect a truncated
+                    # wrapper instead of accepting usable-looking records as
+                    # a complete capture.
+                    if not suffix and len(errors) < 64:
+                        errors.append("json wrapper: unterminated object")
+                    elif suffix and not suffix.endswith("}") and len(errors) < 64:
+                        errors.append("json wrapper: trailing data")
+                elif suffix and len(errors) < 64:
                     errors.append("json array: trailing data")
                 return
             try:
@@ -215,7 +225,13 @@ def _iter_json_array(
             expect_value = True
             continue
         if text[cursor] == "]":
-            if not allow_suffix and text[cursor + 1 :].strip() and len(errors) < 64:
+            suffix = text[cursor + 1 :].strip()
+            if allow_suffix:
+                if not suffix and len(errors) < 64:
+                    errors.append("json wrapper: unterminated object")
+                elif suffix and not suffix.endswith("}") and len(errors) < 64:
+                    errors.append("json wrapper: trailing data")
+            elif suffix and len(errors) < 64:
                 errors.append("json array: trailing data")
             return
         if len(errors) < 64:

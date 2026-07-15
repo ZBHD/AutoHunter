@@ -133,6 +133,13 @@ def test_src_parser_reports_empty_and_malformed_output() -> None:
     assert malformed_array.parse_ok is True
     assert malformed_array.parse_errors
 
+    malformed_ffuf_wrapper = parse_src_output(
+        "discover_content",
+        '{"results":[{"url":"https://a.test/admin"}]',
+    )
+    assert malformed_ffuf_wrapper.parse_ok is True
+    assert malformed_ffuf_wrapper.parse_errors
+
 
 def test_src_parser_preserves_head_tail_priority_and_scan_limit() -> None:
     output = "\n".join(
