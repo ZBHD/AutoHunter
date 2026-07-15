@@ -340,13 +340,13 @@ def test_successful_single_probe_clears_block_but_preserves_manual_disable(
     assert item["resolved_url"].endswith("/api/v1/info/my")
 
 
-def test_single_probe_redacts_case_varied_url_encoded_key(
+def test_single_probe_uses_compatible_placeholder_for_url_encoded_key(
     fofa_key_api, monkeypatch
 ) -> None:
     client, _session_maker = fofa_key_api
     secret = "Opaque/Probe+VERYSECRET"
     _create(client, "Probe", secret)
-    encoded = quote(secret, safe="").lower()
+    encoded = quote(secret, safe="")
 
     async def failed(_key, _base_url):
         return _probe_result(category="transient", error=f"rejected {encoded}")
@@ -355,8 +355,9 @@ def test_single_probe_redacts_case_varied_url_encoded_key(
     response = client.post("/api/settings/fofa-keys/Probe/test")
 
     assert response.status_code == 200
-    assert encoded not in response.text.lower()
+    assert encoded not in response.text
     assert secret not in response.text
+    assert response.json()["fofa_key"]["error"] == "rejected <masked>"
 
 
 def test_probe_failure_categories_update_runtime_state_without_manual_disable(
