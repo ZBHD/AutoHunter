@@ -162,6 +162,27 @@ def test_src_parser_omitted_counts_duplicate_occurrences_by_index() -> None:
     assert parsed.omitted == 2
 
 
+@pytest.mark.parametrize("count,trailing,expected_count,partial", [
+    (2, False, 2, False),
+    (3, True, 3, False),
+    (4, False, 3, True),
+    (4, True, 3, True),
+])
+def test_src_parser_line_limit_treats_trailing_newline_as_terminator(
+    monkeypatch, count: int, trailing: bool, expected_count: int, partial: bool,
+) -> None:
+    from app.tools import src_toolkit
+
+    monkeypatch.setattr(src_toolkit, "_MAX_PARSE_LINES", 3)
+    records = "\n".join(
+        json.dumps({"url": f"https://a.test/line/{index}"})
+        for index in range(count)
+    )
+    parsed = parse_src_output("crawl_endpoints", records + ("\n" if trailing else ""))
+    assert parsed.count == expected_count
+    assert parsed.partial is partial
+
+
 def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path, monkeypatch) -> None:
     worker_root = tmp_path / "worker-root"
     monkeypatch.setattr(worker_config, "work_root", str(worker_root))

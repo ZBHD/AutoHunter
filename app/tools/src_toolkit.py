@@ -318,13 +318,15 @@ def _bounded_text(output: str) -> tuple[str, int, bool, bool]:
     for offset in range(0, len(raw), 8192):
         chunk = raw[offset : offset + 8192]
         encoded_length = len(chunk.encode("utf-8", "replace"))
+        is_last_chunk = offset + len(chunk) >= len(raw)
+        line_increment = chunk.count("\n") - int(is_last_chunk and chunk.endswith("\n"))
         if (
             byte_count + encoded_length <= _MAX_PARSE_BYTES
-            and line_count + chunk.count("\n") <= _MAX_PARSE_LINES
+            and line_count + line_increment <= _MAX_PARSE_LINES
         ):
             pieces.append(chunk)
             byte_count += encoded_length
-            line_count += chunk.count("\n")
+            line_count += line_increment
             continue
         prefix = chunk
         remaining_lines = _MAX_PARSE_LINES - line_count
