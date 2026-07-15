@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, quote_plus
 
 import pytest
@@ -783,3 +783,159 @@ def test_fofa_state_callback_ignores_closed_loop_without_leaking(
 
     assert called is False
     assert secret not in caplog.text
+
+
+def test_fofa_state_callback_drops_older_revision_after_newer_persisted(
+    fofa_key_api, monkeypatch
+) -> None:
+    _client, session_maker = fofa_key_api
+    secret = "revision-secret-a"
+    base_url = "https://fofa.info"
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[_key("A", secret), _key("B", "revision-secret-b")],
+            fofa={"active_key_name": "A"},
+        )
+    )
+    fingerprint = fofa_credential_fingerprint("A", secret, base_url)
+    newer = FofaKeyStateChange(
+        name="A",
+        base_url=base_url,
+        runtime_state="auth_invalid",
+        failure_kind="auth",
+        failure_count=2,
+        cooldown_until=None,
+        active_key_name="B",
+        credential_fingerprint=fingerprint,
+        revision=2,
+    )
+    older = FofaKeyStateChange(
+        name="A",
+        base_url=base_url,
+        runtime_state="ready",
+        failure_kind="",
+        failure_count=0,
+        cooldown_until=None,
+        active_key_name="A",
+        credential_fingerprint=fingerprint,
+        revision=1,
+    )
+    original_persist = settings_service._persist_fofa_key_state
+
+    async def scenario() -> None:
+        completed = asyncio.Event()
+        persisted_revisions: list[int] = []
+
+        async def observed(change: FofaKeyStateChange):
+            result = await original_persist(change)
+            persisted_revisions.append(change.revision)
+            completed.set()
+            return result
+
+        monkeypatch.setattr(
+            settings_service, "_persist_fofa_key_state", observed
+        )
+        callback = settings_service._fofa_state_callback(asyncio.get_running_loop())
+        await asyncio.to_thread(callback, newer)
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await asyncio.to_thread(callback, older)
+        await asyncio.sleep(0.05)
+        assert persisted_revisions == [2]
+
+    asyncio.run(scenario())
+    stored = asyncio.run(_raw_keys(session_maker))
+    assert stored[0]["runtime_state"] == "auth_invalid"
+    assert stored[0]["failure_count"] == 2
+    assert asyncio.run(_raw_fofa(session_maker))["active_key_name"] == "B"
+
+
+def test_public_active_skips_runtime_blocked_and_future_cooldown_keys(
+    fofa_key_api,
+) -> None:
+    client, session_maker = fofa_key_api
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[
+                _key(
+                    "Auth",
+                    "secret-auth",
+                    runtime_state="auth_invalid",
+                    failure_kind="auth",
+                    failure_count=1,
+                ),
+                _key(
+                    "Daily",
+                    "secret-daily",
+                    runtime_state="daily_suspended",
+                    failure_kind="daily_limit",
+                    failure_count=12,
+                ),
+                _key(
+                    "Cooling",
+                    "secret-cooling",
+                    runtime_state="rate_limited",
+                    failure_kind="rate_limit",
+                    failure_count=1,
+                    cooldown_until=future.isoformat(),
+                ),
+                _key("Ready", "secret-ready"),
+            ],
+            fofa={"active_key_name": "Auth"},
+        )
+    )
+
+    listed = client.get("/api/settings/fofa-keys").json()["fofa_keys"]
+    public = client.get("/api/settings").json()["fofa_keys"]
+
+    assert [item["name"] for item in listed if item["is_active"]] == ["Ready"]
+    assert [item["name"] for item in public if item["is_active"]] == ["Ready"]
+
+
+def test_expired_cooldown_can_be_active_and_all_blocked_has_no_active(
+    fofa_key_api,
+) -> None:
+    client, session_maker = fofa_key_api
+    past = datetime.now(timezone.utc) - timedelta(minutes=1)
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[
+                _key(
+                    "Expired",
+                    "secret-expired",
+                    runtime_state="rate_limited",
+                    failure_kind="rate_limit",
+                    failure_count=1,
+                    cooldown_until=past.isoformat(),
+                ),
+                _key("Ready", "secret-ready"),
+            ],
+            fofa={"active_key_name": "Expired"},
+        )
+    )
+
+    listed = client.get("/api/settings/fofa-keys").json()["fofa_keys"]
+    assert [item["name"] for item in listed if item["is_active"]] == ["Expired"]
+
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[
+                _key(
+                    "Auth",
+                    "secret-auth",
+                    runtime_state="auth_invalid",
+                    failure_kind="auth",
+                ),
+                _key("Disabled", "secret-disabled", enabled=False),
+            ],
+            fofa={"active_key_name": "Auth"},
+        )
+    )
+    blocked = client.get("/api/settings/fofa-keys").json()["fofa_keys"]
+    public_blocked = client.get("/api/settings").json()["fofa_keys"]
+    assert not any(item["is_active"] for item in blocked)
+    assert not any(item["is_active"] for item in public_blocked)

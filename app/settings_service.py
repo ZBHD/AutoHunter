@@ -607,23 +607,43 @@ def _legacy_fofa_key_from_row(row: SystemSettings) -> FofaKeyConfig:
     )
 
 
-def _active_fofa_name(row: SystemSettings, items: list[FofaKeyConfig]) -> str:
-    configured = str((row.fofa or {}).get("active_key_name") or "").strip()
+def _fofa_key_eligible(
+    item: FofaKeyConfig, now: datetime | None = None
+) -> bool:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("FOFA eligibility time must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    if not item.enabled or not item.key:
+        return False
+    if item.runtime_state in {"auth_invalid", "daily_suspended"}:
+        return False
+    return item.cooldown_until is None or item.cooldown_until <= current
+
+
+def _select_fofa_active_name(
+    configured: str, items: list[FofaKeyConfig], now: datetime | None = None
+) -> str:
+    current = now or datetime.now(timezone.utc)
     wanted = _fofa_name_key(configured)
     for item in items:
-        if wanted and _fofa_name_key(item.name) == wanted:
+        if (
+            _fofa_name_key(item.name) == wanted
+            and _fofa_key_eligible(item, current)
+        ):
             return item.name
-    return next((item.name for item in items if item.enabled), "")
+    return next(
+        (item.name for item in items if _fofa_key_eligible(item, current)), ""
+    )
+
+
+def _active_fofa_name(row: SystemSettings, items: list[FofaKeyConfig]) -> str:
+    configured = str((row.fofa or {}).get("active_key_name") or "").strip()
+    return _select_fofa_active_name(configured, items)
 
 
 def _set_fofa_active_name(row: SystemSettings, items: list[FofaKeyConfig]) -> str:
     active = _active_fofa_name(row, items)
-    active_item = next(
-        (item for item in items if _fofa_name_key(item.name) == _fofa_name_key(active)),
-        None,
-    )
-    if active_item is None or not active_item.enabled:
-        active = next((item.name for item in items if item.enabled), "")
     fofa = dict(row.fofa or {})
     fofa["active_key_name"] = active
     row.fofa = fofa
@@ -679,11 +699,7 @@ def public_settings_view() -> dict[str, Any]:
         try:
             items = [_validated_fofa_key(value) for value in raw_fofa_keys]
             active_name = str(fofa.get("active_key_name") or "")
-            if not any(
-                _fofa_name_key(item.name) == _fofa_name_key(active_name)
-                for item in items
-            ):
-                active_name = next((item.name for item in items if item.enabled), "")
+            active_name = _select_fofa_active_name(active_name, items)
             fofa_keys_view = [
                 _fofa_api_view(item, active_name=active_name) for item in items
             ]
@@ -694,7 +710,7 @@ def public_settings_view() -> dict[str, Any]:
         fofa_keys_view = [
             _fofa_api_view(
                 legacy,
-                active_name=legacy.name if legacy.enabled else "",
+                active_name=legacy.name if _fofa_key_eligible(legacy) else "",
                 read_only=True,
             )
         ]
@@ -1005,7 +1021,7 @@ async def list_fofa_keys(
         "fofa_keys": [
             _fofa_api_view(
                 legacy,
-                active_name=legacy.name if legacy.enabled else "",
+                active_name=legacy.name if _fofa_key_eligible(legacy) else "",
                 read_only=True,
             )
         ]
@@ -1720,7 +1736,7 @@ async def _persist_global_provider_disabled(
     logger.warning("LLM provider '%s' 已持久禁用: %s", name, redacted_reason)
 
 
-async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
+async def _persist_fofa_key_state(change: FofaKeyStateChange) -> bool:
     """Persist a Router state transition only while its credential is current."""
     async with SessionLocal() as session:
         async with _provider_write_transaction(session) as row:
@@ -1728,7 +1744,7 @@ async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
                 items = _stored_fofa_keys(row)
             except FofaKeyValidationError:
                 await session.rollback()
-                return
+                return False
             wanted = _fofa_name_key(change.name)
             index = next(
                 (
@@ -1740,7 +1756,7 @@ async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
             )
             if index is None or not change.credential_fingerprint:
                 await session.rollback()
-                return
+                return False
             current = items[index]
             current_fingerprint = fofa_credential_fingerprint(
                 current.name, current.key, current.base_url
@@ -1749,7 +1765,7 @@ async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
                 current_fingerprint, change.credential_fingerprint
             ):
                 await session.rollback()
-                return
+                return False
 
             payload = _fofa_payload(current)
             payload.update(
@@ -1762,43 +1778,60 @@ async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
                 updated = _validated_fofa_key(payload)
             except FofaKeyValidationError:
                 await session.rollback()
-                return
+                return False
             changed = _fofa_payload(updated) != _fofa_payload(current)
             items[index] = updated
 
             fofa = dict(row.fofa or {})
-            active_name = str(change.active_key_name or "").strip()
-            active = next(
-                (
-                    item.name
-                    for item in items
-                    if item.enabled
-                    and _fofa_name_key(item.name) == _fofa_name_key(active_name)
-                ),
-                "",
+            active = _select_fofa_active_name(
+                str(change.active_key_name or "").strip(), items
             )
-            if active and fofa.get("active_key_name") != active:
+            if fofa.get("active_key_name") != active:
                 fofa["active_key_name"] = active
                 row.fofa = fofa
                 changed = True
 
             if not changed:
                 await session.rollback()
-                return
+                return True
             row.fofa_keys = [_fofa_payload(item) for item in items]
             await session.commit()
             await session.refresh(row)
             _publish_settings_cache(row)
+            return True
 
 
 def _fofa_state_callback(loop: asyncio.AbstractEventLoop):
+    persist_lock = asyncio.Lock()
+    last_persisted_revision = -1
+    persisted_by_credential: dict[tuple[str, str], int] = {}
+
+    async def persist_serialized(change: FofaKeyStateChange) -> bool:
+        nonlocal last_persisted_revision
+        credential = (
+            _fofa_name_key(change.name),
+            str(change.credential_fingerprint or ""),
+        )
+        async with persist_lock:
+            if (
+                change.revision <= last_persisted_revision
+                or change.revision <= persisted_by_credential.get(credential, -1)
+            ):
+                return False
+            persisted = await _persist_fofa_key_state(change)
+            if persisted is False:
+                return False
+            last_persisted_revision = change.revision
+            persisted_by_credential[credential] = change.revision
+            return True
+
     def callback(change: FofaKeyStateChange) -> None:
         if loop.is_closed():
             logger.warning(
                 "事件循环已关闭，FOFA Key 状态未持久化: name=%s", change.name
             )
             return
-        coroutine = _persist_fofa_key_state(change)
+        coroutine = persist_serialized(change)
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         except Exception as exc:
