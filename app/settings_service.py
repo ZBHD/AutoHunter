@@ -30,6 +30,7 @@ from app.fofa.client import (
     classify_fofa_failure,
     extract_fofa_error,
     extract_fofa_response_failure,
+    redact_fofa_secrets,
 )
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
 from app.llm.router import LLMRouter
@@ -1318,9 +1319,11 @@ def _safe_fofa_probe_result(
     result: dict[str, Any], *, secrets: tuple[str, ...]
 ) -> dict[str, Any]:
     def redact(value: Any) -> str:
-        return _sanitize_error_detail(
-            str(value or ""), redact_values=secrets
-        )
+        text_value = str(value or "")
+        for secret in secrets:
+            text_value = redact_fofa_secrets(text_value, secret)
+        text_value = text_value.replace("[REDACTED]", "<masked>")
+        return _sanitize_error_detail(text_value, redact_values=secrets)
 
     category = str(result.get("category") or ("ok" if result.get("ok") else "transient"))
     return {

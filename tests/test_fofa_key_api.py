@@ -344,20 +344,28 @@ def test_single_probe_uses_compatible_placeholder_for_url_encoded_key(
     fofa_key_api, monkeypatch
 ) -> None:
     client, _session_maker = fofa_key_api
-    secret = "Opaque/Probe+VERYSECRET"
+    secret = "Opaque/Probe+VERY SECRET"
     _create(client, "Probe", secret)
-    encoded = quote(secret, safe="")
+    variants = (
+        secret,
+        quote(secret, safe="").lower(),
+        quote_plus(secret, safe="").lower(),
+    )
 
     async def failed(_key, _base_url):
-        return _probe_result(category="transient", error=f"rejected {encoded}")
+        return _probe_result(
+            category="transient", error="rejected " + " ".join(variants)
+        )
 
     monkeypatch.setattr(settings_service, "probe_fofa_key", failed)
     response = client.post("/api/settings/fofa-keys/Probe/test")
 
     assert response.status_code == 200
-    assert encoded not in response.text
-    assert secret not in response.text
-    assert response.json()["fofa_key"]["error"] == "rejected <masked>"
+    for variant in variants:
+        assert variant.casefold() not in response.text.casefold()
+    assert response.json()["fofa_key"]["error"] == (
+        "rejected <masked> <masked> <masked>"
+    )
 
 
 def test_probe_failure_categories_update_runtime_state_without_manual_disable(
@@ -581,3 +589,41 @@ def test_one_click_stale_probe_does_not_overwrite_replaced_key_or_leak_error(
     assert quote(old_secret, safe="") not in response.text
     assert quote_plus(old_secret, safe="") not in response.text
     assert replacement not in response.text
+
+
+def test_one_click_health_redacts_case_varied_encoded_key_variants(
+    fofa_key_api, monkeypatch
+) -> None:
+    client, session_maker = fofa_key_api
+    secret = "Health/Probe+VERY SECRET"
+    variants = (
+        secret,
+        quote(secret, safe="").lower(),
+        quote_plus(secret, safe="").lower(),
+    )
+    asyncio.run(_seed(session_maker, keys=[_key("Health", secret)]))
+
+    async def failed_probe(_key, _base_url):
+        return _probe_result(
+            category="transient", error="failed " + " ".join(variants)
+        )
+
+    async def successful_provider(provider):
+        return {
+            "ok": True,
+            "latency_ms": 1,
+            "model": provider.model,
+            "protocol": provider.protocol,
+            "error": "",
+        }
+
+    monkeypatch.setattr(settings_service, "probe_fofa_key", failed_probe)
+    monkeypatch.setattr(settings_service, "probe_llm_provider", successful_provider)
+    response = client.post("/api/settings/health-check")
+
+    assert response.status_code == 200
+    for variant in variants:
+        assert variant.casefold() not in response.text.casefold()
+    assert response.json()["fofa_results"][0]["error"] == (
+        "failed <masked> <masked> <masked>"
+    )
