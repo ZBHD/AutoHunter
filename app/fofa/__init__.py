@@ -8,6 +8,13 @@ from .router import (
     FofaPoolFailure,
     fofa_credential_fingerprint,
 )
+from .endpoints import (
+    FofaEndpointResult,
+    request_async,
+    request_sync,
+    resolve_endpoint,
+    standard_endpoint,
+)
 
 __all__ = [
     "FofaFailureKind",
@@ -17,4 +24,9 @@ __all__ = [
     "FofaPoolExhaustedError",
     "FofaPoolFailure",
     "fofa_credential_fingerprint",
+    "FofaEndpointResult",
+    "request_async",
+    "request_sync",
+    "resolve_endpoint",
+    "standard_endpoint",
 ]

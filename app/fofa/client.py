@@ -9,6 +9,9 @@ from urllib.parse import quote, quote_plus
 
 import httpx
 
+from app.fofa.endpoints import request_async
+from app.tools.netguard import SsrfBlocked
+
 BASE = "https://fofa.info"
 
 # 允许指向内网/私有的 FOFA base_url 白名单（私有部署/镜像场景，逗号分隔的 host）。
@@ -224,53 +227,55 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
     if not key:
         raise FofaError("缺少 FOFA key")
     base = (base_url or BASE).rstrip("/")
-    # 请求会把真实 FOFA key 放进 query，必须防 SSRF（篡改 base_url 外泄 key）。
-    # 私有 FOFA 部署可通过 FOFA_ALLOWED_HOSTS 显式放行。
-    from app.tools.netguard import SsrfBlocked, assert_safe_outbound_url
-
-    try:
-        assert_safe_outbound_url(
-            f"{base}/api/v1/search/all", allow_extra_hosts=_FOFA_ALLOWED_HOSTS
-        )
-    except SsrfBlocked as e:
-        raise FofaError(f"FOFA base_url 不被允许：{e}") from e
     params = {
         "key": key, "qbase64": _qbase64(query),
         "fields": fields, "page": str(page), "size": str(size), "full": "false",
     }
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{base}/api/v1/search/all", params=params)
-            if not 200 <= resp.status_code < 300:
-                raise _structured_error(
-                    extract_fofa_response_failure(resp),
-                    status=resp.status_code,
-                    retry_after=_retry_after(resp),
-                    display_message=f"FOFA 返回 HTTP {resp.status_code}",
-                    key=key,
-                )
-            try:
-                data = resp.json()
-            except Exception:
-                message = str(getattr(resp, "text", ""))[:200]
-                raise _structured_error(
-                    message,
-                    status=resp.status_code,
-                    retry_after=_retry_after(resp),
-                    display_message=f"FOFA 返回非 JSON (HTTP {resp.status_code})",
-                    key=key,
-                ) from None
+        result = await request_async(
+            base,
+            purpose="search",
+            params=params,
+            timeout=30,
+            allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+        )
+        if result.category == "network":
+            error = result.error
+            message = f"{type(error).__name__}: {error}" if error else "网络错误"
+            raise _structured_error(
+                message,
+                display_message=f"FOFA 请求失败: {message}",
+                key=key,
+            ) from None
+        resp = result.response
+        if resp is None:
+            raise _structured_error("FOFA 返回为空", key=key)
+        if not 200 <= resp.status_code < 300:
+            raise _structured_error(
+                extract_fofa_response_failure(resp),
+                status=resp.status_code,
+                retry_after=_retry_after(resp),
+                display_message=f"FOFA 返回 HTTP {resp.status_code}",
+                key=key,
+            )
+        try:
+            data = resp.json()
+        except Exception:
+            message = str(getattr(resp, "text", ""))[:200]
+            raise _structured_error(
+                message,
+                status=resp.status_code,
+                retry_after=_retry_after(resp),
+                display_message=f"FOFA 返回非 JSON (HTTP {resp.status_code})",
+                key=key,
+            ) from None
+    except SsrfBlocked as exc:
+        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
     except FofaError:
         raise
     except httpx.HTTPError as e:
-        # 网络抖动/超时/连接失败等统一包装成 FofaError，避免裸 httpx 异常
-        # 一路冒到 orchestrator 主循环（外部 API 不可用是常态，应降级而非告警）。
         message = f"{type(e).__name__}: {e}"
-        raise _structured_error(
-            message,
-            display_message=f"FOFA 请求失败: {message}",
-            key=key,
-        ) from None
+        raise _structured_error(message, display_message=f"FOFA 请求失败: {message}", key=key) from None
     if not isinstance(data, dict):
         raise _structured_error(
             "FOFA 返回无效 JSON 数据",
@@ -298,18 +303,25 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
     """调用 FOFA 官方账号信息接口验证 Key，不消耗搜索额度。"""
     if not key:
         raise FofaError("缺少 FOFA key", account_error=True)
-    base = (base_url or BASE).rstrip("/")
-    url = f"{base}/api/v1/info/my"
-    from app.tools.netguard import SsrfBlocked, assert_safe_outbound_url
-
     try:
-        assert_safe_outbound_url(url, allow_extra_hosts=_FOFA_ALLOWED_HOSTS)
-    except SsrfBlocked as exc:
-        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(url, params={"key": key})
+        result = await request_async(
+            base_url or BASE,
+            purpose="info",
+            params={"key": key},
+            timeout=15,
+            allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+        )
+        if result.category == "network":
+            error = result.error
+            message = f"{type(error).__name__}: {error}" if error else "网络错误"
+            raise _structured_error(
+                message,
+                display_message=f"FOFA 请求失败: {message}",
+                key=key,
+            ) from None
+        response = result.response
+        if response is None:
+            raise _structured_error("FOFA 返回为空", key=key)
         if not 200 <= response.status_code < 300:
             raise _structured_error(
                 extract_fofa_response_failure(response),
@@ -329,6 +341,8 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
                 display_message="FOFA 账号接口返回非 JSON",
                 key=key,
             ) from None
+    except SsrfBlocked as exc:
+        raise FofaError(f"FOFA base_url 不被允许：{exc}") from exc
     except FofaError:
         raise
     except httpx.HTTPError as exc:

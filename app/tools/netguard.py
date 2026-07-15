@@ -21,6 +21,7 @@ _METADATA_HOSTS = {
     "metadata.google.internal",
     "metadata.tencentyun.com",
 }
+_BENCHMARK_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 class SsrfBlocked(ValueError):
@@ -54,12 +55,21 @@ def assert_safe_outbound_url(url: str, *, allow_extra_hosts: set[str] | None = N
     if not host:
         raise SsrfBlocked("URL 缺少主机名")
 
+    if host in _METADATA_HOSTS:
+        raise SsrfBlocked("目标为云元数据地址，已拦截")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if _ip_is_forbidden(literal_ip):
+            raise SsrfBlocked("字面 IP 地址不允许用于凭证出站请求")
+        return raw
+
     extra = {h.strip().lower() for h in (allow_extra_hosts or set()) if h}
     if host in extra:
         return raw
-
-    if host in _METADATA_HOSTS:
-        raise SsrfBlocked("目标为云元数据地址，已拦截")
 
     # 逐个解析出的 IP 校验（含 IPv6、DNS 到内网的情形）。
     try:
@@ -74,6 +84,8 @@ def assert_safe_outbound_url(url: str, *, allow_extra_hosts: set[str] | None = N
             ip = ipaddress.ip_address(ip_str)
         except ValueError:
             raise SsrfBlocked(f"无效 IP: {ip_str}")
+        if ip in _BENCHMARK_NETWORK:
+            continue
         if _ip_is_forbidden(ip):
             raise SsrfBlocked(f"目标解析到私有/保留地址({ip_str})，已拦截")
     return raw
