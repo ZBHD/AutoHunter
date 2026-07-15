@@ -111,7 +111,7 @@ class FofaKeyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    key: str = ""
+    key: str = Field(default="", repr=False)
     base_url: str = "https://fofa.info"
     enabled: bool = True
     runtime_state: FofaRuntimeState = "ready"

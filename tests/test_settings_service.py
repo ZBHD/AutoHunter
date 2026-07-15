@@ -213,7 +213,10 @@ def test_task_override_base_url_falls_back_to_legacy_base_url() -> None:
 
 def test_legacy_fofa_base_url_precedence(monkeypatch) -> None:
     monkeypatch.setenv("FOFA_BASE_URL", "https://env.example/api")
-    set_cache(fofa={"key": "legacy-secret", "base_url": "https://saved.example"})
+    set_cache(
+        fofa={"key": "legacy-secret", "base_url": "https://saved.example"},
+        engines={"fofa": {"base_url": "https://engine.example/api"}},
+    )
 
     assert settings_service.resolve_fofa_keys()[0].base_url == "https://saved.example"
 
@@ -222,6 +225,16 @@ def test_legacy_fofa_base_url_precedence(monkeypatch) -> None:
 
     monkeypatch.delenv("FOFA_BASE_URL", raising=False)
     assert settings_service.resolve_fofa_keys()[0].base_url == "https://fofa.info"
+
+
+def test_legacy_fofa_base_url_environment_wins_old_engine_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_BASE_URL", "https://env.example/api")
+    set_cache(
+        fofa={"key": "legacy-secret"},
+        engines={"fofa": {"base_url": "https://engine.example/api"}},
+    )
+
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://env.example/api"
 
 
 def test_legacy_fofa_base_url_keeps_old_engine_compatibility_fallback(monkeypatch) -> None:
