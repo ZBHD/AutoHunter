@@ -131,7 +131,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 ## 9. 兼容与迁移
 
-数据库迁移为 `system_settings` 增加 `fofa_keys JSON DEFAULT '[]'`，旧行自动使用空数组。池为空时继续解析存储值 `fofa.key`、环境变量 `FOFA_KEY` 和旧引擎配置回退；Legacy 单元的端点按存储 `fofa.base_url` > `FOFA_BASE_URL` > 默认官网解析，`engines.fofa.base_url` 只保留现有旧引擎兼容语义。非空池中缺省端点由模型补齐为 `https://fofa.info`，且不再回退 Legacy；前端以只读 Legacy Key 展示。
+数据库迁移为 `system_settings` 增加 `fofa_keys JSON DEFAULT '[]'`，旧行自动使用空数组。池为空时继续解析存储值 `fofa.key`、环境变量 `FOFA_KEY` 和旧引擎配置回退；Legacy 单元的端点按存储 `fofa.base_url` > `FOFA_BASE_URL` > 旧 `engines.fofa.base_url` > 默认官网解析。非空池中缺省端点由模型补齐为 `https://fofa.info`，且不再回退 Legacy；前端以只读 Legacy Key 展示。
 
 新池产生后，全局运行时使用新池；旧单 Key 值保留在原配置中，便于回滚和已有脚本读取。任务级 `fofa_config.key` 继续优先。旧 `PUT /api/settings` 对 `fofa.key` 的更新语义保持。
 

@@ -302,6 +302,25 @@ def _fofa_key_from_value(value: Any) -> FofaKeyConfig:
     return FofaKeyConfig.model_validate(value)
 
 
+def _resolve_legacy_fofa_base_url() -> str:
+    """按旧配置来源解析 Legacy/旧任务使用的 FOFA 端点。"""
+    fofa = dict(_cache.get("fofa") or {})
+    engines = dict(_cache.get("engines") or {})
+    engine_fofa = engines.get("fofa") or {}
+    if not isinstance(engine_fofa, dict):
+        engine_fofa = {}
+
+    for value in (
+        fofa.get("base_url"),
+        os.environ.get("FOFA_BASE_URL"),
+        engine_fofa.get("base_url"),
+    ):
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return "https://fofa.info"
+
+
 def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
     """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
     if task is not None:
@@ -310,7 +329,7 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
         if task_key:
             task_base_url = str(task_config.get("base_url") or "").strip()
             if not task_base_url:
-                task_base_url = resolve_fofa_base_url()
+                task_base_url = _resolve_legacy_fofa_base_url()
             return [
                 FofaKeyConfig(
                     name="Task override",
@@ -346,7 +365,7 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
         FofaKeyConfig(
             name="Legacy Key",
             key=key,
-            base_url=resolve_fofa_base_url(),
+            base_url=_resolve_legacy_fofa_base_url(),
             enabled=fofa.get("enabled") is not False,
         )
     ]

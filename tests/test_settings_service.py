@@ -226,11 +226,6 @@ def test_legacy_fofa_base_url_precedence(monkeypatch) -> None:
 
 def test_legacy_fofa_base_url_keeps_old_engine_compatibility_fallback(monkeypatch) -> None:
     monkeypatch.delenv("FOFA_BASE_URL", raising=False)
-    monkeypatch.setattr(
-        settings_service,
-        "_env_fofa",
-        lambda: {"key": "", "base_url": "", "enabled": True},
-    )
     set_cache(
         fofa={"key": "legacy-secret"},
         engines={"fofa": {"base_url": "https://engine.example/api"}},

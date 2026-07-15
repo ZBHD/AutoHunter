@@ -153,7 +153,7 @@ def test_nonempty_fofa_pool_wins_over_legacy_key(monkeypatch) -> None:
     assert [(item.name, item.key) for item in keys] == [("Primary", "pool-secret")]
 ```
 
-Implement `resolve_fofa_keys(task=None)` so task `fofa_config.key` returns a single `Task override` entry carrying `fofa_config.base_url` (缺省回退旧全局端点); a stored nonempty pool wins and each item preserves its own `base_url`; an empty pool synthesizes read-only legacy behavior at the API layer from `fofa.key`, `engines.fofa.key`, then `FOFA_KEY`. Legacy `base_url` follows stored `fofa.base_url` > `FOFA_BASE_URL` > official default, with `engines.fofa.base_url` retained only through existing `resolve_engine_base_url` compatibility semantics. Historical pool items missing `base_url` receive the model default and never fall back to Legacy.
+Implement `resolve_fofa_keys(task=None)` so task `fofa_config.key` returns a single `Task override` entry carrying `fofa_config.base_url` (缺省回退旧全局端点); a stored nonempty pool wins and each item preserves its own `base_url`; an empty pool synthesizes read-only legacy behavior at the API layer from `fofa.key`, `engines.fofa.key`, then `FOFA_KEY`. Legacy `base_url` follows stored `fofa.base_url` > `FOFA_BASE_URL` > old `engines.fofa.base_url` > official default. Keep `resolve_fofa_base_url()` compatible for existing callers while the credential parser applies this complete Legacy precedence. Historical pool items missing `base_url` receive the model default and never fall back to Legacy.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -182,7 +182,7 @@ git commit -m "功能：增加 FOFA Key 池模型与数据库迁移"
 
 - [ ] **Step 1: Write failing endpoint and resolution tests**
 
-Cover the official default, private HTTP(S) paths, userinfo/query/fragment/bad-port/non-HTTP rejection, secret-free `repr`/`str`, pool preservation, task `key + base_url` override, task endpoint fallback to the old global resolver, Legacy storage/environment/default precedence, and deep-copy behavior for `base_url`.
+Cover the official default, private HTTP(S) paths, userinfo/query/fragment/bad-port/non-HTTP rejection, secret-free `repr`/`str`, pool preservation, task `key + base_url` override, task endpoint fallback to the old global parser, Legacy storage/environment/old-engine/default precedence, and deep-copy behavior for `base_url`.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -325,35 +325,48 @@ from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
 
 
 def key(name: str, secret: str) -> FofaKeyConfig:
-    return FofaKeyConfig(name=name, key=secret)
+    return FofaKeyConfig(
+        name=name,
+        key=secret,
+        base_url=f"https://{name.lower()}.fofa.example/api",
+    )
 
 
 def test_sync_router_is_sticky_after_failover() -> None:
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
     router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
 
-    def first(secret: str) -> str:
-        calls.append(secret)
+    def first(secret: str, base_url: str) -> str:
+        calls.append((secret, base_url))
         if secret == "a":
             raise FofaError("invalid key", kind="auth")
         return "ok"
 
     assert router.execute_sync(first) == "ok"
-    assert router.execute_sync(lambda secret: calls.append(secret) or "again") == "again"
-    assert calls == ["a", "b", "b"]
+    assert router.execute_sync(
+        lambda secret, base_url: calls.append((secret, base_url)) or "again"
+    ) == "again"
+    assert calls == [
+        ("a", "https://a.fofa.example/api"),
+        ("b", "https://b.fofa.example/api"),
+        ("b", "https://b.fofa.example/api"),
+    ]
 
 
 def test_async_router_tries_each_key_once() -> None:
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
     router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
 
-    async def fail(secret: str) -> str:
-        calls.append(secret)
+    async def fail(secret: str, base_url: str) -> str:
+        calls.append((secret, base_url))
         raise FofaError("limited", kind="rate_limit")
 
     with pytest.raises(FofaPoolExhaustedError):
         asyncio.run(router.execute_async(fail))
-    assert calls == ["a", "b"]
+    assert calls == [
+        ("a", "https://a.fofa.example/api"),
+        ("b", "https://b.fofa.example/api"),
+    ]
 ```
 
 Add tests for 60/120/240/480/600 rate backoff, one-hour daily cooldown, transition to `daily_suspended` on count 12, transient failure retaining the active Key, earliest retry reporting, disabled entries, deletion/reorder reconstruction, state-change idempotence, and two threads reporting the same auth failure.
@@ -389,6 +402,7 @@ class FofaFailureKind(StrEnum):
 @dataclass(frozen=True)
 class FofaKeyStateChange:
     name: str
+    base_url: str
     runtime_state: str
     failure_kind: str
     failure_count: int
@@ -437,7 +451,7 @@ class FofaKeyRouter(Generic[T]):
 
 每次 operation/lease 必须同时传递选中凭据的 `key` 和 `base_url`；禁止只传 Key 再从全局端点补齐。候选快照、状态指纹和状态回调均包含这两个字段。
 
-Use `threading.RLock` only around candidate snapshots and state mutation. Release the lock before calling `operation`. Sanitize `FofaPoolFailure.message` by replacing every configured Key with `<masked>`. State callbacks fire only when the tuple `(runtime_state, failure_kind, failure_count, cooldown_until, active_name)` changes.
+Use `threading.RLock` only around candidate snapshots and state mutation. Release the lock before calling `operation`. Sanitize `FofaPoolFailure.message` by replacing every configured Key with `<masked>`. State callbacks fire only when the tuple `(base_url, runtime_state, failure_kind, failure_count, cooldown_until, active_name)` changes.
 
 Implement `_candidate_snapshot`, `_mark_success`, `_mark_failure`, `_execute_sync_ring`, and `_execute_async_ring` in the same module. Convert `FofaError.kind` through `FofaFailureKind`; unknown values map to `TRANSIENT`.
 
@@ -583,10 +597,10 @@ git commit -m "功能：增加 FOFA Key 池管理与健康检测接口"
 async def test_collector_retries_same_page_with_next_fofa_key(
     session, task, monkeypatch
 ) -> None:
-    calls: list[tuple[str, int]] = []
+    calls: list[tuple[str, str, int]] = []
 
     async def search(key, query, page, page_size, base_url):
-        calls.append((key, page))
+        calls.append((key, base_url, page))
         if key == "bad":
             raise FofaError("invalid key", kind="auth")
         return EngineResult(
@@ -594,11 +608,17 @@ async def test_collector_retries_same_page_with_next_fofa_key(
             results=[], size=0, page=page, engine="fofa"
         )
 
-    router = FofaKeyRouter([fofa_key("A", "bad"), fofa_key("B", "good")])
+    router = FofaKeyRouter([
+        fofa_key("A", "bad", base_url="https://a.fofa.example/api"),
+        fofa_key("B", "good", base_url="https://b.fofa.example/api"),
+    ])
     monkeypatch.setattr(settings_service, "fofa_router_for_task", lambda _task: router)
     monkeypatch.setattr(FofaEngine, "search", search)
     await collector._fofa_collect(session, task, set(), {}, None)
-    assert calls == [("bad", 1), ("good", 1)]
+    assert calls == [
+        ("bad", "https://a.fofa.example/api", 1),
+        ("good", "https://b.fofa.example/api", 1),
+    ]
     assert task.fofa_config["cursor"] == 1
 ```
 
@@ -621,7 +641,7 @@ Replace direct key resolution and `engine.search(key, ...)` with:
 ```python
 router = fofa_router_for_task(task)
 res = await router.execute_async(
-    lambda key: engine.search(
+    lambda key, base_url: engine.search(
         key,
         cur_query,
         page=next_cursor,
@@ -639,7 +659,12 @@ Add `fofa_router` constructor parameters to `ToolExecutor` and `KillsweepHunter`
 
 ```python
 return self.fofa_router.execute_sync(
-    lambda key: self._fofa_lookup_with_key(key, query=q, size=safe_size)
+    lambda key, base_url: self._fofa_lookup_with_key(
+        key,
+        query=q,
+        size=safe_size,
+        base_url=base_url,
+    )
 )
 ```
 
