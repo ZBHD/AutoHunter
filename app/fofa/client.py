@@ -5,6 +5,7 @@ import base64
 import os
 import re
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -49,10 +50,10 @@ class FofaError(Exception):
 _FOFA_DAILY_LIMIT_MARKERS = (
     "820041", "daily quota", "daily limit", "daily request limit",
     "daily search limit", "每日额度", "每日配额", "每日限额", "当日额度",
-    "当日配额", "今日额度", "今日配额",
+    "当日配额", "今日额度", "今日配额", "每日",
 )
 _FOFA_RATE_LIMIT_MARKERS = (
-    "q3005", "too many requests", "rate limit", "ratelimit",
+    "q3005", "too many", "rate limit", "ratelimit",
     "request frequency", "requests too frequent", "请求太频繁", "访问太频繁",
     "请求频率", "频率限制", "操作频繁",
 )
@@ -111,13 +112,15 @@ def classify_fofa_failure(
     code = _extract_error_code(lowered, status)
     retry_seconds = _normalise_retry_after(retry_after)
 
-    # 820041 和每日额度文案也包含 quota，必须先于通用账号额度标记。
-    if any(marker in lowered for marker in _FOFA_DAILY_LIMIT_MARKERS):
-        return "daily_limit", code, retry_seconds if retry_seconds is not None else 3600
     if status == 429:
         return "rate_limit", code, retry_seconds
     if status in {401, 403}:
         return "auth", code, None
+    if status is not None and not 200 <= status < 300:
+        return "transient", code, retry_seconds
+    # 820041 和每日额度文案也包含 quota，必须先于通用账号额度标记。
+    if any(marker in lowered for marker in _FOFA_DAILY_LIMIT_MARKERS):
+        return "daily_limit", code, retry_seconds if retry_seconds is not None else 3600
     if any(marker in lowered for marker in _FOFA_RATE_LIMIT_MARKERS):
         return "rate_limit", code, retry_seconds
     if any(marker in lowered for marker in _FOFA_AUTH_ERROR_MARKERS):
@@ -149,13 +152,34 @@ def _retry_after(response: Any) -> Any:
     return headers.get("Retry-After") if headers is not None else None
 
 
+def redact_fofa_secrets(message: Any, key: str | None) -> str:
+    """移除异常消息中的明文和常见 URL 编码形式的 FOFA key。"""
+    text = str(message or "")
+    if not key:
+        return text
+    candidates = {
+        key,
+        quote(key, safe=""),
+        quote_plus(key, safe=""),
+    }
+    for candidate in sorted((item for item in candidates if item), key=len, reverse=True):
+        if candidate == key:
+            text = text.replace(candidate, "[REDACTED]")
+        else:
+            text = re.sub(re.escape(candidate), "[REDACTED]", text, flags=re.IGNORECASE)
+    return text
+
+
 def _structured_error(
     message: str,
     *,
     status: int | None = None,
     retry_after: Any = None,
     display_message: str | None = None,
+    key: str | None = None,
 ) -> FofaError:
+    message = redact_fofa_secrets(message, key)
+    display_message = redact_fofa_secrets(display_message, key) if display_message else None
     kind, code, retry_seconds = classify_fofa_failure(
         message,
         status=status,
@@ -200,6 +224,14 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(f"{base}/api/v1/search/all", params=params)
+            if not 200 <= resp.status_code < 300:
+                raise _structured_error(
+                    f"HTTP {resp.status_code}",
+                    status=resp.status_code,
+                    retry_after=_retry_after(resp),
+                    display_message=f"FOFA 返回 HTTP {resp.status_code}",
+                    key=key,
+                )
             try:
                 data = resp.json()
             except Exception:
@@ -208,9 +240,8 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
                     message,
                     status=resp.status_code,
                     retry_after=_retry_after(resp),
-                    display_message=(
-                        f"FOFA 返回非 JSON (HTTP {resp.status_code}): {message}"
-                    ),
+                    display_message=f"FOFA 返回非 JSON (HTTP {resp.status_code})",
+                    key=key,
                 )
     except FofaError:
         raise
@@ -221,16 +252,13 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
         raise _structured_error(
             message,
             display_message=f"FOFA 请求失败: {message}",
+            key=key,
         ) from e
     if not isinstance(data, dict):
-        raise FofaError("FOFA 返回无效 JSON 数据")
-    if not 200 <= resp.status_code < 300:
-        errmsg = _error_message(data, str(getattr(resp, "text", ""))[:200])
         raise _structured_error(
-            _classification_message(errmsg, data),
+            "FOFA 返回无效 JSON 数据",
             status=resp.status_code,
-            retry_after=_retry_after(resp),
-            display_message=f"FOFA 返回 HTTP {resp.status_code}: {errmsg}",
+            key=key,
         )
     if data.get("error"):
         errmsg = _error_message(data, "未知错误")
@@ -239,6 +267,7 @@ async def search(key: str, query: str, page: int = 1, size: int = 100,
             status=resp.status_code,
             retry_after=_retry_after(resp),
             display_message=f"FOFA 错误: {errmsg}",
+            key=key,
         )
     return {
         "fields": fields.split(","),
@@ -264,6 +293,14 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(url, params={"key": key})
+        if not 200 <= response.status_code < 300:
+            raise _structured_error(
+                f"HTTP {response.status_code}",
+                status=response.status_code,
+                retry_after=_retry_after(response),
+                display_message=f"FOFA 返回 HTTP {response.status_code}",
+                key=key,
+            )
         try:
             data = response.json()
         except Exception as exc:
@@ -273,6 +310,7 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
                 status=response.status_code,
                 retry_after=_retry_after(response),
                 display_message="FOFA 账号接口返回非 JSON",
+                key=key,
             ) from exc
     except FofaError:
         raise
@@ -281,17 +319,14 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
         raise _structured_error(
             message,
             display_message=f"FOFA 请求失败: {message}",
+            key=key,
         ) from exc
 
     if not isinstance(data, dict):
-        raise FofaError("FOFA 账号接口返回无效 JSON 数据")
-    if not 200 <= response.status_code < 300:
-        message = _error_message(data, "账号不可用")
         raise _structured_error(
-            _classification_message(message, data),
+            "FOFA 账号接口返回无效 JSON 数据",
             status=response.status_code,
-            retry_after=_retry_after(response),
-            display_message=f"FOFA 返回 HTTP {response.status_code}",
+            key=key,
         )
     if data.get("error"):
         message = _error_message(data, "账号不可用")
@@ -300,5 +335,6 @@ async def get_userinfo(key: str, base_url: str | None = None) -> dict[str, Any]:
             status=response.status_code,
             retry_after=_retry_after(response),
             display_message=f"FOFA 错误: {message}",
+            key=key,
         )
     return data

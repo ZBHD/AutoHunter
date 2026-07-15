@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from app.engines.base import EngineResult, SearchEngine, register_engine
-from app.fofa.client import FofaError, classify_fofa_failure
+from app.fofa.client import FofaError, classify_fofa_failure, redact_fofa_secrets
 
 BASE = "https://fofa.info"
 
@@ -30,7 +30,10 @@ def _structured_error(
     status: int | None = None,
     retry_after: Any = None,
     display_message: str | None = None,
+    key: str | None = None,
 ) -> FofaError:
+    message = redact_fofa_secrets(message, key)
+    display_message = redact_fofa_secrets(display_message, key) if display_message else None
     kind, code, retry_seconds = classify_fofa_failure(
         message,
         status=status,
@@ -109,6 +112,14 @@ class FofaEngine(SearchEngine):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(f"{base}/api/v1/search/all", params=params)
+                if not 200 <= resp.status_code < 300:
+                    raise _structured_error(
+                        f"HTTP {resp.status_code}",
+                        status=resp.status_code,
+                        retry_after=_retry_after(resp),
+                        display_message=f"FOFA 返回 HTTP {resp.status_code}",
+                        key=api_key,
+                    )
                 try:
                     data = resp.json()
                 except Exception:
@@ -117,9 +128,8 @@ class FofaEngine(SearchEngine):
                         message,
                         status=resp.status_code,
                         retry_after=_retry_after(resp),
-                        display_message=(
-                            f"FOFA 返回非 JSON (HTTP {resp.status_code}): {message}"
-                        ),
+                        display_message=f"FOFA 返回非 JSON (HTTP {resp.status_code})",
+                        key=api_key,
                     )
         except FofaError:
             raise
@@ -128,17 +138,14 @@ class FofaEngine(SearchEngine):
             raise _structured_error(
                 message,
                 display_message=f"FOFA 请求失败: {message}",
+                key=api_key,
             ) from e
 
         if not isinstance(data, dict):
-            raise FofaError("FOFA 返回无效 JSON 数据")
-        if not 200 <= resp.status_code < 300:
-            errmsg = _error_message(data, str(getattr(resp, "text", ""))[:200])
             raise _structured_error(
-                _classification_message(errmsg, data),
+                "FOFA 返回无效 JSON 数据",
                 status=resp.status_code,
-                retry_after=_retry_after(resp),
-                display_message=f"FOFA 返回 HTTP {resp.status_code}: {errmsg}",
+                key=api_key,
             )
         if data.get("error"):
             errmsg = _error_message(data, "未知错误")
@@ -147,6 +154,7 @@ class FofaEngine(SearchEngine):
                 status=resp.status_code,
                 retry_after=_retry_after(resp),
                 display_message=f"FOFA 错误: {errmsg}",
+                key=api_key,
             )
 
         return EngineResult(
