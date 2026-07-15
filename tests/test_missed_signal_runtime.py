@@ -1140,6 +1140,179 @@ def test_manager_stop_blocks_new_killsweep_dispatch_until_restart(monkeypatch) -
     _run(scenario())
 
 
+def test_manager_immediate_restart_replaces_a_stopped_live_runner(monkeypatch) -> None:
+    from app import orchestrator
+
+    async def scenario():
+        instances = []
+
+        class FakeRunner:
+            def __init__(self, task_id: str):
+                self.task_id = task_id
+                self._stop = asyncio.Event()
+                self._auto_drained = True
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.release = asyncio.Event()
+                self.resume_calls = 0
+                self.stop_calls = 0
+                self.cleanup_complete = asyncio.Event()
+                self.cancelled_after_cleanup = False
+                instances.append(self)
+
+            def resume(self):
+                self.resume_calls += 1
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.cleanup_complete.set()
+
+            async def run_forever(self):
+                self.started.set()
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    self.cancelled_after_cleanup = self.cleanup_complete.is_set()
+                    self.cancelled.set()
+                    raise
+
+        monkeypatch.setattr(orchestrator, "TaskRunner", FakeRunner)
+        manager = orchestrator.OrchestratorManager()
+        old_runner = FakeRunner("task-immediate-restart")
+        old_runner._stop.set()
+        old_task = asyncio.create_task(old_runner.run_forever())
+        manager._runners["task-immediate-restart"] = old_runner
+        manager._tasks["task-immediate-restart"] = old_task
+        await old_runner.started.wait()
+
+        try:
+            await manager.ensure_running("task-immediate-restart")
+
+            new_runner = manager._runners["task-immediate-restart"]
+            new_task = manager._tasks["task-immediate-restart"]
+            await new_runner.started.wait()
+            assert len(instances) == 2
+            assert new_runner is not old_runner
+            assert new_task is not old_task
+            assert old_runner.cancelled.is_set()
+            assert old_task.cancelled()
+            assert old_runner.resume_calls == 0
+            assert old_runner.stop_calls == 1
+            assert old_runner.cancelled_after_cleanup is True
+            assert new_runner.resume_calls == 1
+            assert not new_task.done()
+        finally:
+            for runner in instances:
+                runner.release.set()
+            tasks = set(manager._tasks.values()) | {old_task}
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run(scenario())
+
+
+def test_manager_discards_auto_drained_runner_when_run_forever_finishes(monkeypatch) -> None:
+    from app import orchestrator
+
+    async def scenario():
+        class FakeRunner:
+            def __init__(self, task_id: str):
+                self.task_id = task_id
+                self._stop = asyncio.Event()
+                self._auto_drained = False
+                self.release = asyncio.Event()
+
+            def resume(self):
+                return None
+
+            async def run_forever(self):
+                await self.release.wait()
+
+        monkeypatch.setattr(orchestrator, "TaskRunner", FakeRunner)
+        manager = orchestrator.OrchestratorManager()
+        await manager.ensure_running("task-finished-runner")
+        runner = manager._runners["task-finished-runner"]
+        run_task = manager._tasks["task-finished-runner"]
+
+        runner._auto_drained = True
+        runner.release.set()
+        await run_task
+        await asyncio.sleep(0)
+
+        assert "task-finished-runner" not in manager._tasks
+        assert "task-finished-runner" not in manager._runners
+
+        await manager.ensure_running("task-finished-runner")
+        replacement_runner = manager._runners["task-finished-runner"]
+        replacement_task = manager._tasks["task-finished-runner"]
+
+        manager._runner_task_done("task-finished-runner", runner, run_task)
+
+        assert manager._runners["task-finished-runner"] is replacement_runner
+        assert manager._tasks["task-finished-runner"] is replacement_task
+
+        replacement_runner.release.set()
+        await replacement_task
+        await asyncio.sleep(0)
+
+        assert manager._runners["task-finished-runner"] is replacement_runner
+        assert manager._tasks["task-finished-runner"] is replacement_task
+
+    _run(scenario())
+
+
+def test_manager_keeps_existing_semantics_for_non_drain_stopped_runner(monkeypatch) -> None:
+    from app import orchestrator
+
+    async def scenario():
+        release = asyncio.Event()
+        instances = []
+
+        class FakeRunner:
+            def __init__(self, task_id: str):
+                self.task_id = task_id
+                self._stop = asyncio.Event()
+                self._stop.set()
+                self._auto_drained = False
+                self.resume_calls = 0
+                self.stop_calls = 0
+                instances.append(self)
+
+            def resume(self):
+                self.resume_calls += 1
+
+            async def stop(self):
+                self.stop_calls += 1
+
+            async def run_forever(self):
+                await release.wait()
+
+        monkeypatch.setattr(orchestrator, "TaskRunner", FakeRunner)
+        manager = orchestrator.OrchestratorManager()
+        runner = FakeRunner("task-non-drain-stop")
+        run_task = asyncio.create_task(release.wait())
+        manager._runners["task-non-drain-stop"] = runner
+        manager._tasks["task-non-drain-stop"] = run_task
+
+        try:
+            await manager.ensure_running("task-non-drain-stop")
+
+            assert manager._runners["task-non-drain-stop"] is runner
+            assert manager._tasks["task-non-drain-stop"] is run_task
+            assert len(instances) == 1
+            assert runner.resume_calls == 1
+            assert runner.stop_calls == 0
+            assert not run_task.done()
+        finally:
+            release.set()
+            tasks = set(manager._tasks.values()) | {run_task}
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run(scenario())
+
+
 def test_task_runner_persists_one_capture_without_losing_overlapping_candidates(
     tmp_path,
     monkeypatch,

@@ -412,6 +412,8 @@ class TaskRunner:
     def __init__(self, task_id: str):
         self.task_id = task_id
         self._stop = asyncio.Event()
+        self._auto_drained = False
+        self._drain_lifecycle_lock = asyncio.Lock()
         self._active_workers: dict[str, asyncio.Task] = {}
         self._worker_cancel_events: dict[str, threading.Event] = {}
         self._worker_executor_started: set[str] = set()
@@ -689,6 +691,55 @@ class TaskRunner:
                 or bool(self._escalation_tasks)
                 or inflight > 0
             )
+            drain_busy = busy or bool(self._review_tasks)
+            if not task.search_enabled and queued == 0 and not drain_busy:
+                async with self._drain_lifecycle_lock:
+                    has_runnable_target = select(Target.id).where(
+                        Target.task_id == self.task_id,
+                        Target.status.in_(("queued", "assigned", "scanning")),
+                    ).exists()
+                    result = await session.execute(
+                        update(Task)
+                        .where(
+                            Task.id == self.task_id,
+                            Task.search_enabled.is_(False),
+                            Task.status.in_(("running", "idle")),
+                            ~has_runnable_target,
+                        )
+                        .values(status="stopped")
+                        .execution_options(synchronize_session=False)
+                    )
+                    if result.rowcount != 1:
+                        await session.rollback()
+                        return
+
+                    message = "资产搜索已停止，队列已排空，任务自动停止"
+                    session.add(TaskEvent(
+                        task_id=self.task_id,
+                        agent="orchestrator",
+                        kind="search_drained",
+                        level="info",
+                        message=message,
+                        payload={},
+                    ))
+                    await session.commit()
+                    self._auto_drained = True
+                    self._stop.set()
+                try:
+                    await bus.publish(self.task_id, {
+                        "agent": "orchestrator",
+                        "kind": "search_drained",
+                        "level": "info",
+                        "message": message,
+                        "ts": _now_iso(),
+                    })
+                except Exception:
+                    logger.warning(
+                        "TaskRunner[%s] failed to publish search_drained event",
+                        self.task_id,
+                        exc_info=True,
+                    )
+                return
             if queued == 0 and not busy and task.status == "running":
                 if task.status != "idle":
                     task.status = "idle"
@@ -3758,6 +3809,41 @@ class OrchestratorManager:
     def _lifecycle_lock(self, task_id: str) -> asyncio.Lock:
         return self._lifecycle_locks.setdefault(task_id, asyncio.Lock())
 
+    def _runner_task_done(
+        self,
+        task_id: str,
+        runner: TaskRunner,
+        completed_task: asyncio.Task,
+    ) -> None:
+        _consume_task_exception(completed_task)
+        if not getattr(runner, "_auto_drained", False):
+            return
+        if (
+            self._tasks.get(task_id) is not completed_task
+            or self._runners.get(task_id) is not runner
+        ):
+            return
+        self._tasks.pop(task_id, None)
+        self._runners.pop(task_id, None)
+
+    async def _retire_live_runner_if_auto_drained(
+        self,
+        task_id: str,
+        runner: TaskRunner,
+        runner_task: asyncio.Task,
+    ) -> bool:
+        if not getattr(runner, "_auto_drained", False):
+            runner.resume()
+            return False
+        await runner.stop()
+        runner_task.cancel()
+        await asyncio.gather(runner_task, return_exceptions=True)
+        if self._tasks.get(task_id) is runner_task:
+            self._tasks.pop(task_id, None)
+        if self._runners.get(task_id) is runner:
+            self._runners.pop(task_id, None)
+        return True
+
     def get_runner(self, task_id: str) -> "TaskRunner | None":
         return self._runners.get(task_id)
 
@@ -3812,9 +3898,20 @@ class OrchestratorManager:
         async with self._lifecycle_lock(task_id):
             self._stopped_task_ids.discard(task_id)
             existing_task = self._tasks.get(task_id)
-            if task_id in self._runners and existing_task and not existing_task.done():
-                self._runners[task_id].resume()
-                return
+            existing_runner = self._runners.get(task_id)
+            if existing_runner and existing_task and not existing_task.done():
+                drain_lock = getattr(existing_runner, "_drain_lifecycle_lock", None)
+                if drain_lock is None:
+                    retired = await self._retire_live_runner_if_auto_drained(
+                        task_id, existing_runner, existing_task
+                    )
+                else:
+                    async with drain_lock:
+                        retired = await self._retire_live_runner_if_auto_drained(
+                            task_id, existing_runner, existing_task
+                        )
+                if not retired:
+                    return
             if existing_task and existing_task.done():
                 self._tasks.pop(task_id, None)
             runner = self._runners.get(task_id)
@@ -3823,7 +3920,13 @@ class OrchestratorManager:
                 self._runners[task_id] = runner
             runner.resume()
             self._runners[task_id] = runner
-            self._tasks[task_id] = asyncio.create_task(runner.run_forever())
+            runner_task = asyncio.create_task(runner.run_forever())
+            self._tasks[task_id] = runner_task
+            runner_task.add_done_callback(
+                lambda completed, runner=runner: self._runner_task_done(
+                    task_id, runner, completed
+                )
+            )
 
     async def stop(self, task_id: str) -> None:
         self._stopped_task_ids.add(task_id)

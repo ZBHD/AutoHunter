@@ -360,7 +360,7 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
         task.manual_targets = []  # 消费掉，避免重复
 
     # 2) FOFA 智能搜集
-    if task.target_source in ("fofa", "both"):
+    if task.target_source in ("fofa", "both") and task.search_enabled:
         added += await _fofa_collect(session, task, seen, cluster_state, progress)
 
     await session.commit()

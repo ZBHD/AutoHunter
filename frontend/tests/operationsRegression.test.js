@@ -16,6 +16,107 @@ test("terminal aggregate drives task totals and progress without double counting
   );
 });
 
+test("search control is available only for active fofa-backed tasks", () => {
+  assert.equal(typeof taskViews.taskSearchControl, "function");
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "fofa", status: "running" }),
+    { visible: true, canStop: true, draining: false, label: "停止搜索" },
+  );
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "both", status: "idle", search_enabled: true }),
+    { visible: true, canStop: true, draining: false, label: "停止搜索" },
+  );
+
+  for (const target_source of ["manual", "site"]) {
+    assert.deepEqual(
+      taskViews.taskSearchControl({ target_source, status: "running" }),
+      { visible: false, canStop: false, draining: false, label: "停止搜索" },
+    );
+  }
+});
+
+test("search control reports stopped, draining, and working states", () => {
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "fofa", status: "running", search_enabled: false }),
+    { visible: true, canStop: false, draining: true, label: "搜索已停止" },
+  );
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "fofa", status: "stopped", search_enabled: false }),
+    { visible: true, canStop: false, draining: false, label: "搜索已停止" },
+  );
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "both", status: "idle" }, true),
+    { visible: true, canStop: false, draining: false, label: "正在停止" },
+  );
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "fofa", status: "running" }, false, true),
+    { visible: true, canStop: false, draining: false, label: "停止搜索" },
+  );
+  assert.deepEqual(
+    taskViews.taskSearchControl({ target_source: "fofa", status: "running", search_enabled: false }, false, true),
+    { visible: true, canStop: false, draining: true, label: "搜索已停止" },
+  );
+});
+
+test("control responses preserve board-derived task metrics when the DTO is sparse", () => {
+  assert.equal(typeof taskViews.mergeTaskControlResponse, "function");
+  const current = {
+    status: "running",
+    search_enabled: true,
+    stats: { queued: 12, scanning: 3, done: 8 },
+    pending_user_review: 6,
+    fofa_config: { collector_phase: "enrich", max_pages: 3 },
+    model_config_data: { model: "old-model", board_only: "keep" },
+    engine_config: { region: "cn", board_only: "keep" },
+    llm_usage: { requests: 9, board_only: "keep" },
+    unrelated_config: { board_only: "discard", value: "old" },
+  };
+  const updated = {
+    status: "idle",
+    search_enabled: false,
+    stats: null,
+    pending_user_review: 0,
+    fofa_config: { base_url: "https://fofa.example" },
+    model_config_data: { model: "new-model" },
+    engine_config: { region: "global" },
+    llm_usage: { requests: 10 },
+    unrelated_config: { value: "new" },
+  };
+
+  const merged = taskViews.mergeTaskControlResponse(current, updated);
+  assert.deepEqual(merged.stats, current.stats);
+  assert.equal(merged.pending_user_review, current.pending_user_review);
+  assert.equal(merged.fofa_config.collector_phase, current.fofa_config.collector_phase);
+  assert.equal(merged.fofa_config.max_pages, current.fofa_config.max_pages);
+  assert.equal(merged.fofa_config.base_url, updated.fofa_config.base_url);
+  for (const key of ["model_config_data", "engine_config", "llm_usage"]) {
+    assert.equal(merged[key].board_only, "keep");
+  }
+  assert.deepEqual(merged.unrelated_config, updated.unrelated_config);
+  assert.equal(merged.status, updated.status);
+  assert.equal(merged.search_enabled, updated.search_enabled);
+  assert.equal(
+    taskViews.mergeTaskControlResponse(current, { ...updated, pending_user_review: 2 }).pending_user_review,
+    current.pending_user_review,
+  );
+});
+
+test("task operation request identity requires both the version and task route", () => {
+  assert.equal(typeof taskViews.isCurrentTaskRequest, "function");
+  assert.equal(taskViews.isCurrentTaskRequest(3, 3, "task-a", "task-a", "task-a"), true);
+  assert.equal(taskViews.isCurrentTaskRequest(2, 3, "task-a", "task-a", "task-a"), false);
+  assert.equal(taskViews.isCurrentTaskRequest(3, 3, "task-a", "task-b", "task-b"), false);
+  assert.equal(taskViews.isCurrentTaskRequest(3, 3, "task-a", "task-a", "task-b"), false);
+});
+
+test("ordinary task refreshes reject control-era responses but explicit control refreshes pass", () => {
+  assert.equal(typeof taskViews.isCurrentTaskRefresh, "function");
+  assert.equal(taskViews.isCurrentTaskRefresh(1, 2, false, false), false, "started before control");
+  assert.equal(taskViews.isCurrentTaskRefresh(2, 2, true, false), false, "started during control");
+  assert.equal(taskViews.isCurrentTaskRefresh(2, 2, false, true), false, "applied during control");
+  assert.equal(taskViews.isCurrentTaskRefresh(2, 2, true, true, 2), true, "explicit control refresh");
+});
+
 test("observer task views always collapse sensitive panels to the board", () => {
   assert.equal(typeof taskViews.taskViewForRole, "function");
   for (const view of [

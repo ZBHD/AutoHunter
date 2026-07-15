@@ -10,7 +10,14 @@ import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
 import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
 import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
 import QueuedTargetsPanel from "../components/task/QueuedTargetsPanel.vue";
-import { taskProgressSummary, taskViewForRole } from "../taskViews.js";
+import {
+  taskProgressSummary,
+  taskViewForRole,
+  taskSearchControl,
+  mergeTaskControlResponse,
+  isCurrentTaskRequest,
+  isCurrentTaskRefresh,
+} from "../taskViews.js";
 
 const props = defineProps({ id: String });
 const route = useRoute();
@@ -48,8 +55,11 @@ const archivedHasMore = ref(false);
 const archivedLoading = ref(false);
 const ARCHIVED_PAGE_SIZE = 50;
 const bulkWorking = ref(false);
+const stopSearchWorking = ref(false);
+const taskControlWorking = ref(false);
 const SUBMIT_PAGE_SIZE = 120;
 const EXPORT_PAGE_SIZE = 80;
+let taskControlRequestVersion = 0;
 let ws = null, poll = null, boardPoll = null, searchTimer = null;
 let wsReconnectTimer = null, wsReconnectAttempt = 0, wsIntentionalClose = false;
 let eventRefreshTimer = null, eventRefreshPending = null;
@@ -94,10 +104,23 @@ function markTabLoaded(t) {
   loadedTabs.value = next;
 }
 
-async function loadTask() {
+async function loadTask(options = {}) {
   const id = props.id;
+  const expectedRequestVersion = options.expectedRequestVersion;
+  const requestVersion = taskControlRequestVersion;
+  const startedWhileControlWorking = stopSearchWorking.value || taskControlWorking.value;
   const t = await api.getTask(id);
-  if (id === props.id && id === loadedTaskId.value) task.value = t;
+  if (id !== props.id || id !== loadedTaskId.value) return;
+  if (!isCurrentTaskRefresh(
+    requestVersion,
+    taskControlRequestVersion,
+    startedWhileControlWorking,
+    stopSearchWorking.value || taskControlWorking.value,
+    expectedRequestVersion,
+  )) return;
+  if (expectedRequestVersion !== undefined
+      && !isCurrentTaskRequest(expectedRequestVersion, taskControlRequestVersion, id, props.id, loadedTaskId.value)) return;
+  task.value = t;
 }
 async function loadQueue() {
   if (authRoleRef.value === "observer") return;
@@ -238,6 +261,9 @@ function closeWs(intentional = false) {
 }
 
 function resetTaskState(full = true) {
+  taskControlRequestVersion += 1;
+  stopSearchWorking.value = false;
+  taskControlWorking.value = false;
   if (full) {
     task.value = null;
     queue.value = [];
@@ -355,10 +381,30 @@ function phaseStateText(state) {
   return { active: "进行中", pending: "排队中", done: "已完成", idle: "未开始" }[state] || "";
 }
 
-async function loadBoard() {
+async function loadBoard(options = {}) {
   const id = props.id;
+  const expectedRequestVersion = options.expectedRequestVersion;
+  const requestVersion = taskControlRequestVersion;
+  const startedWhileControlWorking = stopSearchWorking.value || taskControlWorking.value;
   const b = await api.board(id);
   if (id !== props.id) return;
+  if (!isCurrentTaskRefresh(
+    requestVersion,
+    taskControlRequestVersion,
+    startedWhileControlWorking,
+    stopSearchWorking.value || taskControlWorking.value,
+    expectedRequestVersion,
+  )) return;
+  if (
+    expectedRequestVersion !== undefined
+    && !isCurrentTaskRequest(
+      expectedRequestVersion,
+      taskControlRequestVersion,
+      id,
+      props.id,
+      loadedTaskId.value,
+    )
+  ) return;
   liveWorkers.value = b.live_workers || [];
   siteCollab.value = b.site_collab || null;
   if (task.value) {
@@ -514,9 +560,62 @@ function elapsed(iso) {
 }
 
 async function ctl(action) {
-  await api[action](props.id);
-  toast(action === "start" ? "已启动" : action === "pause" ? "已暂停" : "已停止");
-  await Promise.all([loadTask(), loadBoard()]);
+  if (stopSearchWorking.value || taskControlWorking.value) return;
+  const requestTaskId = props.id;
+  const requestVersion = ++taskControlRequestVersion;
+  taskControlWorking.value = true;
+  const isCurrentRequest = () => isCurrentTaskRequest(
+    requestVersion,
+    taskControlRequestVersion,
+    requestTaskId,
+    props.id,
+    loadedTaskId.value,
+  );
+  try {
+    const updated = await api[action](requestTaskId);
+    if (!isCurrentRequest()) return;
+    task.value = mergeTaskControlResponse(task.value, updated);
+    toast(action === "start" ? "已启动" : action === "pause" ? "已暂停" : "已停止");
+    await loadBoard({ expectedRequestVersion: requestVersion });
+  } finally {
+    if (requestVersion === taskControlRequestVersion) taskControlWorking.value = false;
+  }
+}
+
+async function stopSearch() {
+  const requestTaskId = props.id;
+  if (taskControlWorking.value || !searchControl.value.canStop) return;
+  const requestVersion = ++taskControlRequestVersion;
+  const isCurrentRequest = () => (
+    isCurrentTaskRequest(
+      requestVersion,
+      taskControlRequestVersion,
+      requestTaskId,
+      props.id,
+      loadedTaskId.value,
+    )
+  );
+  stopSearchWorking.value = true;
+  try {
+    let updated;
+    try {
+      updated = await api.stopSearch(requestTaskId);
+    } catch (e) {
+      if (!isCurrentRequest()) return;
+      toast(`停止搜索失败：${e?.message || e}`);
+      return;
+    }
+    if (!isCurrentRequest()) return;
+    task.value = mergeTaskControlResponse(task.value, updated);
+    toast("已停止继续搜索，剩余队列将继续处理");
+    try {
+      await loadBoard({ expectedRequestVersion: requestVersion });
+    } catch {
+      // 成功响应已更新任务，刷新失败不覆盖成功提示。
+    }
+  } finally {
+    if (requestVersion === taskControlRequestVersion) stopSearchWorking.value = false;
+  }
 }
 
 function openEdit() {
@@ -745,6 +844,7 @@ const engineName = computed(() => (({
   shodan: "Shodan",
   censys: "Censys",
 })[task.value?.engine] || task.value?.engine || "FOFA"));
+const searchControl = computed(() => taskSearchControl(task.value, stopSearchWorking.value, taskControlWorking.value));
 const missionScopeText = computed(() => {
   if (task.value?.target_source === "site") {
     return task.value?.fofa_query || task.value?.manual_targets?.[0] || "单站协作";
@@ -856,7 +956,9 @@ function parseEventTs(ts) {
         <div class="mission-meta">
           <span>{{ taskModeName }}</span>
           <span>{{ targetSourceName }}</span>
-          <span v-if="task.engine && task.engine !== 'fofa'" class="engine-badge">🔍 {{ engineName }}</span>
+          <span v-if="searchControl.draining" class="engine-badge draining-badge">{{ engineName }} · 已停止 · 正在排空队列</span>
+          <span v-else-if="searchControl.visible && task.search_enabled === false && task.status === 'stopped'" class="engine-badge stopped-badge">{{ engineName }} · 搜索已停止 · 下次启动将恢复搜索</span>
+          <span v-else-if="task.engine && task.engine !== 'fofa'" class="engine-badge">🔍 {{ engineName }}</span>
           <span>{{ missionScopeText }}</span>
           <span>并发 {{ task.concurrency }}</span>
           <span>{{ runState.hint }}</span>
@@ -885,9 +987,15 @@ function parseEventTs(ts) {
         </div>
         <div class="mission-actions" v-if="!readonly">
           <button @click="openEdit">编辑参数</button>
-          <button class="primary" @click="ctl('start')" :disabled="task.status === 'running'">启动</button>
-          <button @click="ctl('pause')" :disabled="task.status !== 'running'">暂停</button>
-          <button @click="ctl('stop')">停止</button>
+          <button class="primary" @click="ctl('start')" :disabled="task.status === 'running' || stopSearchWorking || taskControlWorking">启动</button>
+          <button @click="ctl('pause')" :disabled="task.status !== 'running' || stopSearchWorking || taskControlWorking">暂停</button>
+          <button
+            v-if="searchControl.visible"
+            class="stop-search"
+            :disabled="!searchControl.canStop"
+            @click="stopSearch"
+          >{{ searchControl.label }}</button>
+          <button class="stop-task" @click="ctl('stop')" :disabled="stopSearchWorking || taskControlWorking">停止任务</button>
         </div>
         <div v-else class="mission-actions readonly-hint">{{ authRoleRef === 'readonly' ? "只读模式" : "未认证" }}</div>
       </div>
