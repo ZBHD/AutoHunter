@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit
 
+from app.config import worker_config
 from app.agents.src_leads import SrcCandidate
 
 
@@ -170,29 +171,58 @@ def _new_candidate(
         return None
 
 
-def _iter_json_array(text: str, start: int, errors: list[str]) -> Iterator[Mapping[str, Any]]:
+def _iter_json_array(
+    text: str,
+    start: int,
+    errors: list[str],
+    *,
+    allow_suffix: bool = False,
+) -> Iterator[Mapping[str, Any]]:
     decoder = json.JSONDecoder()
     cursor = start + 1
     length = len(text)
+    expect_value = True
+    saw_value = False
     while cursor < length:
         while cursor < length and text[cursor].isspace():
             cursor += 1
-        if cursor >= length or text[cursor] == "]":
-            return
-        try:
-            value, cursor = decoder.raw_decode(text, cursor)
-        except json.JSONDecodeError as exc:
+        if cursor >= length:
             if len(errors) < 64:
-                errors.append(f"json array: {exc.msg}")
+                errors.append("json array: unterminated array")
             return
-        if isinstance(value, Mapping):
-            yield value
-        elif isinstance(value, list):
-            yield from (item for item in value if isinstance(item, Mapping))
-        while cursor < length and text[cursor].isspace():
+        if expect_value:
+            if text[cursor] == "]":
+                if saw_value and len(errors) < 64:
+                    errors.append("json array: trailing comma")
+                if not allow_suffix and text[cursor + 1 :].strip() and len(errors) < 64:
+                    errors.append("json array: trailing data")
+                return
+            try:
+                value, cursor = decoder.raw_decode(text, cursor)
+            except json.JSONDecodeError as exc:
+                if len(errors) < 64:
+                    errors.append(f"json array: {exc.msg}")
+                return
+            saw_value = True
+            if isinstance(value, Mapping):
+                yield value
+            elif isinstance(value, list):
+                yield from (item for item in value if isinstance(item, Mapping))
+            expect_value = False
+            continue
+        if text[cursor] == ",":
             cursor += 1
-        if cursor < length and text[cursor] == ",":
-            cursor += 1
+            expect_value = True
+            continue
+        if text[cursor] == "]":
+            if not allow_suffix and text[cursor + 1 :].strip() and len(errors) < 64:
+                errors.append("json array: trailing data")
+            return
+        if len(errors) < 64:
+            errors.append("json array: expected comma")
+        return
+    if len(errors) < 64:
+        errors.append("json array: unterminated array")
 
 
 def _json_records(text: str, errors: list[str]) -> Iterator[Mapping[str, Any]]:
@@ -204,7 +234,7 @@ def _json_records(text: str, errors: list[str]) -> Iterator[Mapping[str, Any]]:
         return
     results_match = re.search(r'"results"\s*:\s*\[', text)
     if results_match:
-        yield from _iter_json_array(text, results_match.end() - 1, errors)
+        yield from _iter_json_array(text, results_match.end() - 1, errors, allow_suffix=True)
         return
     try:
         parsed = json.loads(text)
@@ -276,24 +306,55 @@ def _candidate_in_scope(candidate: SrcCandidate, scope_target: str) -> bool:
 
 
 def _bounded_text(output: str) -> tuple[str, int, bool, bool]:
+    """Build a bounded text window without copying the complete input first."""
+
     raw = str(output or "")
-    encoded = raw.encode("utf-8", "replace")
-    byte_partial = len(encoded) > _MAX_PARSE_BYTES
-    if byte_partial:
-        encoded = encoded[:_MAX_PARSE_BYTES]
-        # Do not feed an incomplete JSONL record to the parser.
-        cut = encoded.rfind(b"\n")
-        if cut >= 0:
-            encoded = encoded[:cut]
-    text = encoded.decode("utf-8", "replace")
-    total_lines = raw.count("\n") + (1 if raw and not raw.endswith(("\n", "\r")) else 0)
-    line_partial = total_lines > _MAX_PARSE_LINES
-    scanned_lines = min(total_lines, _MAX_PARSE_LINES)
-    omitted = max(0, total_lines - scanned_lines)
-    if byte_partial and omitted == 0:
-        omitted = 1
-    partial = byte_partial or line_partial or omitted > 0
-    return text, omitted, partial, partial
+    if not raw:
+        return "", 0, False, False
+    pieces: list[str] = []
+    byte_count = 0
+    line_count = 1
+    partial = False
+    for offset in range(0, len(raw), 8192):
+        chunk = raw[offset : offset + 8192]
+        encoded_length = len(chunk.encode("utf-8", "replace"))
+        if (
+            byte_count + encoded_length <= _MAX_PARSE_BYTES
+            and line_count + chunk.count("\n") <= _MAX_PARSE_LINES
+        ):
+            pieces.append(chunk)
+            byte_count += encoded_length
+            line_count += chunk.count("\n")
+            continue
+        prefix = chunk
+        remaining_lines = _MAX_PARSE_LINES - line_count
+        if prefix.count("\n") > remaining_lines:
+            if remaining_lines <= 0:
+                prefix = prefix[: prefix.find("\n")]
+            else:
+                cursor = -1
+                for _ in range(remaining_lines + 1):
+                    cursor = prefix.find("\n", cursor + 1)
+                prefix = prefix[:cursor]
+        remaining_bytes = _MAX_PARSE_BYTES - byte_count
+        if len(prefix.encode("utf-8", "replace")) > remaining_bytes:
+            lower, upper = 0, len(prefix)
+            while lower < upper:
+                middle = (lower + upper + 1) // 2
+                if len(prefix[:middle].encode("utf-8", "replace")) <= remaining_bytes:
+                    lower = middle
+                else:
+                    upper = middle - 1
+            prefix = prefix[:lower]
+        if prefix:
+            pieces.append(prefix)
+            byte_count += len(prefix.encode("utf-8", "replace"))
+            line_count += prefix.count("\n")
+        if len(prefix) < len(chunk):
+            partial = True
+        break
+    text = "".join(pieces)
+    return text, 0, partial, partial
 
 
 def _next_actions(tool: str) -> tuple[str, ...]:
@@ -482,6 +543,35 @@ def parse_src_output(tool: str, output: str) -> SrcParseResult:
 
 
 def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:
+    capture_id = str(capture.get("id") or "").strip()
+    directory_text = str(capture.get("directory") or "").strip()
+    if (
+        not capture_id
+        or len(capture_id) > 64
+        or capture_id in {".", ".."}
+        or "/" in capture_id
+        or "\\" in capture_id
+        or not directory_text
+    ):
+        return "", "capture directory is unavailable"
+    raw_directory = Path(directory_text)
+    if raw_directory.is_symlink():
+        return "", "capture directory must not be symlinked"
+    try:
+        owned_directory = Path(directory_text).resolve(strict=False)
+    except OSError as exc:
+        return "", f"capture directory resolve failed: {exc}"
+    if (
+        not owned_directory.is_dir()
+        or owned_directory.name != capture_id
+        or owned_directory.parent.name != ".captures"
+    ):
+        return "", "capture directory is outside owned .captures boundary"
+    try:
+        owned_directory.relative_to(Path(worker_config.work_root).resolve(strict=False))
+    except (OSError, ValueError):
+        return "", "capture directory is outside worker root"
+
     channels = capture.get("channels")
     descriptors: Iterable[Any]
     if isinstance(channels, Mapping):
@@ -502,17 +592,17 @@ def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:
         path_text = str(descriptor.get("path") or "")
         if not path_text:
             continue
-        directory_text = str(capture.get("directory") or "").strip()
-        if directory_text:
-            try:
-                channel_path = Path(path_text).resolve(strict=False)
-                owned_directory = Path(directory_text).resolve(strict=False)
-            except OSError as exc:
-                return "", f"capture output ownership failed: {exc}"
-            if channel_path.parent != owned_directory:
-                return "", "capture output channel is outside owned directory"
+        raw_channel_path = Path(path_text)
+        if raw_channel_path.is_symlink():
+            return "", "capture output channel must not be symlinked"
         try:
-            with Path(path_text).open("rb") as stream:
+            channel_path = raw_channel_path.resolve(strict=False)
+        except OSError as exc:
+            return "", f"capture output ownership failed: {exc}"
+        if channel_path.parent != owned_directory:
+            return "", "capture output channel is outside owned directory"
+        try:
+            with channel_path.open("rb") as stream:
                 data = stream.read(_MAX_PARSE_BYTES + 1)
             return data.decode("utf-8", "replace"), ""
         except (OSError, ValueError) as exc:
@@ -557,6 +647,7 @@ class SrcToolPlan:
     display_argv: tuple[str, ...]
     timeout: int
     guidance: str
+    follow_redirects: bool = False
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int, name: str) -> int:
@@ -647,6 +738,7 @@ def _plan(
     *,
     timeout: int,
     guidance: str,
+    follow_redirects: bool = False,
 ) -> SrcToolPlan:
     return SrcToolPlan(
         tool=tool,
@@ -655,6 +747,7 @@ def _plan(
         display_argv=tuple(display),
         timeout=timeout,
         guidance=guidance,
+        follow_redirects=follow_redirects,
     )
 
 
@@ -662,6 +755,7 @@ def _probe_http(args: Mapping[str, Any], scope: str) -> SrcToolPlan:
     url = _url(args.get("url"), scope)
     rate = _bounded_int(args.get("rate_limit"), 20, 1, 50, "rate_limit")
     request_timeout = _bounded_int(args.get("request_timeout"), 10, 3, 30, "request_timeout")
+    follow_redirects = bool(args.get("follow_redirects", False))
     argv = [
         "httpx", "-u", url, "-silent", "-json", "-status-code", "-title",
         "-server", "-tech-detect", "-ip", "-cname", "-rate-limit", str(rate),
@@ -674,6 +768,7 @@ def _probe_http(args: Mapping[str, Any], scope: str) -> SrcToolPlan:
     _header_args(argv, display, _headers(args.get("headers")))
     return _plan(
         "probe_http", argv, display, timeout=90,
+        follow_redirects=follow_redirects,
         guidance="指纹结果用于选择后续入口；漏洞结论仍需 http_request 取得请求/响应证据。",
     )
 

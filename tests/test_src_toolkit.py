@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.config import worker_config
 from app.agents.escalate import EscalateHunter
 from app.agents.history import bounded_tool_content
 from app.agents.worker import Worker
@@ -51,6 +52,7 @@ def test_http_probe_builds_bounded_same_host_argv() -> None:
     assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
     assert plan.argv[plan.argv.index("-timeout") + 1] == "30"
     assert "-follow-redirects" not in plan.argv
+    assert plan.follow_redirects is True
     assert "Authorization: Bearer top-secret" in plan.argv
     assert "Bearer top-secret" not in plan.display_argv
     assert plan.timeout <= 180
@@ -124,6 +126,13 @@ def test_src_parser_reports_empty_and_malformed_output() -> None:
     assert malformed.failure_kind == "parse_error"
     assert malformed.parse_errors
 
+    malformed_array = parse_src_output(
+        "crawl_endpoints",
+        '[{"url":"https://a.test/prefix"}',
+    )
+    assert malformed_array.parse_ok is True
+    assert malformed_array.parse_errors
+
 
 def test_src_parser_preserves_head_tail_priority_and_scan_limit() -> None:
     output = "\n".join(
@@ -153,8 +162,12 @@ def test_src_parser_omitted_counts_duplicate_occurrences_by_index() -> None:
     assert parsed.omitted == 2
 
 
-def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path) -> None:
-    output_path = tmp_path / "stdout"
+def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path, monkeypatch) -> None:
+    worker_root = tmp_path / "worker-root"
+    monkeypatch.setattr(worker_config, "work_root", str(worker_root))
+    capture_dir = worker_root / ".captures" / "cap-1"
+    capture_dir.mkdir(parents=True)
+    output_path = capture_dir / "stdout"
     output_path.write_text(
         "\n".join(
             [
@@ -164,7 +177,11 @@ def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
-    capture = {"channels": [{"name": "output", "path": str(output_path)}]}
+    capture = {
+        "id": "cap-1",
+        "directory": str(capture_dir),
+        "channels": [{"name": "output", "path": str(output_path)}],
+    }
     parsed = parse_src_capture("crawl_endpoints", capture, "https://a.test")
     assert parsed.count == 1
     assert parsed.head_candidates[0].value == "https://a.test/in-scope?secret="
@@ -181,6 +198,25 @@ def test_src_capture_requires_private_output_channel() -> None:
     assert parsed.failure_kind == "capture_unavailable"
     assert parsed.partial is True
     assert parsed.remaining_unknown is True
+
+
+def test_src_capture_rejects_channel_outside_owned_directory(tmp_path: Path, monkeypatch) -> None:
+    worker_root = tmp_path / "worker-root"
+    monkeypatch.setattr(worker_config, "work_root", str(worker_root))
+    owned = worker_root / ".captures" / "cap-2"
+    owned.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.write_text(json.dumps({"url": "https://a.test/outside"}), encoding="utf-8")
+    parsed = parse_src_capture(
+        "crawl_endpoints",
+        {
+            "id": "cap-2",
+            "directory": str(owned),
+            "channels": [{"name": "output", "path": str(outside)}],
+        },
+        "https://a.test",
+    )
+    assert parsed.failure_kind == "capture_unavailable"
 
 
 def test_arjun_scanning_output_keeps_url_scope_for_parameters() -> None:
