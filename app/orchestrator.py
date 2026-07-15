@@ -11,11 +11,12 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit, urlunparse
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -164,25 +165,163 @@ _ESCALATE_TOPTIER_KEYWORDS = (
 _ESCALATE_IMPACT_THRESHOLD = int(os.environ.get("ESCALATE_IMPACT_THRESHOLD", "100"))
 
 
-def _escalation_is_significant(orig_severity: str, res: dict) -> bool:
-    """判定扩大危害结果是否『显著』——不显著则丢弃，不产出新 finding。
+def _normalize_escalation_evidence(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").strip()
 
-    满足任一即算显著：
-      1. 等级实际跳变（新等级 > 原等级）；
-      2. 定性质变（升级后类型/标题命中顶格危害关键词，如 接管/RCE）；
-      3. 影响面数量级（impact_count ≥ 阈值）。
-    """
+
+_CACHE_BUST_QUERY_KEYS = {
+    "", "bust", "cache", "cachebust", "cachebuster", "cb", "nocache",
+    "rand", "random", "t", "timestamp", "ts",
+}
+_REQUEST_NOISE_HEADERS = {
+    "accept", "accept-encoding", "accept-language", "cache-control", "connection",
+    "content-length", "date", "dnt", "host", "if-match", "if-modified-since",
+    "if-none-match", "if-range", "if-unmodified-since", "pragma", "priority", "te",
+    "traceparent", "tracestate", "upgrade", "upgrade-insecure-requests", "user-agent",
+    "x-correlation-id", "x-request-id",
+}
+_RESPONSE_NOISE_HEADERS = {
+    "age", "alt-svc", "cache-control", "cf-ray", "connection", "content-length",
+    "date", "etag", "expires", "last-modified", "request-id", "server",
+    "server-timing", "timing-allow-origin", "traceparent", "tracestate",
+    "transfer-encoding", "via", "x-amz-cf-id", "x-cache", "x-cache-hits",
+    "x-correlation-id", "x-request-id", "x-served-by", "x-timer",
+}
+
+
+def _split_http_evidence(value: object) -> tuple[str, dict[str, list[str]], str]:
+    text = _normalize_escalation_evidence(value)
+    head, separator, body = text.partition("\n\n")
+    lines = head.splitlines()
+    start_line = lines[0].strip() if lines else ""
+    headers: dict[str, list[str]] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        name, header_value = line.split(":", 1)
+        headers.setdefault(name.strip().lower(), []).append(" ".join(header_value.split()))
+    return start_line, headers, body.strip() if separator else ""
+
+
+def _query_evidence_signature(query: str) -> tuple[tuple[str, str], ...]:
+    pairs = parse_qsl(query, keep_blank_values=True)
+    stable = [
+        (name, value)
+        for name, value in pairs
+        if re.sub(r"[^a-z0-9]", "", name.lower()) not in _CACHE_BUST_QUERY_KEYS
+    ]
+    return tuple(sorted(stable))
+
+
+def _url_evidence_signature(value: str) -> tuple[str, str, str, tuple[tuple[str, str], ...]]:
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or ("*" if value == "*" else "/"),
+            _query_evidence_signature(parsed.query),
+        )
+    except ValueError:
+        base, _, query = value.partition("?")
+        return "", "", base or "/", _query_evidence_signature(query.partition("#")[0])
+
+
+def _cookie_names(values: list[str], *, response: bool) -> tuple[str, ...]:
+    names: list[str] = []
+    for value in values:
+        parts = [value.split(";", 1)[0]] if response else value.split(";")
+        for part in parts:
+            name, separator, _cookie_value = part.strip().partition("=")
+            if separator and name:
+                names.append(name.lower())
+    return tuple(sorted(names))
+
+
+def _header_evidence_signature(
+    headers: dict[str, list[str]],
+    *,
+    ignored: set[str],
+) -> tuple[tuple[str, object], ...]:
+    stable: list[tuple[str, object]] = []
+    for name, values in headers.items():
+        if name in ignored or name.startswith("sec-"):
+            continue
+        if name == "cookie":
+            normalized: object = _cookie_names(values, response=False)
+        elif name == "set-cookie":
+            normalized = _cookie_names(values, response=True)
+        elif name == "location":
+            normalized = tuple(sorted(_url_evidence_signature(value) for value in values))
+        else:
+            normalized = tuple(sorted(values))
+        stable.append((name, normalized))
+    return tuple(sorted(stable))
+
+
+def _request_evidence_signature(value: object) -> tuple[object, ...]:
+    start_line, headers, body = _split_http_evidence(value)
+    match = re.match(r"^([^\s]+)\s+(\S+)(?:\s+HTTP/\d+(?:\.\d+)?)?$", start_line, re.I)
+    if not match:
+        return "", start_line, body
+
+    method, target = match.groups()
+    _scheme, authority, path, query = _url_evidence_signature(target)
+    host = authority or (headers.get("host") or [""])[0].lower()
+    return (
+        method.upper(), host, path, query,
+        _header_evidence_signature(headers, ignored=_REQUEST_NOISE_HEADERS),
+        body,
+    )
+
+
+def _response_evidence_signature(value: object) -> tuple[object, ...]:
+    start_line, headers, body = _split_http_evidence(value)
+    match = re.match(r"^HTTP/\d+(?:\.\d+)?\s+(\d{3})\b", start_line, re.I)
+    status = match.group(1) if match else start_line
+    return status, _header_evidence_signature(headers, ignored=_RESPONSE_NOISE_HEADERS), body
+
+
+def _escalation_evidence_signature(
+    raw_request: object,
+    raw_response: object,
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    return _request_evidence_signature(raw_request), _response_evidence_signature(raw_response)
+
+
+def _escalation_is_significant(
+    orig_severity: str,
+    res: dict,
+    *,
+    source_finding: dict | None = None,
+) -> bool:
+    """Return whether an escalation proves a materially new impact."""
     if not res or not res.get("escalated"):
         return False
-    new_sev = res.get("severity") or ""
-    if _SEVERITY_RANK.get(new_sev, 0) > _SEVERITY_RANK.get(orig_severity, 0):
-        return True
-    blob = f"{res.get('vuln_type','')} {res.get('title','')}".lower()
-    if any(k in blob for k in _ESCALATE_TOPTIER_KEYWORDS):
-        return True
-    if int(res.get("impact_count", 0) or 0) >= _ESCALATE_IMPACT_THRESHOLD:
-        return True
-    return False
+
+    new_severity = res.get("severity") or ""
+    severity_up = _SEVERITY_RANK.get(new_severity, 0) > _SEVERITY_RANK.get(orig_severity, 0)
+    impact_up = int(res.get("impact_count", 0) or 0) >= _ESCALATE_IMPACT_THRESHOLD
+    blob = f"{res.get('vuln_type', '')} {res.get('title', '')}".lower()
+    top_tier = any(keyword in blob for keyword in _ESCALATE_TOPTIER_KEYWORDS)
+
+    source = source_finding or {}
+    if dedup.normalize_vuln_type(source.get("vuln_type", "")) == "backdoor_compromised":
+        new_request = _normalize_escalation_evidence(res.get("raw_request"))
+        new_response = _normalize_escalation_evidence(res.get("raw_response"))
+        if not new_request or not new_response:
+            return False
+        old_request = _normalize_escalation_evidence(source.get("raw_request"))
+        old_response = _normalize_escalation_evidence(source.get("raw_response"))
+        if _escalation_evidence_signature(
+            new_request, new_response,
+        ) == _escalation_evidence_signature(old_request, old_response):
+            return False
+        if dedup.normalize_vuln_type(res.get("vuln_type", "")) == "backdoor_compromised":
+            if not severity_up and not impact_up:
+                return False
+
+    return severity_up or top_tier or impact_up
 
 
 LOOP_INTERVAL = 3.0
@@ -3657,7 +3796,11 @@ class TaskRunner:
             return
 
         # 显著性门槛：不显著就丢弃，只留一条事件，不产出新 finding、不污染报告。
-        if not _escalation_is_significant(orig_severity, res):
+        if not _escalation_is_significant(
+            orig_severity,
+            res,
+            source_finding=finding_dict,
+        ):
             reason = res.get("reason") or "未达到显著升级门槛（等级未提升且影响面无质变）"
             async with SessionLocal() as s:
                 await finalize_escalation_attempt(

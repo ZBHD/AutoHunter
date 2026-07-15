@@ -106,11 +106,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "check_duplicate_finding",
-            "description": "提交漏洞前查重：用类型/标题/URL 对比全局同系统历史漏洞。只拦同系统同洞；duplicate=true 时不要再 submit，同系统其它 endpoint/类型/证据链可继续挖。",
+            "description": "查重(backdoor_compromised)：duplicate=true 不提交；同系统其它 endpoint/类型/证据链继续挖。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "vuln_type": {"type": "string", "description": "漏洞类型，如 idor/unauthorized_access/sql_injection"},
+                    "vuln_type": {"type": "string", "description": "漏洞类型，如 idor/unauthorized_access/sql_injection/backdoor_compromised"},
                     "title": {"type": "string", "description": "准备提交的漏洞标题"},
                     "target_url": {"type": "string", "description": "漏洞所在URL"},
                     "description": {"type": "string", "description": "简要描述，用于辅助模糊查重"},
@@ -124,13 +124,13 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "submit_finding",
             "description": (
-                "提交一个确认的漏洞。提交前必须先用 http_request/run_shell 取得真实证据"
+                "提交确认漏洞，支持 backdoor_compromised。提交前必须先用 http_request/run_shell 取得真实证据"
                 "（原始请求/响应包）。提交前必须如实填写 self_check 自检。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "vuln_type": {"type": "string", "description": "漏洞类型，如 sql_injection/rce/captcha_bypass/idor/unauthorized_access/file_upload"},
+                    "vuln_type": {"type": "string", "description": "漏洞类型，如 sql_injection/rce/captcha_bypass/idor/unauthorized_access/file_upload/backdoor_compromised"},
                     "title": {"type": "string", "description": "[目标]-[模块]-[简述]"},
                     "severity_claimed": {"type": "string", "enum": ["严重", "高危", "中危", "低危"]},
                     "target_url": {"type": "string"},
@@ -466,13 +466,14 @@ ESCALATE_TOOL_SCHEMAS = [
         "function": {
             "name": "submit_escalation",
             "description": (
-                "仅当你已把原漏洞【实锤升级】——危害等级实际提升，或影响面出现数量级变化（如单点→批量接管/遍历）"
+                "提交实锤升级；backdoor_compromised 应提供新证据并优先写真实根因类型。"
+                "仅当危害等级实际提升，或影响面出现数量级变化（如单点→批量接管/遍历）"
                 "——时调用一次，交出升级后的完整证据链。没打穿、原地打转、危害没变，请改调 abandon_escalation。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "vuln_type": {"type": "string", "description": "升级后的漏洞类型，如『任意用户密码重置+账号接管』"},
+                    "vuln_type": {"type": "string", "description": "升级后的真实根因类型，如 rce/file_upload/unauthorized_access；完整性事件可为 backdoor_compromised"},
                     "title": {"type": "string", "description": "升级后的漏洞标题（含归属单位/系统 + 升级后的危害）"},
                     "severity": {"type": "string", "enum": ["严重", "高危", "中危", "低危"], "description": "升级后的最终等级"},
                     "description": {"type": "string", "description": "升级利用链描述：从原入口如何一步步做大危害"},

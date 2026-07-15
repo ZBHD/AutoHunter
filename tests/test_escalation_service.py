@@ -803,3 +803,309 @@ def test_accepted_review_commits_persistent_attempt_before_dispatch(tmp_path, mo
             await engine.dispose()
 
     asyncio.run(scenario())
+
+
+def _backdoor_source() -> dict:
+    return {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\n\r\nCasino page",
+    }
+
+
+def test_regular_escalation_keeps_existing_severity_behavior() -> None:
+    from app import orchestrator
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {"escalated": True, "severity": "严重", "vuln_type": "idor"},
+        source_finding={"vuln_type": "idor"},
+    ) is True
+
+
+def test_backdoor_escalation_requires_complete_new_evidence() -> None:
+    from app import orchestrator
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "raw_request": "GET /shell.php HTTP/1.1",
+            "raw_response": "",
+        },
+        source_finding=_backdoor_source(),
+    ) is False
+
+
+def test_backdoor_escalation_rejects_reused_evidence_even_with_higher_severity() -> None:
+    from app import orchestrator
+
+    source = _backdoor_source()
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "backdoor_compromised",
+            "title": "RCE through existing webshell",
+            "raw_request": source["raw_request"],
+            "raw_response": source["raw_response"],
+        },
+        source_finding=source,
+    ) is False
+
+
+def test_backdoor_escalation_rejects_semantically_reused_page_evidence() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": (
+            "GET /landing?cache_bust=source HTTP/1.1\r\n"
+            "Host: example.test\r\n"
+            "Accept: text/html\r\n\r\n"
+        ),
+        "raw_response": (
+            "HTTP/1.1 200 OK\r\n"
+            "Date: Wed, 15 Jul 2026 00:00:00 GMT\r\n"
+            "Age: 0\r\n"
+            "Content-Type: text/html\r\n\r\n"
+            "Casino page"
+        ),
+    }
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": (
+                "GET /landing?_=different-random-value HTTP/1.1\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Accept: text/html\r\n"
+                "Host: example.test\r\n\r\n"
+            ),
+            "raw_response": (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html\r\n"
+                "Age: 7\r\n"
+                "Date: Wed, 15 Jul 2026 00:01:00 GMT\r\n\r\n"
+                "Casino page"
+            ),
+        },
+        source_finding=source,
+    ) is False
+
+
+def test_backdoor_escalation_accepts_new_response_proof_on_the_same_path() -> None:
+    from app import orchestrator
+
+    source = _backdoor_source()
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": (
+                "GET /?probe=whoami HTTP/1.1\r\n"
+                "Host: example.test\r\n"
+                "Cache-Control: no-cache\r\n\r\n"
+            ),
+            "raw_response": "HTTP/1.1 200 OK\r\n\r\nprobe-user",
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_preserves_meaningful_query_evidence() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET /shell.php?cmd=whoami HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\n\r\ncommand accepted",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": "GET /shell.php?cmd=id HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            "raw_response": source["raw_response"],
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_preserves_new_security_response_headers() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nDashboard",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "unauthorized_access",
+            "title": "Admin session issued without authentication",
+            "raw_request": source["raw_request"],
+            "raw_response": (
+                "HTTP/1.1 200 OK\r\n"
+                "Set-Cookie: admin_session=TOKEN; HttpOnly\r\n"
+                "Content-Type: text/html\r\n\r\n"
+                "Dashboard"
+            ),
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_handles_malformed_request_targets() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET http://[invalid/landing?cache_bust=one HTTP/1.1\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\nDate: first\r\n\r\nCasino page",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": "GET http://[invalid/landing?_=two HTTP/1.1\r\nCache-Control: no-cache\r\n\r\n",
+            "raw_response": "HTTP/1.1 200 OK\r\nDate: second\r\nAge: 1\r\n\r\nCasino page",
+        },
+        source_finding=source,
+    ) is False
+
+
+def test_backdoor_escalation_accepts_new_same_type_evidence_only_when_impact_grows() -> None:
+    from app import orchestrator
+
+    base = {
+        "escalated": True,
+        "severity": "高危",
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET /shell.php?probe=whoami HTTP/1.1",
+        "raw_response": "HTTP/1.1 200 OK\r\n\r\nprobe-user",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        base,
+        source_finding=_backdoor_source(),
+    ) is False
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {**base, "impact_count": orchestrator._ESCALATE_IMPACT_THRESHOLD},
+        source_finding=_backdoor_source(),
+    ) is True
+
+
+def test_backdoor_escalation_accepts_new_same_type_evidence_when_severity_grows() -> None:
+    from app import orchestrator
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "backdoor_compromised",
+            "raw_request": "GET /shell.php?probe=whoami HTTP/1.1",
+            "raw_response": "HTTP/1.1 200 OK\r\n\r\nprobe-user",
+        },
+        source_finding=_backdoor_source(),
+    ) is True
+
+
+def test_backdoor_escalation_accepts_new_root_cause_evidence() -> None:
+    from app import orchestrator
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": "GET /shell.php?probe=whoami HTTP/1.1",
+            "raw_response": "HTTP/1.1 200 OK\r\n\r\nprobe-user",
+        },
+        source_finding={**_backdoor_source(), "vuln_type": "网页被篡改"},
+    ) is True
+
+
+def test_runner_skips_backdoor_escalation_with_reused_evidence(tmp_path, monkeypatch) -> None:
+    async def scenario() -> None:
+        from app import orchestrator
+        from app.agents import escalate as escalate_module
+
+        engine, sessions = await _database(tmp_path)
+        source = _backdoor_source()
+        try:
+            async with sessions() as session:
+                finding = await session.get(Finding, "finding-0")
+                finding.vuln_type = source["vuln_type"]
+                finding.raw_request = source["raw_request"]
+                finding.raw_response = source["raw_response"]
+                attempt, _ = await queue_attempt(
+                    session,
+                    task_id="task",
+                    finding_id="finding-0",
+                    orig_severity="高危",
+                )
+                attempt_id = attempt.id
+                await session.commit()
+
+            class FakeExecutor:
+                def kill_processes(self) -> None:
+                    pass
+
+            class FakeHunter:
+                def __init__(self, *_args, **_kwargs) -> None:
+                    self.executor = FakeExecutor()
+
+                def run(self):
+                    return SimpleNamespace(model_dump=lambda **_kwargs: {
+                        "escalated": True,
+                        "severity": "严重",
+                        "vuln_type": "backdoor_compromised",
+                        "title": "Repeated compromised page",
+                        "raw_request": source["raw_request"],
+                        "raw_response": source["raw_response"],
+                    })
+
+            monkeypatch.setattr(escalate_module, "EscalateHunter", FakeHunter)
+            monkeypatch.setattr(orchestrator, "SessionLocal", sessions)
+            monkeypatch.setattr(orchestrator, "_llm_for_task", lambda _task: object())
+            monkeypatch.setattr(orchestrator, "agent_semaphore", lambda _kind: asyncio.Semaphore(1))
+
+            runner = orchestrator.TaskRunner("task")
+            await runner._run_escalation_inner("task", attempt_id)
+
+            async with sessions() as session:
+                persisted = await session.get(EscalationAttempt, attempt_id)
+                generated = (await session.scalars(
+                    select(Finding).where(Finding.worker_id == "escalation")
+                )).all()
+                assert persisted.status == "skipped"
+                assert persisted.error_kind == "not_significant"
+                assert generated == []
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())

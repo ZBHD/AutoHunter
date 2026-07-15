@@ -40,7 +40,7 @@ def generate_query(llm: LLMRouter, intent: str, vuln_types: list[str],
         + "\n\n请产出本轮的 1 条 FOFA 语法。"
     )
     msg = llm.chat(
-        [{"role": "system", "content": collector_query_prompt(src_type)},
+        [{"role": "system", "content": collector_query_prompt(src_type, vuln_types)},
          {"role": "user", "content": user}],
         tools=COLLECTOR_QUERY_SCHEMAS,
         tool_choice="auto",
