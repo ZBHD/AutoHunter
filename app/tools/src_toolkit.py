@@ -171,11 +171,10 @@ def _new_candidate(
 
 
 def _json_records(text: str, errors: list[str]) -> Iterator[Mapping[str, Any]]:
-    stripped = text.strip()
-    if not stripped:
+    if not text.strip():
         return
     try:
-        parsed = json.loads(stripped)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         parsed = None
     if isinstance(parsed, Mapping):
@@ -286,12 +285,16 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
     priority_candidates: list[tuple[int, SrcCandidate]] = []
     candidate_count = 0
 
+    def add_error(message: str) -> None:
+        if len(errors) < 64:
+            errors.append(message)
+
     def add(candidate: SrcCandidate | None) -> None:
         nonlocal candidate_count
         if candidate is None:
             return
         if not _candidate_in_scope(candidate, scope_target):
-            errors.append(f"scope filtered: {candidate.value or candidate.endpoint_key}")
+            add_error(f"scope filtered: {candidate.value or candidate.endpoint_key}")
             return
         candidate_index = candidate_count
         candidate_count += 1
@@ -311,8 +314,7 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
             records_seen = True
             url = _record_url(record)
             if not url:
-                if len(errors) < 64:
-                    errors.append("record missing url")
+                add_error("record missing url")
                 continue
             request = record.get("request") if isinstance(record.get("request"), Mapping) else {}
             method = request.get("method") if isinstance(request, Mapping) else record.get("method", "GET")
@@ -331,7 +333,7 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 record=record, scanner=scanner,
             ))
         if not records_seen and not errors:
-            errors.append("no JSON records")
+            add_error("no JSON records")
     elif name == "fingerprint_waf":
         records_seen = False
         for record in _json_records(text, errors):
@@ -339,8 +341,7 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
             url = _record_url(record)
             firewall = record.get("firewall") or record.get("waf") or record.get("manufacturer") or record.get("name")
             if not url and not firewall:
-                if len(errors) < 64:
-                    errors.append("record missing target")
+                add_error("record missing target")
                 continue
             add(_new_candidate(
                 "fingerprint", url or str(firewall), url or str(firewall),
@@ -349,7 +350,7 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 reason=str(firewall or "waf fingerprint"), record=record,
             ))
         if not records_seen and not errors:
-            errors.append("no JSON records")
+            add_error("no JSON records")
     elif name == "discover_parameters":
         current_url = ""
         current_method = "GET"
@@ -407,9 +408,9 @@ def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcPar
                 reason=f"nmap {port}/{protocol.lower()}",
             ))
         if not head_candidates and not errors:
-            errors.append("no open service lines")
+            add_error("no open service lines")
     else:
-        errors.append(f"unsupported SRC parser: {name}")
+        add_error(f"unsupported SRC parser: {name}")
 
     # Keep summaries stable and bounded while count remains the number admitted.
     head = tuple(candidate for _index, candidate in head_candidates)
