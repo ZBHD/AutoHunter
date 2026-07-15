@@ -20,6 +20,7 @@ _LOCATIONS = {"path", "query", "body", "header", "cookie", "fragment", "unknown"
 _STATUSES = {"pending", "verified", "failed", "inconclusive", "skipped"}
 _INCONCLUSIVE_OUTCOMES = {"timeout", "network", "insufficient", "inconclusive"}
 _METHOD_PREFIX = re.compile(r"^(?P<method>[A-Za-z]+)\s+(?P<target>.+)$")
+_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
 
 
 def _raw_text(value: object) -> str:
@@ -60,6 +61,15 @@ def _strip_bare_userinfo(path: str) -> str:
     return path
 
 
+_PATH_USERINFO = re.compile(r"(?:(?<=/)|^)[^/@:?#\s]+:[^/@?#\s]*@")
+
+
+def _scrub_path_userinfo(path: str) -> str:
+    """Remove credential-like ``name:value@`` segments from malformed paths."""
+
+    return _PATH_USERINFO.sub("", path)
+
+
 def _normalize_opaque_scheme(raw: str) -> str:
     """Turn malformed ``scheme:authority`` spellings into parseable URLs."""
 
@@ -73,12 +83,39 @@ def _normalize_opaque_scheme(raw: str) -> str:
         # parsed as an authority and has its userinfo removed.
         return f"{scheme}//{rest.lstrip('/')}"
 
+    if rest.startswith("/"):
+        # A single slash is another common malformed spelling of an authority.
+        stripped = rest.lstrip("/")
+        authority, separator, tail = stripped.partition("/")
+        if "@" in authority:
+            userinfo, host = authority.rsplit("@", 1)
+            if ":" in userinfo:
+                return f"{scheme}//{host}" + (f"/{tail}" if separator else "")
+
     authority, separator, tail = rest.partition("/")
     if "@" in authority:
         userinfo, host = authority.rsplit("@", 1)
         if ":" in userinfo:
             return f"{scheme}//{host}" + (f"/{tail}" if separator else "")
     return raw
+
+
+def _split_http_method_target(raw: str) -> tuple[str, str]:
+    """Split only a recognized HTTP method followed by a URL-like target."""
+
+    match = _METHOD_PREFIX.match(raw)
+    if not match:
+        return "", raw
+    method = match.group("method").upper()
+    target = match.group("target")
+    if method not in _HTTP_METHODS:
+        return "", raw
+    looks_like_url = (
+        target.startswith("/")
+        or re.match(r"^https?://", target, re.IGNORECASE) is not None
+        or re.match(r"^https?:", target, re.IGNORECASE) is not None
+    )
+    return (method, target) if looks_like_url else ("", raw)
 
 
 def _fallback_public(raw: str) -> str:
@@ -102,6 +139,7 @@ def _fallback_public(raw: str) -> str:
         clean = f"{prefix}{host.lower()}{authority_match.group('path') or ''}"
     else:
         clean = _strip_bare_userinfo(path)
+    clean = _scrub_path_userinfo(clean)
     if separator:
         clean += f"?{_query_names(query)}"
     return _text(clean)
@@ -113,9 +151,7 @@ def _public_value(value: object) -> str:
     raw = _raw_text(value)
     if not raw:
         return ""
-    method_match = _METHOD_PREFIX.match(raw)
-    if method_match:
-        raw = method_match.group("target")
+    _, raw = _split_http_method_target(raw)
     raw = _normalize_opaque_scheme(raw)
     try:
         parsed = urlsplit(raw)
@@ -124,10 +160,11 @@ def _public_value(value: object) -> str:
         return _text(sanitized)
     if not parsed.netloc:
         if "?" not in raw:
-            path = _strip_bare_userinfo(raw.split("#", 1)[0])
+            path = _scrub_path_userinfo(_strip_bare_userinfo(raw.split("#", 1)[0]))
             return _text(path)
         path, query = raw.split("?", 1)
-        sanitized = f"{_strip_bare_userinfo(path.split('#', 1)[0])}?{_query_names(query)}"
+        clean_path = _scrub_path_userinfo(_strip_bare_userinfo(path.split('#', 1)[0]))
+        sanitized = f"{clean_path}?{_query_names(query)}"
         return _text(sanitized)
 
     scheme = parsed.scheme.lower()
@@ -146,7 +183,7 @@ def _public_value(value: object) -> str:
         host = f"[{host}]"
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         host = f"{host}:{port}"
-    sanitized = urlunsplit((scheme, host, parsed.path, _query_names(parsed.query), ""))
+    sanitized = urlunsplit((scheme, host, _scrub_path_userinfo(parsed.path), _query_names(parsed.query), ""))
     return _text(sanitized)
 
 
@@ -164,10 +201,9 @@ def _method(value: object) -> str:
 
 def _endpoint_key(value: object, method: str) -> str:
     raw = _raw_text(value)
-    match = _METHOD_PREFIX.match(raw)
-    target = match.group("target") if match else raw
+    _, target = _split_http_method_target(raw)
     normalized = _public_value(target)
-    return _text(f"{method} {normalized}" if match else normalized)
+    return _text(f"{method} {normalized}" if target != raw else normalized)
 
 
 def _confidence(value: object) -> float:

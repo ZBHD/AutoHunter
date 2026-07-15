@@ -133,6 +133,43 @@ def test_opaque_scheme_authority_is_sanitized(value: str) -> None:
     assert "SECRET" not in repr(candidate)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https:/user:pass@host/path?token=ONESLASHSECRET",
+        "GET https:/user:pass@host/path?token=METHODSLASHSECRET",
+    ],
+)
+def test_single_slash_opaque_authority_is_sanitized(value: str) -> None:
+    candidate = _candidate(value=value)
+
+    assert candidate.value == "https://host/path?token="
+    assert "user:pass" not in repr(candidate)
+    assert "SECRET" not in repr(candidate)
+
+
+@pytest.mark.parametrize("value", ["OpenSSH 8.2", "Apache httpd 2.4", "Potential SSRF hypothesis"])
+def test_non_http_leading_tokens_are_not_treated_as_methods(value: str) -> None:
+    candidate = _candidate(kind="fingerprint", value=value, endpoint_key=value)
+
+    assert candidate.value == value
+
+
+def test_malformed_bracket_authority_scrubs_path_userinfo() -> None:
+    candidate = _candidate(value="https://[bad/user:pass@host/path?token=BRACKETSECRET")
+
+    assert "user:pass" not in repr(candidate)
+    assert "BRACKETSECRET" not in repr(candidate)
+    assert len(candidate.value) <= 160
+
+
+def test_malformed_port_path_userinfo_is_scrubbed() -> None:
+    candidate = _candidate(value="https://host:bad/user:pass@host/path?token=PORTSECRET")
+
+    assert "user:pass" not in repr(candidate)
+    assert "PORTSECRET" not in repr(candidate)
+
+
 def test_userinfo_longer_than_input_budget_is_sanitized_before_bounding() -> None:
     userinfo = "u" * (1_048_576 + 128)
     candidate = _candidate(value=f"https://{userinfo}:pass@host/path?token=HUGESECRET")
