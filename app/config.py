@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, quote_plus, urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 def _load_dotenv() -> None:
@@ -48,6 +55,19 @@ def _validate_http_base_url(value: str) -> str:
     return normalized
 
 
+def _key_overlaps_name(name: str, key: str) -> bool:
+    normalized_key = str(key or "").strip()
+    if not normalized_key:
+        return False
+    name_key = str(name or "").casefold()
+    key_variants = {
+        normalized_key,
+        quote(normalized_key, safe=""),
+        quote_plus(normalized_key, safe=""),
+    }
+    return any(variant.casefold() in name_key for variant in key_variants)
+
+
 FofaRuntimeState = Literal[
     "ready", "rate_limited", "daily_cooldown", "daily_suspended", "auth_invalid"
 ]
@@ -70,13 +90,22 @@ class FofaKeyConfig(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name(cls, value: str, info: ValidationInfo) -> str:
         normalized = str(value or "").strip()
         if not normalized or "/" in normalized or "\\" in normalized:
             raise ValueError("FOFA Key 名称必须非空且可用于 API 路径")
         if normalized.casefold() == "order":
             raise ValueError("FOFA Key 名称不能使用保留字 order")
+        if _key_overlaps_name(normalized, info.data.get("key", "")):
+            raise ValueError("FOFA Key 名称不能包含 Key")
         return normalized
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str, info: ValidationInfo) -> str:
+        if _key_overlaps_name(info.data.get("name", ""), value):
+            raise ValueError("FOFA Key 名称不能包含 Key")
+        return value
 
     @field_validator("cooldown_until")
     @classmethod
@@ -94,16 +123,7 @@ class FofaKeyConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_name_does_not_contain_key(self) -> "FofaKeyConfig":
-        normalized_key = self.key.strip()
-        name_key = self.name.casefold()
-        key_variants = {
-            normalized_key,
-            quote(normalized_key, safe=""),
-            quote_plus(normalized_key, safe=""),
-        }
-        if normalized_key and any(
-            variant.casefold() in name_key for variant in key_variants
-        ):
+        if _key_overlaps_name(self.name, self.key):
             raise ValueError("FOFA Key 名称不能包含 Key")
         return self
 

@@ -74,6 +74,30 @@ def test_fofa_key_config_rejects_assignment_key_in_name() -> None:
         item.key = item.name
 
 
+def test_fofa_key_config_rejects_assignment_name_and_preserves_fields() -> None:
+    item = FofaKeyConfig(name="Primary", key="secret-a")
+
+    with pytest.raises(ValidationError):
+        item.name = "prefix-secret-a-suffix"
+
+    assert item.name == "Primary"
+    assert item.key == "secret-a"
+    assert "secret-a" not in repr(item)
+    assert "secret-a" not in str(item)
+
+
+def test_fofa_key_config_rejects_assignment_key_and_preserves_fields() -> None:
+    item = FofaKeyConfig(name="Primary", key="secret-a")
+
+    with pytest.raises(ValidationError):
+        item.key = item.name
+
+    assert item.name == "Primary"
+    assert item.key == "secret-a"
+    assert "secret-a" not in repr(item)
+    assert "secret-a" not in str(item)
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
