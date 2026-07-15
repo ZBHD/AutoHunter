@@ -80,7 +80,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 4. 同一个业务请求中，每个 Key 最多尝试一次，候选数量达到上限后结束本轮。
 5. 某个备用 Key 成功时，调用方只接收一次成功结果，业务分页只推进一次。
 6. 全部 Key 处于冷却状态时，返回包含最早 `cooldown_until` 的池耗尽结果，任务进入等待；冷却期间静默跳过。
-7. 全部候选均为认证失效或 `daily_suspended` 时，任务暂停并记录汇总原因，等待设置更新、检测恢复或任务重启。
+7. 全部候选均为认证失效或 `daily_suspended` 时，任务暂停并记录汇总原因。全局池等待设置更新或检测恢复；任务级单 Key 覆盖还可以通过任务重启清除自身暂停状态。
 
 运行时状态写回使用 Key 名称和配置指纹做条件校验。检测或编辑期间发生配置变化时，旧请求结果标记 `stale`，当前配置保持原样。
 
@@ -90,7 +90,7 @@ Collector、Worker 的 `fofa_lookup`、Killsweep 的 FOFA 搜索均通过 Router
 
 - `auth`：认证、权限、过期、账号无效等；映射为 `auth_invalid`，持久阻断当前 Key 并立即尝试下一个。
 - `rate_limit`：HTTP 429、Q3005、Too Many Requests 等；映射为 `rate_limited`，指数退避 60、120、240、480、600 秒，到期自动回池。
-- `daily_limit`：FOFA `820041`、每日上限、每日额度等；先映射为 `daily_cooldown`，每次进入 1 小时冷却并在到期后自动回池。同一 Key 连续 12 次仍返回该错误时转为 `daily_suspended`，检测成功、替换 Key 或任务重启后恢复。
+- `daily_limit`：FOFA `820041`、每日上限、每日额度等；先映射为 `daily_cooldown`，每次进入 1 小时冷却并在到期后自动回池。同一 Key 连续 12 次仍返回该错误时转为 `daily_suspended`。全局 Key 由检测成功或替换 Key 恢复；任务级单 Key 还可以由任务重启恢复。
 - `transient`：网络错误、5xx、非 JSON、端点瞬时异常；运行状态保持 `ready`，本轮结束，下轮继续使用当前游标。
 
 每日额度匹配优先级高于通用 quota 和账号错误，避免把额度耗尽误判成认证失效。连续次数按 Key 分别统计；池中存在其他可用 Key 时任务继续执行。
