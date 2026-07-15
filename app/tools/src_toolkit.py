@@ -170,8 +170,41 @@ def _new_candidate(
         return None
 
 
+def _iter_json_array(text: str, start: int, errors: list[str]) -> Iterator[Mapping[str, Any]]:
+    decoder = json.JSONDecoder()
+    cursor = start + 1
+    length = len(text)
+    while cursor < length:
+        while cursor < length and text[cursor].isspace():
+            cursor += 1
+        if cursor >= length or text[cursor] == "]":
+            return
+        try:
+            value, cursor = decoder.raw_decode(text, cursor)
+        except json.JSONDecodeError as exc:
+            if len(errors) < 64:
+                errors.append(f"json array: {exc.msg}")
+            return
+        if isinstance(value, Mapping):
+            yield value
+        elif isinstance(value, list):
+            yield from (item for item in value if isinstance(item, Mapping))
+        while cursor < length and text[cursor].isspace():
+            cursor += 1
+        if cursor < length and text[cursor] == ",":
+            cursor += 1
+
+
 def _json_records(text: str, errors: list[str]) -> Iterator[Mapping[str, Any]]:
     if not text.strip():
+        return
+    first = next((index for index, char in enumerate(text) if not char.isspace()), -1)
+    if first >= 0 and text[first] == "[":
+        yield from _iter_json_array(text, first, errors)
+        return
+    results_match = re.search(r'"results"\s*:\s*\[', text)
+    if results_match:
+        yield from _iter_json_array(text, results_match.end() - 1, errors)
         return
     try:
         parsed = json.loads(text)
