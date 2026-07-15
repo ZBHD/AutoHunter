@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -38,7 +38,7 @@ class FofaKeyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    key: str = ""
+    key: str = Field(default="", repr=False)
     enabled: bool = True
     runtime_state: FofaRuntimeState = "ready"
     failure_kind: FofaFailureKindValue = ""
@@ -54,6 +54,15 @@ class FofaKeyConfig(BaseModel):
         if normalized.casefold() == "order":
             raise ValueError("FOFA Key 名称不能使用保留字 order")
         return normalized
+
+    @field_validator("cooldown_until")
+    @classmethod
+    def normalize_cooldown_until(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("cooldown_until 必须包含时区")
+        return value.astimezone(timezone.utc)
 
 
 class LLMProviderConfig(BaseModel):

@@ -193,6 +193,10 @@ def test_old_system_settings_table_gains_fofa_key_pool_column() -> None:
                     )
                     """
                 )
+                await conn.exec_driver_sql(
+                    """INSERT INTO system_settings (id, fofa)
+                       VALUES ('global', '{"key":"legacy-secret","max_pages":7}')"""
+                )
 
                 await _auto_migrate(conn)
 
@@ -200,11 +204,13 @@ def test_old_system_settings_table_gains_fofa_key_pool_column() -> None:
                 names = {row[1] for row in columns.fetchall()}
                 assert "fofa_keys" in names
 
-                await conn.exec_driver_sql("INSERT INTO system_settings (id) VALUES ('global')")
                 value = await conn.exec_driver_sql(
-                    "SELECT fofa_keys FROM system_settings WHERE id='global'"
+                    "SELECT fofa, fofa_keys FROM system_settings WHERE id='global'"
                 )
-                assert value.scalar_one() == "[]"
+                assert value.one() == (
+                    '{"key":"legacy-secret","max_pages":7}',
+                    "[]",
+                )
         finally:
             await engine.dispose()
 

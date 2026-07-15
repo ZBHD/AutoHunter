@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -37,6 +37,39 @@ def test_fofa_key_config_accepts_utc_cooldown() -> None:
     )
 
     assert item.cooldown_until == cooldown
+
+
+def test_fofa_key_config_repr_hides_key() -> None:
+    secret = "fofa-secret-that-must-not-leak"
+
+    item = FofaKeyConfig(name="A", key=secret)
+
+    assert secret not in repr(item)
+
+
+@pytest.mark.parametrize(
+    "cooldown",
+    [
+        datetime(2026, 7, 16, 1, 0),
+        "2026-07-16T01:00:00",
+    ],
+)
+def test_fofa_key_config_rejects_naive_cooldown(cooldown) -> None:
+    with pytest.raises(ValidationError):
+        FofaKeyConfig(name="A", key="secret-a", cooldown_until=cooldown)
+
+
+def test_fofa_key_config_normalizes_cooldown_to_utc() -> None:
+    item = FofaKeyConfig(
+        name="A",
+        key="secret-a",
+        cooldown_until=datetime(
+            2026, 7, 16, 1, 0, tzinfo=timezone(timedelta(hours=8))
+        ),
+    )
+
+    assert item.cooldown_until == datetime(2026, 7, 15, 17, 0, tzinfo=timezone.utc)
+    assert item.cooldown_until.tzinfo is timezone.utc
 
 
 @pytest.mark.parametrize("name", ["", "  ", "A/B", r"A\B", " Order ", "ORDER"])
