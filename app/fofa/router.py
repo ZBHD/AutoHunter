@@ -158,7 +158,7 @@ class FofaKeyRouter(Generic[T]):
         item = entry.config
         return FofaKeyStateSnapshot(
             name=item.name,
-            base_url=item.base_url,
+            base_url=self._redact(item.base_url),
             enabled=item.enabled,
             key_set=bool(item.key),
             runtime_state=item.runtime_state,

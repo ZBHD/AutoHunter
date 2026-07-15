@@ -474,6 +474,12 @@ def test_credential_fingerprint_is_stable_irreversible_and_changes_with_key() ->
     assert snapshot.key_set is True
     assert not hasattr(snapshot, "key")
 
+    overlap = FofaKeyRouter(
+        [key("Overlap", "fofa.example", base_url="https://fofa.example/api")]
+    )
+    overlap_snapshot = overlap.keys[0]
+    assert "fofa.example" not in overlap_snapshot.base_url
+
 
 def test_preblocked_entries_are_reported_with_safe_fixed_failure_kinds() -> None:
     start = datetime(2026, 7, 16, tzinfo=UTC)
