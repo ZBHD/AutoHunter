@@ -11,11 +11,12 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit, urlunparse
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -167,6 +168,126 @@ def _normalize_escalation_evidence(value: object) -> str:
     return str(value or "").replace("\r\n", "\n").strip()
 
 
+_CACHE_BUST_QUERY_KEYS = {
+    "", "bust", "cache", "cachebust", "cachebuster", "cb", "nocache",
+    "rand", "random", "t", "timestamp", "ts",
+}
+_REQUEST_NOISE_HEADERS = {
+    "accept", "accept-encoding", "accept-language", "cache-control", "connection",
+    "content-length", "date", "dnt", "host", "if-match", "if-modified-since",
+    "if-none-match", "if-range", "if-unmodified-since", "pragma", "priority", "te",
+    "traceparent", "tracestate", "upgrade", "upgrade-insecure-requests", "user-agent",
+    "x-correlation-id", "x-request-id",
+}
+_RESPONSE_NOISE_HEADERS = {
+    "age", "alt-svc", "cache-control", "cf-ray", "connection", "content-length",
+    "date", "etag", "expires", "last-modified", "request-id", "server",
+    "server-timing", "timing-allow-origin", "traceparent", "tracestate",
+    "transfer-encoding", "via", "x-amz-cf-id", "x-cache", "x-cache-hits",
+    "x-correlation-id", "x-request-id", "x-served-by", "x-timer",
+}
+
+
+def _split_http_evidence(value: object) -> tuple[str, dict[str, list[str]], str]:
+    text = _normalize_escalation_evidence(value)
+    head, separator, body = text.partition("\n\n")
+    lines = head.splitlines()
+    start_line = lines[0].strip() if lines else ""
+    headers: dict[str, list[str]] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        name, header_value = line.split(":", 1)
+        headers.setdefault(name.strip().lower(), []).append(" ".join(header_value.split()))
+    return start_line, headers, body.strip() if separator else ""
+
+
+def _query_evidence_signature(query: str) -> tuple[tuple[str, str], ...]:
+    pairs = parse_qsl(query, keep_blank_values=True)
+    stable = [
+        (name, value)
+        for name, value in pairs
+        if re.sub(r"[^a-z0-9]", "", name.lower()) not in _CACHE_BUST_QUERY_KEYS
+    ]
+    return tuple(sorted(stable))
+
+
+def _url_evidence_signature(value: str) -> tuple[str, str, str, tuple[tuple[str, str], ...]]:
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or ("*" if value == "*" else "/"),
+            _query_evidence_signature(parsed.query),
+        )
+    except ValueError:
+        base, _, query = value.partition("?")
+        return "", "", base or "/", _query_evidence_signature(query.partition("#")[0])
+
+
+def _cookie_names(values: list[str], *, response: bool) -> tuple[str, ...]:
+    names: list[str] = []
+    for value in values:
+        parts = [value.split(";", 1)[0]] if response else value.split(";")
+        for part in parts:
+            name, separator, _cookie_value = part.strip().partition("=")
+            if separator and name:
+                names.append(name.lower())
+    return tuple(sorted(names))
+
+
+def _header_evidence_signature(
+    headers: dict[str, list[str]],
+    *,
+    ignored: set[str],
+) -> tuple[tuple[str, object], ...]:
+    stable: list[tuple[str, object]] = []
+    for name, values in headers.items():
+        if name in ignored or name.startswith("sec-"):
+            continue
+        if name == "cookie":
+            normalized: object = _cookie_names(values, response=False)
+        elif name == "set-cookie":
+            normalized = _cookie_names(values, response=True)
+        elif name == "location":
+            normalized = tuple(sorted(_url_evidence_signature(value) for value in values))
+        else:
+            normalized = tuple(sorted(values))
+        stable.append((name, normalized))
+    return tuple(sorted(stable))
+
+
+def _request_evidence_signature(value: object) -> tuple[object, ...]:
+    start_line, headers, body = _split_http_evidence(value)
+    match = re.match(r"^([^\s]+)\s+(\S+)(?:\s+HTTP/\d+(?:\.\d+)?)?$", start_line, re.I)
+    if not match:
+        return "", start_line, body
+
+    method, target = match.groups()
+    _scheme, authority, path, query = _url_evidence_signature(target)
+    host = authority or (headers.get("host") or [""])[0].lower()
+    return (
+        method.upper(), host, path, query,
+        _header_evidence_signature(headers, ignored=_REQUEST_NOISE_HEADERS),
+        body,
+    )
+
+
+def _response_evidence_signature(value: object) -> tuple[object, ...]:
+    start_line, headers, body = _split_http_evidence(value)
+    match = re.match(r"^HTTP/\d+(?:\.\d+)?\s+(\d{3})\b", start_line, re.I)
+    status = match.group(1) if match else start_line
+    return status, _header_evidence_signature(headers, ignored=_RESPONSE_NOISE_HEADERS), body
+
+
+def _escalation_evidence_signature(
+    raw_request: object,
+    raw_response: object,
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    return _request_evidence_signature(raw_request), _response_evidence_signature(raw_response)
+
+
 def _escalation_is_significant(
     orig_severity: str,
     res: dict,
@@ -191,7 +312,9 @@ def _escalation_is_significant(
             return False
         old_request = _normalize_escalation_evidence(source.get("raw_request"))
         old_response = _normalize_escalation_evidence(source.get("raw_response"))
-        if new_request == old_request and new_response == old_response:
+        if _escalation_evidence_signature(
+            new_request, new_response,
+        ) == _escalation_evidence_signature(old_request, old_response):
             return False
         if dedup.normalize_vuln_type(res.get("vuln_type", "")) == "backdoor_compromised":
             if not severity_up and not impact_up:
