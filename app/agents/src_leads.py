@@ -203,7 +203,7 @@ def _method(value: object) -> str:
 def _endpoint_key(value: object, method: str) -> str:
     raw = _raw_text(value)
     method_token, target = _split_http_method_target(raw)
-    if method_token and method_token == method.upper():
+    if method_token:
         return _text(f"{method} {_public_value(target)}")
     return _text(_public_value(raw, expected_method=method))
 
@@ -304,12 +304,16 @@ def _lead_id(key: tuple[str, str, str, str, str]) -> str:
 
 
 def _verify_action(candidate: SrcCandidate) -> str:
+    endpoint = candidate.endpoint_key
+    prefix = f"{candidate.method} "
+    if endpoint.upper().startswith(prefix.upper()):
+        endpoint = endpoint[len(prefix):]
     if candidate.kind == "parameter":
         return _text(
-            f"Verify {candidate.method} {candidate.endpoint_key} "
+            f"Verify {candidate.method} {endpoint} "
             f"parameter {candidate.parameter} ({candidate.location})"
         )
-    return _text(f"Verify {candidate.method} {candidate.value or candidate.endpoint_key}")
+    return _text(f"Verify {candidate.method} {candidate.value or endpoint}")
 
 
 @dataclass

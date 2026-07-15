@@ -172,6 +172,23 @@ def test_mismatched_or_descriptive_method_tokens_are_preserved(value: str) -> No
     assert candidate.value.startswith(value.split(" ", 1)[0])
 
 
+def test_endpoint_key_uses_explicit_method_as_authority() -> None:
+    candidate = _candidate(
+        kind="parameter",
+        endpoint_key="GET https://host/path",
+        value="id",
+        method="POST",
+        parameter="id",
+        location="query",
+    )
+
+    lead = Lead.from_candidate(candidate, round_no=1)
+
+    assert candidate.endpoint_key == "POST https://host/path"
+    assert lead.verify_action.startswith("Verify POST https://host/path")
+    assert "POST GET" not in lead.verify_action
+
+
 @pytest.mark.parametrize("value", ["OpenSSH 8.2", "Apache httpd 2.4", "Potential SSRF hypothesis"])
 def test_non_http_leading_tokens_are_not_treated_as_methods(value: str) -> None:
     candidate = _candidate(kind="fingerprint", value=value, endpoint_key=value)
