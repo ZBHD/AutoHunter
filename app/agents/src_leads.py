@@ -144,14 +144,19 @@ def _fallback_public(raw: str) -> str:
     return _text(clean)
 
 
-def _public_value(value: object, *, expected_method: str | None = None) -> str:
+def _public_value(
+    value: object,
+    *,
+    expected_method: str | None = None,
+    strip_any_method: bool = False,
+) -> str:
     """Bound a URL/path and remove userinfo, fragments, and query values."""
 
     raw = _raw_text(value)
     if not raw:
         return ""
     method_token, target = _split_http_method_target(raw)
-    if method_token and (expected_method is None or method_token == expected_method.upper()):
+    if method_token and (strip_any_method or expected_method is None or method_token == expected_method.upper()):
         raw = target
     raw = _normalize_opaque_scheme(raw)
     try:
@@ -278,7 +283,17 @@ class SrcCandidate:
 
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "endpoint_key", _endpoint_key(self.endpoint_key, method))
-        object.__setattr__(self, "value", _text(_public_value(self.value, expected_method=method)))
+        object.__setattr__(
+            self,
+            "value",
+            _text(
+                _public_value(
+                    self.value,
+                    expected_method=method,
+                    strip_any_method=kind in {"endpoint", "parameter", "service"},
+                )
+            ),
+        )
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "parameter", _parameter_name(self.parameter))
         object.__setattr__(self, "location", location if location in _LOCATIONS else "unknown")

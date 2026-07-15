@@ -189,6 +189,19 @@ def test_endpoint_key_uses_explicit_method_as_authority() -> None:
     assert "POST GET" not in lead.verify_action
 
 
+@pytest.mark.parametrize("kind", ["endpoint", "parameter", "service"])
+def test_structured_url_values_strip_mismatched_method_prefix(kind: str) -> None:
+    candidate = _candidate(
+        kind=kind,
+        method="GET",
+        value="POST https://host/path?token=STRUCTUREDSECRET",
+        endpoint_key="GET https://host/path",
+    )
+
+    assert candidate.value == "https://host/path?token="
+    assert "STRUCTUREDSECRET" not in repr(candidate)
+
+
 @pytest.mark.parametrize("value", ["OpenSSH 8.2", "Apache httpd 2.4", "Potential SSRF hypothesis"])
 def test_non_http_leading_tokens_are_not_treated_as_methods(value: str) -> None:
     candidate = _candidate(kind="fingerprint", value=value, endpoint_key=value)
