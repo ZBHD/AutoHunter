@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
+
+from app.agents.src_leads import SrcCandidate
 
 
 SRC_TOOL_NAMES = frozenset({
@@ -29,6 +32,436 @@ _DEFAULT_WEB_PORTS = (80, 443, 8000, 8080, 8081, 8443, 8888, 9000, 9443)
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.:*,-]{1,300}$")
 _SAFE_PARAM_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _VALID_SEVERITIES = {"info", "low", "medium", "high", "critical", "unknown"}
+
+_MAX_PARSE_BYTES = 64 * 1024 * 1024
+_MAX_PARSE_LINES = 50_000
+_SUMMARY_WIDTH = 3
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Boundaries and workflow metadata for one external SRC CLI."""
+
+    name: str
+    stage: str
+    roles: tuple[str, ...]
+    routes: tuple[str, ...]
+    enterprise_allowed: bool
+    requires: tuple[str, ...]
+    produces: tuple[str, ...]
+    max_rate: int
+    timeout: int
+    summary_kind: str
+
+
+SRC_TOOL_CATALOG: dict[str, ToolSpec] = {
+    "probe_http": ToolSpec(
+        "probe_http", "recon", ("worker",), (), True,
+        ("url",), ("fingerprint", "http_baseline"), 50, 90, "fingerprint",
+    ),
+    "fingerprint_waf": ToolSpec(
+        "fingerprint_waf", "recon", ("worker",), (), True,
+        ("url",), ("waf_fingerprint",), 1, 90, "fingerprint",
+    ),
+    "scan_web_ports": ToolSpec(
+        "scan_web_ports", "recon", ("worker",), (), True,
+        ("host",), ("service",), 1, 150, "service",
+    ),
+    "crawl_endpoints": ToolSpec(
+        "crawl_endpoints", "locate", ("worker",), (), True,
+        ("url",), ("endpoint", "parameter", "js_asset"), 50, 180, "endpoint",
+    ),
+    "discover_content": ToolSpec(
+        "discover_content", "locate", ("worker",), (), True,
+        ("url", "wordlist"), ("endpoint", "path_candidate"), 50, 210, "endpoint",
+    ),
+    "discover_parameters": ToolSpec(
+        "discover_parameters", "locate", ("worker",), (), True,
+        ("url",), ("parameter",), 20, 180, "parameter",
+    ),
+    "scan_nuclei": ToolSpec(
+        "scan_nuclei", "verify", ("worker",), (), False,
+        ("url", "selector"), ("scanner_candidate",), 50, 180, "hypothesis",
+    ),
+    "verify_xss": ToolSpec(
+        "verify_xss", "verify", ("worker",), (), False,
+        ("url", "params"), ("xss_candidate",), 20, 240, "hypothesis",
+    ),
+
+}
+
+
+@dataclass(frozen=True)
+class SrcParseResult:
+    tool: str
+    parse_ok: bool
+    count: int
+    head_candidates: tuple[SrcCandidate, ...]
+    tail_candidates: tuple[SrcCandidate, ...]
+    priority_candidates: tuple[SrcCandidate, ...]
+    omitted: int
+    parse_errors: tuple[str, ...]
+    next_actions: tuple[str, ...]
+    partial: bool
+    remaining_unknown: bool
+    failure_kind: str
+
+
+def _status_code(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if 100 <= number <= 599 else None
+
+
+def _candidate_priority(status: int | None, record: Mapping[str, Any], *, scanner: bool = False) -> int:
+    if scanner:
+        return 8
+    if status in {401, 403}:
+        return 8
+    if status in {500, 502, 503}:
+        return 7
+    try:
+        if int(record.get("content_length") or record.get("length") or 0) > 512:
+            return 8
+    except (TypeError, ValueError, OverflowError):
+        pass
+    raw = str(record.get("url") or record.get("endpoint") or record.get("input") or "").lower()
+    if any(token in raw for token in ("/admin", "/login", "/api", "/internal", "/debug")):
+        return 7
+    return 5
+
+
+def _new_candidate(
+    kind: str,
+    endpoint: Any,
+    value: Any,
+    *,
+    method: Any = "GET",
+    parameter: Any = "",
+    location: Any = "path",
+    status: Any = None,
+    confidence: float = 0.6,
+    priority: int | None = None,
+    reason: str = "",
+    record: Mapping[str, Any] | None = None,
+    scanner: bool = False,
+) -> SrcCandidate | None:
+    item = record or {}
+    code = _status_code(status)
+    selected_priority = priority if priority is not None else _candidate_priority(code, item, scanner=scanner)
+    try:
+        return SrcCandidate(
+            kind=kind,
+            endpoint_key=str(endpoint or value or ""),
+            value=str(value or endpoint or ""),
+            method=str(method or "GET"),
+            parameter=str(parameter or ""),
+            location=str(location or "unknown"),
+            status_code=code,
+            confidence=confidence,
+            priority=selected_priority,
+            reason=reason,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_records(text: str, errors: list[str]) -> list[Mapping[str, Any]]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, Mapping):
+        results = parsed.get("results")
+        if isinstance(results, list):
+            return [item for item in results if isinstance(item, Mapping)]
+        return [parsed]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, Mapping)]
+    records: list[Mapping[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {line_number}: json:{exc.msg}")
+            continue
+        if isinstance(value, Mapping):
+            records.append(value)
+        elif isinstance(value, list):
+            records.extend(item for item in value if isinstance(item, Mapping))
+    return records
+
+
+def _record_url(record: Mapping[str, Any]) -> str:
+    request = record.get("request")
+    if isinstance(request, Mapping):
+        for key in ("endpoint", "url", "input"):
+            if request.get(key):
+                return str(request[key])
+    for key in ("url", "endpoint", "input", "target", "matched-at", "host"):
+        if record.get(key):
+            value = record[key]
+            if isinstance(value, Mapping):
+                for item in value.values():
+                    if item:
+                        return str(item)
+                continue
+            return str(value)
+    return ""
+
+
+def _scope_host(value: str) -> str:
+    try:
+        parsed = urlsplit(str(value or "").replace("FUZZ", "probe"))
+    except ValueError:
+        return ""
+    return str(parsed.hostname or "").rstrip(".").lower()
+
+
+def _candidate_in_scope(candidate: SrcCandidate, scope_target: str) -> bool:
+    expected = _scope_host(scope_target)
+    if not expected:
+        return True
+    for value in (candidate.value, candidate.endpoint_key):
+        candidate_value = re.sub(r"^[A-Za-z]+\s+", "", str(value or ""), count=1)
+        host = _scope_host(candidate_value)
+        if host and host != expected:
+            return False
+    return True
+
+
+def _bounded_text(output: str) -> tuple[str, int, bool, bool]:
+    raw = str(output or "")
+    encoded = raw.encode("utf-8", "replace")
+    byte_partial = len(encoded) > _MAX_PARSE_BYTES
+    if byte_partial:
+        encoded = encoded[:_MAX_PARSE_BYTES]
+        # Do not feed an incomplete JSONL record to the parser.
+        cut = encoded.rfind(b"\n")
+        if cut >= 0:
+            encoded = encoded[:cut]
+    text = encoded.decode("utf-8", "replace")
+    lines = text.splitlines()
+    line_partial = len(lines) > _MAX_PARSE_LINES
+    if line_partial:
+        text = "\n".join(lines[:_MAX_PARSE_LINES])
+    total_lines = raw.count("\n") + (1 if raw and not raw.endswith(("\n", "\r")) else 0)
+    scanned_lines = min(len(lines), _MAX_PARSE_LINES)
+    omitted = max(0, total_lines - scanned_lines)
+    if byte_partial and omitted == 0:
+        omitted = 1
+    partial = byte_partial or line_partial or omitted > 0
+    return text, omitted, partial, partial
+
+
+def _next_actions(tool: str) -> tuple[str, ...]:
+    return {
+        "probe_http": ("保存基线并对高价值端点做最小请求复核",),
+        "crawl_endpoints": ("优先复核带参数、认证和管理端点",),
+        "discover_content": ("排除软 404 后复核高状态码路径",),
+        "discover_parameters": ("使用无害值建立参数响应基线",),
+        "fingerprint_waf": ("据指纹调整请求节奏并保留原始证据",),
+        "scan_web_ports": ("仅对开放 Web 服务做 HTTP 指纹",),
+        "scan_nuclei": ("将命中回到具体 URL 做最小请求验证",),
+        "verify_xss": ("保存反射上下文并用请求证据确认",),
+    }.get(tool, ("检查工具输出并进行人工复核",))
+
+
+def _parse_src_text(tool: str, output: str, *, scope_target: str = "") -> SrcParseResult:
+    name = str(tool or "").strip()
+    text, omitted, partial, remaining_unknown = _bounded_text(output)
+    errors: list[str] = []
+    candidates: list[SrcCandidate] = []
+
+    def add(candidate: SrcCandidate | None) -> None:
+        if candidate is None:
+            return
+        if not _candidate_in_scope(candidate, scope_target):
+            errors.append(f"scope filtered: {candidate.value or candidate.endpoint_key}")
+            return
+        candidates.append(candidate)
+
+    if not text.strip():
+        return SrcParseResult(name, False, 0, (), (), (), omitted, (), _next_actions(name), partial, remaining_unknown, "empty")
+
+    if name in {"probe_http", "crawl_endpoints", "discover_content", "scan_nuclei", "verify_xss"}:
+        records = _json_records(text, errors)
+        if not records and not errors:
+            errors.append("no JSON records")
+        for record in records:
+            url = _record_url(record)
+            if not url:
+                errors.append("record missing url")
+                continue
+            request = record.get("request") if isinstance(record.get("request"), Mapping) else {}
+            method = request.get("method") if isinstance(request, Mapping) else record.get("method", "GET")
+            response = record.get("response") if isinstance(record.get("response"), Mapping) else {}
+            status = record.get("status_code", record.get("status"))
+            if status is None and isinstance(response, Mapping):
+                status = response.get("status_code", response.get("status"))
+            scanner = name in {"scan_nuclei", "verify_xss"}
+            kind = "hypothesis" if scanner else "endpoint"
+            if name == "probe_http":
+                kind = "fingerprint"
+            reason = str(record.get("title") or record.get("template-id") or record.get("type") or name)
+            add(_new_candidate(
+                kind, url, url, method=method, status=status,
+                confidence=0.8 if scanner else 0.7, reason=reason,
+                record=record, scanner=scanner,
+            ))
+    elif name == "fingerprint_waf":
+        records = _json_records(text, errors)
+        if not records and not errors:
+            errors.append("no JSON records")
+        for record in records:
+            url = _record_url(record)
+            firewall = record.get("firewall") or record.get("waf") or record.get("manufacturer") or record.get("name")
+            if not url and not firewall:
+                errors.append("record missing target")
+                continue
+            add(_new_candidate(
+                "fingerprint", url or str(firewall), url or str(firewall),
+                location="unknown", confidence=0.8 if record.get("detected", True) else 0.4,
+                priority=6 if record.get("detected", True) else 3,
+                reason=str(firewall or "waf fingerprint"), record=record,
+            ))
+    elif name == "discover_parameters":
+        current_url = ""
+        current_method = "GET"
+        for line_number, line in enumerate(text.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            match = re.search(r"\b(GET|POST|PUT|PATCH|DELETE|JSON|XML)\s+(https?://\S+)", stripped, re.I)
+            if match:
+                current_method, current_url = match.group(1).upper(), match.group(2).rstrip(")],")
+                add(_new_candidate("endpoint", current_url, current_url, method=current_method, reason="arjun endpoint"))
+                continue
+            found = re.search(
+                r"(?:valid\s+parameters?\s+found|parameters?\s+found|found(?:\s+\d+)?(?:\s+parameters?)?|param(?:eters)?)\s*:?\s*(.+)$",
+                stripped,
+                re.I,
+            )
+            if found:
+                params = re.split(r"[,\s]+", found.group(1).strip())
+                for parameter in params:
+                    parameter = parameter.strip("[](){}\"'")
+                    if not parameter or "=" in parameter:
+                        continue
+                    add(_new_candidate(
+                        "parameter", current_url, parameter, method=current_method,
+                        parameter=parameter, location="query", priority=7,
+                        confidence=0.75, reason="arjun parameter",
+                    ))
+            elif current_url and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,79}", stripped):
+                add(_new_candidate(
+                    "parameter", current_url, stripped, method=current_method,
+                    parameter=stripped, location="query", priority=7,
+                    confidence=0.7, reason=f"arjun line {line_number}",
+                ))
+    elif name == "scan_web_ports":
+        service_re = re.compile(r"^(\d+)/(tcp|udp)\s+open\s*(.*)$", re.I)
+        for line in text.splitlines():
+            match = service_re.match(line.strip())
+            if not match:
+                continue
+            port, protocol, service = match.groups()
+            service = service.strip() or "unknown"
+            add(_new_candidate(
+                "service", f"{port}/{protocol.lower()}", service,
+                location="unknown", priority=6, confidence=0.8,
+                reason=f"nmap {port}/{protocol.lower()}",
+            ))
+        if not candidates and not errors:
+            errors.append("no open service lines")
+    else:
+        errors.append(f"unsupported SRC parser: {name}")
+
+    # Keep summaries stable and bounded while count remains the number admitted.
+    head = tuple(candidates[:_SUMMARY_WIDTH])
+    tail = tuple(candidates[-_SUMMARY_WIDTH:]) if candidates else ()
+    priority = tuple(sorted(enumerate(candidates), key=lambda pair: (-pair[1].priority, pair[0]))[:_SUMMARY_WIDTH])
+    priority_candidates = tuple(candidate for _index, candidate in priority)
+    parse_ok = bool(candidates)
+    failure_kind = "" if parse_ok else ("empty" if not text.strip() else "parse_error")
+    return SrcParseResult(
+        name, parse_ok, len(candidates), head, tail, priority_candidates,
+        omitted, tuple(errors[:64]), _next_actions(name), partial, remaining_unknown,
+        failure_kind,
+    )
+
+
+def parse_src_output(tool: str, output: str) -> SrcParseResult:
+    """Parse bounded CLI output into normalized, scope-neutral candidates."""
+
+    return _parse_src_text(tool, output)
+
+
+def _capture_output(capture: Mapping[str, Any]) -> tuple[str, str]:
+    channels = capture.get("channels")
+    descriptors: Iterable[Any]
+    if isinstance(channels, Mapping):
+        descriptors = channels.values()
+    elif isinstance(channels, (list, tuple)):
+        descriptors = channels
+    else:
+        descriptors = ()
+    for descriptor in descriptors:
+        if not isinstance(descriptor, Mapping) or str(descriptor.get("name") or "") not in {"output", "stdout"}:
+            continue
+        path_text = str(descriptor.get("path") or "")
+        if not path_text:
+            continue
+        directory_text = str(capture.get("directory") or "").strip()
+        if directory_text:
+            try:
+                channel_path = Path(path_text).resolve(strict=False)
+                owned_directory = Path(directory_text).resolve(strict=False)
+            except OSError as exc:
+                return "", f"capture output ownership failed: {exc}"
+            if channel_path.parent != owned_directory:
+                return "", "capture output channel is outside owned directory"
+        try:
+            with Path(path_text).open("rb") as stream:
+                data = stream.read(_MAX_PARSE_BYTES + 1)
+            return data.decode("utf-8", "replace"), ""
+        except (OSError, ValueError) as exc:
+            return "", f"capture output read failed: {exc}"
+    value = capture.get("output")
+    if isinstance(value, str):
+        return value, ""
+    return "", "capture output channel not found"
+
+
+def parse_src_capture(tool: str, capture: Mapping[str, Any], scope_target: str) -> SrcParseResult:
+    """Read the private output channel and admit only same-scope candidates."""
+
+    if not isinstance(capture, Mapping):
+        return SrcParseResult(str(tool or ""), False, 0, (), (), (), 0, ("invalid capture",), _next_actions(str(tool or "")), False, False, "parse_error")
+    output, capture_error = _capture_output(capture)
+    result = _parse_src_text(tool, output, scope_target=scope_target)
+    capture_partial = str(capture.get("status") or "").lower() in {"partial", "writing", "failed", "legacy_partial"}
+    if capture_partial and not result.partial:
+        result = SrcParseResult(
+            result.tool, result.parse_ok, result.count, result.head_candidates, result.tail_candidates,
+            result.priority_candidates, result.omitted, result.parse_errors, result.next_actions,
+            True, True, result.failure_kind,
+        )
+    if capture_error:
+        return SrcParseResult(
+            result.tool, False, result.count, result.head_candidates, result.tail_candidates,
+            result.priority_candidates, result.omitted, tuple((*result.parse_errors, capture_error))[:64],
+            result.next_actions, result.partial, result.remaining_unknown,
+            "parse_error" if result.count == 0 else result.failure_kind,
+        )
+    return result
 
 
 class SrcToolError(ValueError):
@@ -156,9 +589,9 @@ def _probe_http(args: Mapping[str, Any], scope: str) -> SrcToolPlan:
         "-timeout", str(request_timeout), "-no-color", "-disable-update-check",
     ]
     display = list(argv)
-    if bool(args.get("follow_redirects", True)):
-        argv.append("-follow-redirects")
-        display.append("-follow-redirects")
+    # Keep accepting the legacy flag in callers, but leave redirects disabled.
+    # Redirect handling belongs to the bounded HTTP executor so a Location header
+    # cannot silently move the probe to another host.
     _header_args(argv, display, _headers(args.get("headers")))
     return _plan(
         "probe_http", argv, display, timeout=90,
@@ -409,7 +842,13 @@ def build_src_plan(
 __all__ = [
     "ENTERPRISE_BLOCKED_SRC_TOOLS",
     "SRC_TOOL_NAMES",
+    "SRC_TOOL_CATALOG",
     "SrcToolError",
     "SrcToolPlan",
+    "SrcParseResult",
+    "SrcCandidate",
+    "ToolSpec",
     "build_src_plan",
+    "parse_src_capture",
+    "parse_src_output",
 ]

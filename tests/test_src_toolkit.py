@@ -11,7 +11,16 @@ from app.agents.history import bounded_tool_content
 from app.agents.worker import Worker
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import ESCALATE_TOOL_SCHEMAS, TOOL_SCHEMAS
-from app.tools.src_toolkit import SRC_TOOL_NAMES, SrcToolError, build_src_plan
+from app.tools.src_toolkit import (
+    SRC_TOOL_NAMES,
+    SRC_TOOL_CATALOG,
+    SrcParseResult,
+    SrcToolError,
+    ToolSpec,
+    build_src_plan,
+    parse_src_capture,
+    parse_src_output,
+)
 
 
 def _tool_names(schemas: list[dict]) -> set[str]:
@@ -41,10 +50,118 @@ def test_http_probe_builds_bounded_same_host_argv() -> None:
     assert "https://app.example.test/login?next=/home;marker=1" in plan.argv
     assert plan.argv[plan.argv.index("-rate-limit") + 1] == "50"
     assert plan.argv[plan.argv.index("-timeout") + 1] == "30"
-    assert "-follow-redirects" in plan.argv
+    assert "-follow-redirects" not in plan.argv
     assert "Authorization: Bearer top-secret" in plan.argv
     assert "Bearer top-secret" not in plan.display_argv
     assert plan.timeout <= 180
+
+
+def test_src_catalog_covers_tools_and_scanners_are_worker_only() -> None:
+    assert SRC_TOOL_NAMES <= set(SRC_TOOL_CATALOG)
+    assert all(isinstance(spec, ToolSpec) for spec in SRC_TOOL_CATALOG.values())
+    for name in ("scan_nuclei", "verify_xss"):
+        spec = SRC_TOOL_CATALOG[name]
+        assert spec.roles == ("worker",)
+        assert spec.enterprise_allowed is False
+
+
+def test_src_parsers_normalize_all_supported_formats() -> None:
+    httpx = parse_src_output(
+        "probe_http",
+        json.dumps({"url": "https://a.test/login?token=secret", "status_code": 200, "title": "Login"}),
+    )
+    assert httpx.parse_ok is True
+    assert httpx.count == 1
+    assert "secret" not in httpx.head_candidates[0].value
+    assert httpx.head_candidates[0].kind == "fingerprint"
+
+    katana = parse_src_output(
+        "crawl_endpoints",
+        "\n".join(
+            [
+                json.dumps({"request": {"endpoint": "https://a.test/api/users?id=1", "method": "GET"}}),
+                json.dumps({"url": "https://a.test/assets/app.js", "status_code": 200}),
+            ]
+        ),
+    )
+    assert katana.count == 2
+    assert all("id=1" not in candidate.value for candidate in katana.head_candidates)
+
+    ffuf = parse_src_output(
+        "discover_content",
+        json.dumps({"results": [{"url": "https://a.test/admin?x=1", "status": 403}]}),
+    )
+    assert ffuf.count == 1
+    assert ffuf.head_candidates[0].status_code == 403
+
+    arjun = parse_src_output("discover_parameters", "GET https://a.test/api?id\nFound: page, sort")
+    assert arjun.count >= 2
+    assert any(candidate.kind == "parameter" for candidate in arjun.head_candidates)
+
+    waf = parse_src_output(
+        "fingerprint_waf",
+        json.dumps({"url": "https://a.test", "firewall": "Example WAF", "detected": True}),
+    )
+    assert waf.count == 1
+    assert waf.head_candidates[0].kind == "fingerprint"
+
+    nmap = parse_src_output(
+        "scan_web_ports",
+        "80/tcp open http Apache httpd\n443/tcp open ssl/http nginx",
+    )
+    assert nmap.count == 2
+    assert all(candidate.kind == "service" for candidate in nmap.head_candidates)
+
+
+def test_src_parser_reports_empty_and_malformed_output() -> None:
+    empty = parse_src_output("crawl_endpoints", "")
+    assert isinstance(empty, SrcParseResult)
+    assert empty.parse_ok is False
+    assert empty.failure_kind == "empty"
+
+    malformed = parse_src_output("crawl_endpoints", "{not json}")
+    assert malformed.parse_ok is False
+    assert malformed.failure_kind == "parse_error"
+    assert malformed.parse_errors
+
+
+def test_src_parser_preserves_head_tail_priority_and_scan_limit() -> None:
+    output = "\n".join(
+        json.dumps(
+            {
+                "url": f"https://a.test/api/{index}",
+                "status_code": 200,
+                "content_length": 1000 if index == 49999 else 10,
+            }
+        )
+        for index in range(50010)
+    )
+    parsed = parse_src_output("crawl_endpoints", output)
+    assert parsed.count == 50000
+    assert parsed.head_candidates[0].value.endswith("/0")
+    assert parsed.tail_candidates[-1].value.endswith("/49999")
+    assert parsed.priority_candidates
+    assert parsed.remaining_unknown is True
+    assert parsed.omitted >= 10
+    assert parsed.partial is True
+
+
+def test_src_capture_reads_private_output_and_filters_scope(tmp_path: Path) -> None:
+    output_path = tmp_path / "stdout"
+    output_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"url": "https://a.test/in-scope?secret=x", "status_code": 200}),
+                json.dumps({"url": "https://other.test/out-of-scope", "status_code": 200}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    capture = {"channels": [{"name": "output", "path": str(output_path)}]}
+    parsed = parse_src_capture("crawl_endpoints", capture, "https://a.test")
+    assert parsed.count == 1
+    assert parsed.head_candidates[0].value == "https://a.test/in-scope?secret="
+    assert any("scope" in error for error in parsed.parse_errors)
 
 
 def test_src_plan_rejects_cross_host_target() -> None:
