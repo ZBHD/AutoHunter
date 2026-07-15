@@ -14,6 +14,7 @@ from app.api import settings as settings_api
 from app.api.dto import FofaKeyDTO
 from app.db.models import Base, SystemSettings
 from app.db.session import get_session
+from app.fofa.router import FofaKeyStateChange, fofa_credential_fingerprint
 
 
 @pytest.fixture
@@ -627,3 +628,158 @@ def test_one_click_health_redacts_case_varied_encoded_key_variants(
     assert response.json()["fofa_results"][0]["error"] == (
         "failed <masked> <masked> <masked>"
     )
+
+
+def test_persist_fofa_key_state_updates_runtime_and_valid_active_only(
+    fofa_key_api,
+) -> None:
+    _client, session_maker = fofa_key_api
+    secret = "state-secret-a"
+    base_url = "https://a.example/api.php"
+    cooldown = datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[
+                _key("A", secret, base_url=base_url),
+                _key("B", "state-secret-b"),
+            ],
+            fofa={"active_key_name": "A"},
+        )
+    )
+    change = FofaKeyStateChange(
+        name="A",
+        base_url=base_url,
+        runtime_state="rate_limited",
+        failure_kind="rate_limit",
+        failure_count=3,
+        cooldown_until=cooldown,
+        active_key_name="B",
+        credential_fingerprint=fofa_credential_fingerprint(
+            "A", secret, base_url
+        ),
+        revision=4,
+    )
+
+    asyncio.run(settings_service._persist_fofa_key_state(change))
+
+    stored = asyncio.run(_raw_keys(session_maker))
+    assert stored[0] == {
+        "name": "A",
+        "key": secret,
+        "base_url": base_url,
+        "enabled": True,
+        "runtime_state": "rate_limited",
+        "failure_kind": "rate_limit",
+        "failure_count": 3,
+        "cooldown_until": "2026-07-16T08:00:00Z",
+    }
+    assert stored[1] == _key("B", "state-secret-b")
+    assert asyncio.run(_raw_fofa(session_maker))["active_key_name"] == "B"
+    assert secret not in repr(settings_service.public_settings_view())
+
+    invalid_active = FofaKeyStateChange(
+        **{**change.__dict__, "active_key_name": "Missing", "revision": 5}
+    )
+    asyncio.run(settings_service._persist_fofa_key_state(invalid_active))
+    assert asyncio.run(_raw_fofa(session_maker))["active_key_name"] == "B"
+
+
+def test_persist_fofa_key_state_ignores_stale_credential_fingerprint(
+    fofa_key_api,
+) -> None:
+    _client, session_maker = fofa_key_api
+    old_secret = "old-state-secret"
+    replacement = "replacement-state-secret"
+    base_url = "https://fofa.info"
+    asyncio.run(
+        _seed(
+            session_maker,
+            keys=[_key("A", replacement)],
+            fofa={"active_key_name": "A"},
+        )
+    )
+    change = FofaKeyStateChange(
+        name="A",
+        base_url=base_url,
+        runtime_state="auth_invalid",
+        failure_kind="auth",
+        failure_count=1,
+        cooldown_until=None,
+        active_key_name="A",
+        credential_fingerprint=fofa_credential_fingerprint(
+            "A", old_secret, base_url
+        ),
+    )
+
+    asyncio.run(settings_service._persist_fofa_key_state(change))
+
+    assert asyncio.run(_raw_keys(session_maker)) == [_key("A", replacement)]
+    assert asyncio.run(_raw_fofa(session_maker))["active_key_name"] == "A"
+
+
+def test_fofa_state_callback_schedules_persistence_on_captured_loop(
+    monkeypatch,
+) -> None:
+    change = FofaKeyStateChange(
+        name="A",
+        base_url="https://fofa.info",
+        runtime_state="auth_invalid",
+        failure_kind="auth",
+        failure_count=1,
+        cooldown_until=None,
+        active_key_name="B",
+        credential_fingerprint="fingerprint",
+    )
+    persisted: list[FofaKeyStateChange] = []
+
+    async def scenario() -> None:
+        completed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        async def fake_persist(value: FofaKeyStateChange) -> None:
+            assert asyncio.get_running_loop() is loop
+            persisted.append(value)
+            completed.set()
+
+        monkeypatch.setattr(
+            settings_service, "_persist_fofa_key_state", fake_persist
+        )
+        callback = settings_service._fofa_state_callback(loop)
+        await asyncio.to_thread(callback, change)
+        await asyncio.wait_for(completed.wait(), timeout=1)
+
+    asyncio.run(scenario())
+    assert persisted == [change]
+
+
+def test_fofa_state_callback_ignores_closed_loop_without_leaking(
+    monkeypatch, caplog
+) -> None:
+    secret = "callback-secret-VERYSECRET"
+    called = False
+
+    async def fake_persist(_change: FofaKeyStateChange) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(settings_service, "_persist_fofa_key_state", fake_persist)
+    loop = asyncio.new_event_loop()
+    loop.close()
+    callback = settings_service._fofa_state_callback(loop)
+    change = FofaKeyStateChange(
+        name="A",
+        base_url=f"https://fofa.info/{secret}",
+        runtime_state="ready",
+        failure_kind="",
+        failure_count=0,
+        cooldown_until=None,
+        active_key_name="A",
+        credential_fingerprint="fingerprint",
+    )
+
+    with caplog.at_level("WARNING"):
+        callback(change)
+
+    assert called is False
+    assert secret not in caplog.text

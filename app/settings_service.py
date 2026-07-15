@@ -32,6 +32,7 @@ from app.fofa.client import (
     extract_fofa_response_failure,
     redact_fofa_secrets,
 )
+from app.fofa.router import FofaKeyStateChange, fofa_credential_fingerprint
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
 from app.llm.router import LLMRouter
 
@@ -1717,6 +1718,111 @@ async def _persist_global_provider_disabled(
         if secret:
             redacted_reason = redacted_reason.replace(secret, "<masked>")
     logger.warning("LLM provider '%s' 已持久禁用: %s", name, redacted_reason)
+
+
+async def _persist_fofa_key_state(change: FofaKeyStateChange) -> None:
+    """Persist a Router state transition only while its credential is current."""
+    async with SessionLocal() as session:
+        async with _provider_write_transaction(session) as row:
+            try:
+                items = _stored_fofa_keys(row)
+            except FofaKeyValidationError:
+                await session.rollback()
+                return
+            wanted = _fofa_name_key(change.name)
+            index = next(
+                (
+                    i
+                    for i, item in enumerate(items)
+                    if _fofa_name_key(item.name) == wanted
+                ),
+                None,
+            )
+            if index is None or not change.credential_fingerprint:
+                await session.rollback()
+                return
+            current = items[index]
+            current_fingerprint = fofa_credential_fingerprint(
+                current.name, current.key, current.base_url
+            )
+            if not hmac.compare_digest(
+                current_fingerprint, change.credential_fingerprint
+            ):
+                await session.rollback()
+                return
+
+            payload = _fofa_payload(current)
+            payload.update(
+                runtime_state=change.runtime_state,
+                failure_kind=change.failure_kind,
+                failure_count=change.failure_count,
+                cooldown_until=change.cooldown_until,
+            )
+            try:
+                updated = _validated_fofa_key(payload)
+            except FofaKeyValidationError:
+                await session.rollback()
+                return
+            changed = _fofa_payload(updated) != _fofa_payload(current)
+            items[index] = updated
+
+            fofa = dict(row.fofa or {})
+            active_name = str(change.active_key_name or "").strip()
+            active = next(
+                (
+                    item.name
+                    for item in items
+                    if item.enabled
+                    and _fofa_name_key(item.name) == _fofa_name_key(active_name)
+                ),
+                "",
+            )
+            if active and fofa.get("active_key_name") != active:
+                fofa["active_key_name"] = active
+                row.fofa = fofa
+                changed = True
+
+            if not changed:
+                await session.rollback()
+                return
+            row.fofa_keys = [_fofa_payload(item) for item in items]
+            await session.commit()
+            await session.refresh(row)
+            _publish_settings_cache(row)
+
+
+def _fofa_state_callback(loop: asyncio.AbstractEventLoop):
+    def callback(change: FofaKeyStateChange) -> None:
+        if loop.is_closed():
+            logger.warning(
+                "事件循环已关闭，FOFA Key 状态未持久化: name=%s", change.name
+            )
+            return
+        coroutine = _persist_fofa_key_state(change)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except Exception as exc:
+            coroutine.close()
+            logger.error(
+                "调度 FOFA Key 状态持久化失败: name=%s error_type=%s",
+                change.name,
+                type(exc).__name__,
+            )
+            return
+
+        def consume_result(done) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                logger.error(
+                    "FOFA Key 状态持久化失败: name=%s error_type=%s",
+                    change.name,
+                    type(exc).__name__,
+                )
+
+        future.add_done_callback(consume_result)
+
+    return callback
 
 
 def _provider_disable_callback(
