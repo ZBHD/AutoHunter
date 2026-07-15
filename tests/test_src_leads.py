@@ -156,12 +156,20 @@ def test_username_only_authority_is_sanitized(value: str) -> None:
     assert "SECRET" not in repr(candidate)
 
 
-@pytest.mark.parametrize("method", ["PROPFIND", "LOCK", "CUSTOMVERB"])
+@pytest.mark.parametrize("method", ["GET", "PROPFIND", "LOCK", "CUSTOMVERB"])
 def test_url_shaped_targets_accept_extended_method_tokens(method: str) -> None:
-    candidate = _candidate(value=f"{method} https://host/path?token=METHODSECRET")
+    candidate = _candidate(method=method, value=f"{method} https://host/path?token=METHODSECRET")
 
     assert candidate.value == "https://host/path?token="
     assert "METHODSECRET" not in repr(candidate)
+
+
+@pytest.mark.parametrize("value", ["Apache /server", "Foo http://bar/path", "POST https://host/path"])
+def test_mismatched_or_descriptive_method_tokens_are_preserved(value: str) -> None:
+    candidate = _candidate(method="GET", kind="fingerprint", value=value, endpoint_key=value)
+
+    assert candidate.value.startswith(value.split("?")[0])
+    assert candidate.value.startswith(value.split(" ", 1)[0])
 
 
 @pytest.mark.parametrize("value", ["OpenSSH 8.2", "Apache httpd 2.4", "Potential SSRF hypothesis"])

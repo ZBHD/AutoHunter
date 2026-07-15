@@ -144,13 +144,15 @@ def _fallback_public(raw: str) -> str:
     return _text(clean)
 
 
-def _public_value(value: object) -> str:
+def _public_value(value: object, *, expected_method: str | None = None) -> str:
     """Bound a URL/path and remove userinfo, fragments, and query values."""
 
     raw = _raw_text(value)
     if not raw:
         return ""
-    _, raw = _split_http_method_target(raw)
+    method_token, target = _split_http_method_target(raw)
+    if method_token and (expected_method is None or method_token == expected_method.upper()):
+        raw = target
     raw = _normalize_opaque_scheme(raw)
     try:
         parsed = urlsplit(raw)
@@ -200,9 +202,10 @@ def _method(value: object) -> str:
 
 def _endpoint_key(value: object, method: str) -> str:
     raw = _raw_text(value)
-    _, target = _split_http_method_target(raw)
-    normalized = _public_value(target)
-    return _text(f"{method} {normalized}" if target != raw else normalized)
+    method_token, target = _split_http_method_target(raw)
+    if method_token and method_token == method.upper():
+        return _text(f"{method} {_public_value(target)}")
+    return _text(_public_value(raw, expected_method=method))
 
 
 def _confidence(value: object) -> float:
@@ -275,7 +278,7 @@ class SrcCandidate:
 
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "endpoint_key", _endpoint_key(self.endpoint_key, method))
-        object.__setattr__(self, "value", _text(_public_value(self.value)))
+        object.__setattr__(self, "value", _text(_public_value(self.value, expected_method=method)))
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "parameter", _parameter_name(self.parameter))
         object.__setattr__(self, "location", location if location in _LOCATIONS else "unknown")
