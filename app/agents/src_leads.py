@@ -14,7 +14,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 MAX_PUBLIC_TEXT = 160
 MAX_REFERENCES = 32
 MAX_VERIFY_ATTEMPTS = 2
-_MAX_INPUT_TEXT = 1_048_576
 
 _KINDS = {"endpoint", "parameter", "fingerprint", "service", "hypothesis"}
 _LOCATIONS = {"path", "query", "body", "header", "cookie", "fragment", "unknown"}
@@ -26,8 +25,7 @@ _METHOD_PREFIX = re.compile(r"^(?P<method>[A-Za-z]+)\s+(?P<target>.+)$")
 def _raw_text(value: object) -> str:
     """Normalize control/whitespace without truncating before parsing."""
 
-    text = " ".join(str(value or "").replace("\x00", " ").split())
-    return text[:_MAX_INPUT_TEXT]
+    return " ".join(str(value or "").replace("\x00", " ").split())
 
 
 def _text(value: object, limit: int = MAX_PUBLIC_TEXT) -> str:
@@ -51,6 +49,38 @@ def _query_names(query: str) -> str:
     return urlencode(names, doseq=True)
 
 
+def _strip_bare_userinfo(path: str) -> str:
+    """Drop ``user:password@`` when a URL lacks an explicit authority marker."""
+
+    if "@" not in path:
+        return path
+    prefix, suffix = path.rsplit("@", 1)
+    if ":" in prefix and "/" not in prefix:
+        return suffix
+    return path
+
+
+def _normalize_opaque_scheme(raw: str) -> str:
+    """Turn malformed ``scheme:authority`` spellings into parseable URLs."""
+
+    match = re.match(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*:)(?P<rest>.*)$", raw)
+    if not match:
+        return raw
+    scheme = match.group("scheme").lower()
+    rest = match.group("rest")
+    if rest.startswith("//"):
+        # Collapse excess slashes so ``https:////user:pass@host`` still gets
+        # parsed as an authority and has its userinfo removed.
+        return f"{scheme}//{rest.lstrip('/')}"
+
+    authority, separator, tail = rest.partition("/")
+    if "@" in authority:
+        userinfo, host = authority.rsplit("@", 1)
+        if ":" in userinfo:
+            return f"{scheme}//{host}" + (f"/{tail}" if separator else "")
+    return raw
+
+
 def _fallback_public(raw: str) -> str:
     """Best-effort sanitization for malformed URL authorities."""
 
@@ -71,7 +101,7 @@ def _fallback_public(raw: str) -> str:
         prefix = f"{scheme}//" if scheme else "//"
         clean = f"{prefix}{host.lower()}{authority_match.group('path') or ''}"
     else:
-        clean = path
+        clean = _strip_bare_userinfo(path)
     if separator:
         clean += f"?{_query_names(query)}"
     return _text(clean)
@@ -84,40 +114,40 @@ def _public_value(value: object) -> str:
     if not raw:
         return ""
     method_match = _METHOD_PREFIX.match(raw)
-    method_prefix = ""
     if method_match:
-        method_prefix = f"{_method(method_match.group('method'))} "
         raw = method_match.group("target")
+    raw = _normalize_opaque_scheme(raw)
     try:
         parsed = urlsplit(raw)
     except ValueError:
         sanitized = _fallback_public(raw)
-        return _text(method_prefix + sanitized)
+        return _text(sanitized)
     if not parsed.netloc:
         if "?" not in raw:
-            return _text(method_prefix + raw.split("#", 1)[0])
+            path = _strip_bare_userinfo(raw.split("#", 1)[0])
+            return _text(path)
         path, query = raw.split("?", 1)
-        sanitized = f"{path.split('#', 1)[0]}?{_query_names(query)}"
-        return _text(method_prefix + sanitized)
+        sanitized = f"{_strip_bare_userinfo(path.split('#', 1)[0])}?{_query_names(query)}"
+        return _text(sanitized)
 
     scheme = parsed.scheme.lower()
     try:
         host = (parsed.hostname or "").lower()
     except ValueError:
-        return _text(method_prefix + _fallback_public(raw))
+        return _text(_fallback_public(raw))
     try:
         port = parsed.port
     except ValueError:
         # A malformed port is discarded rather than exposing authority text.
         port = None
     if not host:
-        return _text(method_prefix + _fallback_public(raw))
+        return _text(_fallback_public(raw))
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         host = f"{host}:{port}"
     sanitized = urlunsplit((scheme, host, parsed.path, _query_names(parsed.query), ""))
-    return _text(method_prefix + sanitized)
+    return _text(sanitized)
 
 
 def _parameter_name(value: object) -> str:

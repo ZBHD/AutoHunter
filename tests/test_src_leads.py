@@ -105,9 +105,41 @@ def test_method_prefixed_value_is_sanitized_before_bounding() -> None:
         value=f"GET https://user:pass@a.test/path?token={secret}",
     )
 
-    assert candidate.value == "GET https://a.test/path?token="
+    assert candidate.value == "https://a.test/path?token="
     assert secret not in repr(candidate)
     assert "user:pass" not in repr(candidate)
+
+
+def test_bare_userinfo_is_removed_from_relative_url_values() -> None:
+    candidate = _candidate(value="user:pass@a.test/path?token=BARESECRET")
+
+    assert candidate.value == "a.test/path?token="
+    assert "user:pass" not in repr(candidate)
+    assert "BARESECRET" not in repr(candidate)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https:user:pass@host/path?token=OPAQUESECRET",
+        "https:////user:pass@host/path?token=SLASHSECRET",
+    ],
+)
+def test_opaque_scheme_authority_is_sanitized(value: str) -> None:
+    candidate = _candidate(value=value)
+
+    assert candidate.value == "https://host/path?token="
+    assert "user:pass" not in repr(candidate)
+    assert "SECRET" not in repr(candidate)
+
+
+def test_userinfo_longer_than_input_budget_is_sanitized_before_bounding() -> None:
+    userinfo = "u" * (1_048_576 + 128)
+    candidate = _candidate(value=f"https://{userinfo}:pass@host/path?token=HUGESECRET")
+
+    assert candidate.value == "https://host/path?token="
+    assert "HUGESECRET" not in repr(candidate)
+    assert "pass@" not in repr(candidate)
 
 
 def test_parameter_normalization_drops_assignment_values() -> None:

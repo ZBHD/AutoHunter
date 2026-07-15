@@ -144,5 +144,7 @@ def test_schema_examples_document_canonical_backdoor_type() -> None:
 
     assert "backdoor_compromised" in finding_description
     assert "backdoor_compromised" in duplicate_schema["description"]
+    assert "duplicate=true" in duplicate_schema["description"]
+    assert "其它 endpoint/类型/证据链继续挖" in duplicate_schema["description"]
     assert "backdoor_compromised" in submit_schema["description"]
     assert "backdoor_compromised" in escalation_schema["description"]

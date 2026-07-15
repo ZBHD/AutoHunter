@@ -106,7 +106,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "check_duplicate_finding",
-            "description": "提交漏洞前查重；规范类型包含 backdoor_compromised。用类型/标题/URL 对比全局同系统历史漏洞，只拦同系统同洞。",
+            "description": "查重(backdoor_compromised)：duplicate=true 不提交；同系统其它 endpoint/类型/证据链继续挖。",
             "parameters": {
                 "type": "object",
                 "properties": {

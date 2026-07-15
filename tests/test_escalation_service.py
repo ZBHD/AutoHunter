@@ -857,6 +857,143 @@ def test_backdoor_escalation_rejects_reused_evidence_even_with_higher_severity()
     ) is False
 
 
+def test_backdoor_escalation_rejects_semantically_reused_page_evidence() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": (
+            "GET /landing?cache_bust=source HTTP/1.1\r\n"
+            "Host: example.test\r\n"
+            "Accept: text/html\r\n\r\n"
+        ),
+        "raw_response": (
+            "HTTP/1.1 200 OK\r\n"
+            "Date: Wed, 15 Jul 2026 00:00:00 GMT\r\n"
+            "Age: 0\r\n"
+            "Content-Type: text/html\r\n\r\n"
+            "Casino page"
+        ),
+    }
+
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": (
+                "GET /landing?_=different-random-value HTTP/1.1\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Accept: text/html\r\n"
+                "Host: example.test\r\n\r\n"
+            ),
+            "raw_response": (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html\r\n"
+                "Age: 7\r\n"
+                "Date: Wed, 15 Jul 2026 00:01:00 GMT\r\n\r\n"
+                "Casino page"
+            ),
+        },
+        source_finding=source,
+    ) is False
+
+
+def test_backdoor_escalation_accepts_new_response_proof_on_the_same_path() -> None:
+    from app import orchestrator
+
+    source = _backdoor_source()
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": (
+                "GET /?probe=whoami HTTP/1.1\r\n"
+                "Host: example.test\r\n"
+                "Cache-Control: no-cache\r\n\r\n"
+            ),
+            "raw_response": "HTTP/1.1 200 OK\r\n\r\nprobe-user",
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_preserves_meaningful_query_evidence() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET /shell.php?cmd=whoami HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\n\r\ncommand accepted",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": "GET /shell.php?cmd=id HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            "raw_response": source["raw_response"],
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_preserves_new_security_response_headers() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET /admin HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\nDashboard",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "unauthorized_access",
+            "title": "Admin session issued without authentication",
+            "raw_request": source["raw_request"],
+            "raw_response": (
+                "HTTP/1.1 200 OK\r\n"
+                "Set-Cookie: admin_session=TOKEN; HttpOnly\r\n"
+                "Content-Type: text/html\r\n\r\n"
+                "Dashboard"
+            ),
+        },
+        source_finding=source,
+    ) is True
+
+
+def test_backdoor_escalation_handles_malformed_request_targets() -> None:
+    from app import orchestrator
+
+    source = {
+        "vuln_type": "backdoor_compromised",
+        "raw_request": "GET http://[invalid/landing?cache_bust=one HTTP/1.1\r\n\r\n",
+        "raw_response": "HTTP/1.1 200 OK\r\nDate: first\r\n\r\nCasino page",
+    }
+    assert orchestrator._escalation_is_significant(
+        "高危",
+        {
+            "escalated": True,
+            "severity": "严重",
+            "vuln_type": "rce",
+            "title": "Confirmed RCE root cause",
+            "raw_request": "GET http://[invalid/landing?_=two HTTP/1.1\r\nCache-Control: no-cache\r\n\r\n",
+            "raw_response": "HTTP/1.1 200 OK\r\nDate: second\r\nAge: 1\r\n\r\nCasino page",
+        },
+        source_finding=source,
+    ) is False
+
+
 def test_backdoor_escalation_accepts_new_same_type_evidence_only_when_impact_grows() -> None:
     from app import orchestrator
 
