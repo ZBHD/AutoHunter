@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.config import LLMProviderConfig
+from app.config import FofaKeyConfig, LLMProviderConfig
 from app.db.models import Base, SystemSettings, Task
 from app import settings_service
 
@@ -288,6 +288,18 @@ def test_malformed_fofa_pool_log_does_not_expose_name_or_key(caplog) -> None:
         assert settings_service.resolve_fofa_keys() == []
 
     assert secret not in caplog.text
+    assert "name=<invalid>" in caplog.text
+
+
+def test_model_copy_update_is_revalidated_at_fofa_pool_boundary(caplog) -> None:
+    item = FofaKeyConfig(name="Primary", key="secret-a")
+    invalid = item.model_copy(update={"key": item.name})
+    set_cache(fofa_keys=[invalid])
+
+    with caplog.at_level(logging.ERROR, logger="autohunter.settings"):
+        assert settings_service.resolve_fofa_keys() == []
+
+    assert "Primary" not in caplog.text
     assert "name=<invalid>" in caplog.text
 
 

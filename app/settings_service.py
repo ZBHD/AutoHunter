@@ -298,7 +298,7 @@ def resolve_llm_config(task: Task | None = None) -> LLMConfig:
 
 def _fofa_key_from_value(value: Any) -> FofaKeyConfig:
     if isinstance(value, FofaKeyConfig):
-        return value.model_copy(deep=True)
+        return FofaKeyConfig.model_validate(value.model_dump())
     return FofaKeyConfig.model_validate(value)
 
 

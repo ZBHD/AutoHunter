@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -57,7 +57,7 @@ FofaFailureKindValue = Literal["", "auth", "rate_limit", "daily_limit", "transie
 class FofaKeyConfig(BaseModel):
     """单个 FOFA Key 及其可恢复运行状态。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     name: str
     key: str = Field(default="", repr=False)
@@ -95,7 +95,15 @@ class FofaKeyConfig(BaseModel):
     @model_validator(mode="after")
     def validate_name_does_not_contain_key(self) -> "FofaKeyConfig":
         normalized_key = self.key.strip()
-        if normalized_key and normalized_key.casefold() in self.name.casefold():
+        name_key = self.name.casefold()
+        key_variants = {
+            normalized_key,
+            quote(normalized_key, safe=""),
+            quote_plus(normalized_key, safe=""),
+        }
+        if normalized_key and any(
+            variant.casefold() in name_key for variant in key_variants
+        ):
             raise ValueError("FOFA Key 名称不能包含 Key")
         return self
 
