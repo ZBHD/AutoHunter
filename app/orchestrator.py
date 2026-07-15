@@ -163,25 +163,41 @@ _ESCALATE_TOPTIER_KEYWORDS = (
 _ESCALATE_IMPACT_THRESHOLD = int(os.environ.get("ESCALATE_IMPACT_THRESHOLD", "100"))
 
 
-def _escalation_is_significant(orig_severity: str, res: dict) -> bool:
-    """判定扩大危害结果是否『显著』——不显著则丢弃，不产出新 finding。
+def _normalize_escalation_evidence(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").strip()
 
-    满足任一即算显著：
-      1. 等级实际跳变（新等级 > 原等级）；
-      2. 定性质变（升级后类型/标题命中顶格危害关键词，如 接管/RCE）；
-      3. 影响面数量级（impact_count ≥ 阈值）。
-    """
+
+def _escalation_is_significant(
+    orig_severity: str,
+    res: dict,
+    *,
+    source_finding: dict | None = None,
+) -> bool:
+    """Return whether an escalation proves a materially new impact."""
     if not res or not res.get("escalated"):
         return False
-    new_sev = res.get("severity") or ""
-    if _SEVERITY_RANK.get(new_sev, 0) > _SEVERITY_RANK.get(orig_severity, 0):
-        return True
-    blob = f"{res.get('vuln_type','')} {res.get('title','')}".lower()
-    if any(k in blob for k in _ESCALATE_TOPTIER_KEYWORDS):
-        return True
-    if int(res.get("impact_count", 0) or 0) >= _ESCALATE_IMPACT_THRESHOLD:
-        return True
-    return False
+
+    new_severity = res.get("severity") or ""
+    severity_up = _SEVERITY_RANK.get(new_severity, 0) > _SEVERITY_RANK.get(orig_severity, 0)
+    impact_up = int(res.get("impact_count", 0) or 0) >= _ESCALATE_IMPACT_THRESHOLD
+    blob = f"{res.get('vuln_type', '')} {res.get('title', '')}".lower()
+    top_tier = any(keyword in blob for keyword in _ESCALATE_TOPTIER_KEYWORDS)
+
+    source = source_finding or {}
+    if dedup.normalize_vuln_type(source.get("vuln_type", "")) == "backdoor_compromised":
+        new_request = _normalize_escalation_evidence(res.get("raw_request"))
+        new_response = _normalize_escalation_evidence(res.get("raw_response"))
+        if not new_request or not new_response:
+            return False
+        old_request = _normalize_escalation_evidence(source.get("raw_request"))
+        old_response = _normalize_escalation_evidence(source.get("raw_response"))
+        if new_request == old_request and new_response == old_response:
+            return False
+        if dedup.normalize_vuln_type(res.get("vuln_type", "")) == "backdoor_compromised":
+            if not severity_up and not impact_up:
+                return False
+
+    return severity_up or top_tier or impact_up
 
 
 LOOP_INTERVAL = 3.0
@@ -3642,7 +3658,11 @@ class TaskRunner:
             return
 
         # 显著性门槛：不显著就丢弃，只留一条事件，不产出新 finding、不污染报告。
-        if not _escalation_is_significant(orig_severity, res):
+        if not _escalation_is_significant(
+            orig_severity,
+            res,
+            source_finding=finding_dict,
+        ):
             reason = res.get("reason") or "未达到显著升级门槛（等级未提升且影响面无质变）"
             async with SessionLocal() as s:
                 await finalize_escalation_attempt(
