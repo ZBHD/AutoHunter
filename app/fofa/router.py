@@ -110,15 +110,19 @@ class FofaKeyRouter(Generic[T]):
         on_state_change: Callable[[FofaKeyStateChange], None] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
-        self._entries = [
-            _Entry(
-                config=item.model_copy(deep=True),
-                credential_fingerprint=fofa_credential_fingerprint(
-                    item.name, item.key, item.base_url
-                ),
+        self._entries = []
+        for item in keys:
+            # model_copy(update=...) bypasses Pydantic validators; revalidate
+            # before taking the private credential snapshot.
+            config = FofaKeyConfig.model_validate(item.model_dump())
+            self._entries.append(
+                _Entry(
+                    config=config,
+                    credential_fingerprint=fofa_credential_fingerprint(
+                        config.name, config.key, config.base_url
+                    ),
+                )
             )
-            for item in keys
-        ]
         self._active_name = str(active_name or "")
         self._active_revision = 0
         self._state_revision = 0
@@ -372,7 +376,11 @@ class FofaKeyRouter(Generic[T]):
             item.failure_count = 0
             item.cooldown_until = None
             self._active_name = item.name
-            self._record_state_change(before, entry)
+            change = self._record_state_change(before, entry)
+            # Even a ready/active no-op success advances the entry generation,
+            # invalidating older in-flight failures for the same credential.
+            if change is None:
+                entry.generation += 1
         self._drain_callbacks()
         return True
 
@@ -384,36 +392,87 @@ class FofaKeyRouter(Generic[T]):
     ) -> bool:
         with self._lock:
             if not self._candidate_is_fresh_for_write(candidate):
-                return False
-            entry = self._entries[candidate.index]
-            item = entry.config
-            if kind is FofaFailureKind.AUTH and item.runtime_state == "auth_invalid":
-                return False
-            before = self._state_fingerprint(item)
-            item.failure_count = (
-                item.failure_count + 1 if item.failure_kind == kind.value else 1
-            )
-            item.failure_kind = kind.value
-            item.cooldown_until = None
-            if kind is FofaFailureKind.AUTH:
-                item.runtime_state = "auth_invalid"
-            elif kind is FofaFailureKind.RATE_LIMIT:
-                item.runtime_state = "rate_limited"
-                delay = min(60 * (2 ** min(item.failure_count - 1, 4)), 600)
-                if retry_after is not None:
-                    delay = max(delay, retry_after)
-                item.cooldown_until = self._current_time() + timedelta(seconds=delay)
-            elif kind is FofaFailureKind.DAILY_LIMIT:
-                if item.failure_count >= 12:
-                    item.runtime_state = "daily_suspended"
-                else:
-                    item.runtime_state = "daily_cooldown"
-                    item.cooldown_until = self._current_time() + timedelta(hours=1)
+                if not self._merge_stale_failure_locked(candidate, kind, retry_after):
+                    return False
             else:
-                item.runtime_state = "ready"
-            self._record_state_change(before, entry)
+                entry = self._entries[candidate.index]
+                item = entry.config
+                if kind is FofaFailureKind.AUTH and item.runtime_state == "auth_invalid":
+                    return False
+                self._apply_failure_locked(entry, kind, retry_after)
         self._drain_callbacks()
         return True
+
+    def _merge_stale_failure_locked(
+        self,
+        candidate: _Candidate,
+        kind: FofaFailureKind,
+        retry_after: int | None,
+    ) -> bool:
+        """Merge a same-generation concurrent quota result without changing active."""
+        if candidate.index >= len(self._entries):
+            return False
+        entry = self._entries[candidate.index]
+        item = entry.config
+        current_fingerprint = fofa_credential_fingerprint(
+            item.name, item.key, item.base_url
+        )
+        if (
+            entry.generation <= candidate.generation
+            or entry.credential_fingerprint != candidate.credential_fingerprint
+            or current_fingerprint != candidate.credential_fingerprint
+        ):
+            return False
+        if kind is FofaFailureKind.RATE_LIMIT:
+            same_state = (
+                item.failure_kind == kind.value and item.runtime_state == "rate_limited"
+            )
+        elif kind is FofaFailureKind.DAILY_LIMIT:
+            same_state = (
+                item.failure_kind == kind.value and item.runtime_state == "daily_cooldown"
+            )
+        else:
+            same_state = False
+        if not same_state:
+            return False
+        self._apply_failure_locked(entry, kind, retry_after)
+        return True
+
+    def _apply_failure_locked(
+        self,
+        entry: _Entry,
+        kind: FofaFailureKind,
+        retry_after: int | None,
+    ) -> None:
+        item = entry.config
+        before = self._state_fingerprint(item)
+        previous_cooldown = item.cooldown_until
+        item.failure_count = (
+            item.failure_count + 1 if item.failure_kind == kind.value else 1
+        )
+        item.failure_kind = kind.value
+        item.cooldown_until = None
+        if kind is FofaFailureKind.AUTH:
+            item.runtime_state = "auth_invalid"
+        elif kind is FofaFailureKind.RATE_LIMIT:
+            item.runtime_state = "rate_limited"
+            delay = min(60 * (2 ** min(item.failure_count - 1, 4)), 600)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
+            calculated_cooldown = self._current_time() + timedelta(seconds=delay)
+            item.cooldown_until = max(
+                calculated_cooldown,
+                previous_cooldown or calculated_cooldown,
+            )
+        elif kind is FofaFailureKind.DAILY_LIMIT:
+            if item.failure_count >= 12:
+                item.runtime_state = "daily_suspended"
+            else:
+                item.runtime_state = "daily_cooldown"
+                item.cooldown_until = self._current_time() + timedelta(hours=1)
+        else:
+            item.runtime_state = "ready"
+        self._record_state_change(before, entry)
 
     def _safe_error(self, error: BaseException, kind: FofaFailureKind) -> FofaError:
         if isinstance(error, FofaError):

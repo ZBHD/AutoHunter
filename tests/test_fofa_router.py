@@ -6,6 +6,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import FofaKeyConfig
 from app.fofa.client import FofaError
@@ -71,7 +72,7 @@ def test_sync_router_is_sticky_after_auth_failover_and_keeps_key_url_pair() -> N
 
 def test_async_rate_failure_tries_each_key_once() -> None:
     calls: list[tuple[str, str]] = []
-    router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
 
     async def fail(secret: str, base_url: str) -> str:
         calls.append((secret, base_url))
@@ -80,8 +81,8 @@ def test_async_rate_failure_tries_each_key_once() -> None:
     with pytest.raises(FofaPoolExhaustedError):
         asyncio.run(router.execute_async(fail))
     assert calls == [
-        ("a", "https://a.fofa.example/api"),
-        ("b", "https://b.fofa.example/api"),
+        ("key-a", "https://a.fofa.example/api"),
+        ("key-b", "https://b.fofa.example/api"),
     ]
 
 
@@ -154,8 +155,8 @@ def test_earliest_retry_and_all_blocked_pool_state() -> None:
     now, _advance = clock(start)
     router = FofaKeyRouter(
         [
-            key("A", "a", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=5)),
-            key("B", "b", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=2)),
+            key("A", "key-a", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=5)),
+            key("B", "key-b", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=2)),
         ],
         now=now,
     )
@@ -165,7 +166,7 @@ def test_earliest_retry_and_all_blocked_pool_state() -> None:
     assert {failure.name for failure in exc_info.value.failures} == {"A", "B"}
 
     blocked = FofaKeyRouter(
-        [key("A", "a", enabled=False), key("B", "b", runtime_state="auth_invalid")],
+        [key("A", "key-a", enabled=False), key("B", "key-b", runtime_state="auth_invalid")],
         now=now,
     )
     with pytest.raises(FofaPoolExhaustedError) as blocked_info:
@@ -175,24 +176,24 @@ def test_earliest_retry_and_all_blocked_pool_state() -> None:
 
 def test_disabled_and_keyless_entries_are_excluded() -> None:
     router = FofaKeyRouter(
-        [key("off", "off", enabled=False), key("empty", ""), key("good", "good")],
+        [key("off", "key-off", enabled=False), key("empty", ""), key("good", "key-good")],
         active_name="off",
     )
     seen: list[tuple[str, str]] = []
     assert router.execute_sync(lambda secret, base: seen.append((secret, base)) or "ok") == "ok"
-    assert seen == [("good", "https://good.fofa.example/api")]
+    assert seen == [("key-good", "https://good.fofa.example/api")]
 
 
 def test_active_missing_disabled_and_reordered_construction_starts_at_first_eligible() -> None:
-    configs = [key("B", "b"), key("A", "a")]
+    configs = [key("B", "key-b"), key("A", "key-a")]
     router = FofaKeyRouter(configs, active_name="deleted")
     seen: list[str] = []
     router.execute_sync(lambda secret, _base: seen.append(secret) or "ok")
-    assert seen == ["b"]
+    assert seen == ["key-b"]
 
-    router = FofaKeyRouter([key("A", "a", enabled=False), key("B", "b")], active_name="A")
+    router = FofaKeyRouter([key("A", "key-a", enabled=False), key("B", "key-b")], active_name="A")
     router.execute_sync(lambda secret, _base: seen.append(secret) or "ok")
-    assert seen[-1] == "b"
+    assert seen[-1] == "key-b"
 
 
 def test_callbacks_only_fire_on_real_changes_and_callback_errors_are_ignored() -> None:
@@ -203,7 +204,7 @@ def test_callbacks_only_fire_on_real_changes_and_callback_errors_are_ignored() -
         if len(events) == 1:
             raise RuntimeError("callback failure")
 
-    router = FofaKeyRouter([key("A", "a")], on_state_change=callback)
+    router = FofaKeyRouter([key("A", "key-a")], on_state_change=callback)
     router.execute_sync(lambda *_: "ok")
     router.execute_sync(lambda *_: "ok")
     assert len(events) == 1
@@ -256,13 +257,20 @@ def test_router_copies_input_models_and_now_must_be_aware() -> None:
     assert router.keys[0].key_set is True
     assert router.keys[0].base_url == "https://a.fofa.example/api"
 
-    naive_router = FofaKeyRouter([key("A", "a")], now=lambda: datetime(2026, 7, 16))
+    naive_router = FofaKeyRouter([key("A", "key-a")], now=lambda: datetime(2026, 7, 16))
     with pytest.raises(ValueError, match="aware"):
         naive_router.execute_sync(lambda *_: "ok")
 
 
+def test_router_revalidates_model_copy_updates_before_snapshot() -> None:
+    original = key("A", "secret-a")
+    forged = original.model_copy(update={"name": "secret-a"})
+    with pytest.raises(ValidationError):
+        FofaKeyRouter([forged])
+
+
 def test_unknown_failure_kind_maps_to_transient_without_rotation() -> None:
-    router = FofaKeyRouter([key("A", "a"), key("B", "b")])
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")])
     with pytest.raises(FofaError) as exc_info:
         router.execute_sync(
             lambda *_: (_ for _ in ()).throw(FofaError("unknown", kind="future_kind"))
@@ -343,7 +351,7 @@ def test_async_transient_exception_has_no_original_cause_or_context() -> None:
 
 
 def test_stale_sync_success_cannot_reactivate_old_key_after_other_key_wins() -> None:
-    router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
     old_started = threading.Event()
     release_old = threading.Event()
     results: list[str] = []
@@ -353,7 +361,7 @@ def test_stale_sync_success_cannot_reactivate_old_key_after_other_key_wins() -> 
             old_started.set()
             assert release_old.wait(timeout=2)
             return "old"
-        if _key == "a":
+        if _key == "key-a":
             raise FofaError("auth", kind="auth")
         return "new"
 
@@ -376,19 +384,19 @@ def test_stale_sync_success_cannot_reactivate_old_key_after_other_key_wins() -> 
 
 def test_stale_async_success_cannot_reactivate_old_key_after_other_key_wins() -> None:
     async def scenario() -> None:
-        router = FofaKeyRouter([key("A", "a"), key("B", "b")], active_name="A")
+        router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
         old_started = asyncio.Event()
         release_old = asyncio.Event()
 
         async def old_operation(secret: str, _base_url: str) -> str:
-            if secret == "a":
+            if secret == "key-a":
                 old_started.set()
                 await release_old.wait()
                 return "old"
             return "old-b"
 
         async def fast_operation(secret: str, _base_url: str) -> str:
-            if secret == "a":
+            if secret == "key-a":
                 raise FofaError("auth", kind="auth")
             return "new"
 
@@ -416,7 +424,7 @@ def test_callback_reentry_is_lock_free_and_revision_ordered() -> None:
             assert release.wait(timeout=2)
             router.execute_sync(lambda *_: "reentered")
 
-    router = FofaKeyRouter([key("A", "a")], on_state_change=callback)
+    router = FofaKeyRouter([key("A", "key-a")], on_state_change=callback)
 
     def transient() -> None:
         with pytest.raises(FofaError):
@@ -443,7 +451,7 @@ def test_operation_and_callback_can_acquire_router_state_lock_from_other_thread(
         probe.join(timeout=1)
         assert not probe.is_alive()
 
-    router = FofaKeyRouter([key("A", "a")], on_state_change=callback)
+    router = FofaKeyRouter([key("A", "key-a")], on_state_change=callback)
 
     def operation(_secret: str, _base_url: str) -> str:
         probe = threading.Thread(target=lambda: lock_probe.append(router.active_name))
@@ -486,12 +494,12 @@ def test_preblocked_entries_are_reported_with_safe_fixed_failure_kinds() -> None
     now, _advance = clock(start)
     router = FofaKeyRouter(
         [
-            key("disabled", "d", enabled=False),
+            key("disabled", "key-d", enabled=False),
             key("missing", ""),
-            key("auth", "a", runtime_state="auth_invalid"),
-            key("daily", "q", runtime_state="daily_suspended"),
-            key("rate", "r", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=5)),
-            key("daily_wait", "w", runtime_state="daily_cooldown", cooldown_until=start + timedelta(minutes=2)),
+            key("auth", "key-a", runtime_state="auth_invalid"),
+            key("daily", "key-q", runtime_state="daily_suspended"),
+            key("rate", "key-r", runtime_state="rate_limited", cooldown_until=start + timedelta(minutes=5)),
+            key("daily_wait", "key-w", runtime_state="daily_cooldown", cooldown_until=start + timedelta(minutes=2)),
         ],
         now=now,
     )
@@ -505,3 +513,174 @@ def test_preblocked_entries_are_reported_with_safe_fixed_failure_kinds() -> None
     assert by_name["rate"].kind == FofaFailureKind.RATE_LIMIT.value
     assert by_name["daily_wait"].kind == FofaFailureKind.DAILY_LIMIT.value
     assert exc_info.value.next_retry_at == start + timedelta(minutes=2)
+
+
+def test_concurrent_same_generation_rate_failures_merge_count_and_backoff() -> None:
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    now, _advance = clock(start)
+    barrier = threading.Barrier(2)
+    events = []
+    router = FofaKeyRouter(
+        [key("A", "secret-a"), key("B", "secret-b")],
+        active_name="A",
+        on_state_change=events.append,
+        now=now,
+    )
+
+    def operation(secret: str, _base_url: str) -> None:
+        if secret == "secret-a":
+            barrier.wait(timeout=2)
+            raise FofaError("rate", kind="rate_limit")
+        raise FofaError("auth", kind="auth")
+
+    def run() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(operation)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    state = router.keys[0]
+    assert state.failure_count == 2
+    assert state.runtime_state == "rate_limited"
+    assert state.cooldown_until == start + timedelta(seconds=120)
+    assert router.active_name == "A"
+    assert [event.revision for event in events] == sorted(event.revision for event in events)
+    assert [event.failure_count for event in events if event.name == "A"] == [1, 2]
+
+
+def test_concurrent_same_generation_daily_failures_merge_into_twelfth_suspension() -> None:
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    now, _advance = clock(start)
+    barrier = threading.Barrier(2)
+    events = []
+    router = FofaKeyRouter(
+        [
+            key(
+                "A",
+                "secret-a",
+                runtime_state="daily_cooldown",
+                failure_kind="daily_limit",
+                failure_count=10,
+                cooldown_until=start,
+            ),
+            key("B", "secret-b"),
+        ],
+        active_name="A",
+        on_state_change=events.append,
+        now=now,
+    )
+
+    def operation(secret: str, _base_url: str) -> None:
+        if secret == "secret-a":
+            barrier.wait(timeout=2)
+            raise FofaError("daily", kind="daily_limit")
+        raise FofaError("auth", kind="auth")
+
+    def run() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(operation)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    state = router.keys[0]
+    assert state.failure_count == 12
+    assert state.runtime_state == "daily_suspended"
+    assert state.cooldown_until is None
+    assert router.active_name == "A"
+    assert [event.revision for event in events] == sorted(event.revision for event in events)
+    assert [event.failure_count for event in events if event.name == "A"] == [11, 12]
+
+
+def test_stale_same_generation_failure_ignored_after_newer_success_noop() -> None:
+    router = FofaKeyRouter([key("A", "secret-a")], active_name="A")
+    old_started = threading.Event()
+    release_old = threading.Event()
+
+    def operation(_secret: str, _base_url: str) -> str:
+        if threading.current_thread().name == "old":
+            old_started.set()
+            assert release_old.wait(timeout=2)
+            raise FofaError("late rate", kind="rate_limit")
+        return "new success"
+
+    results: list[str] = []
+
+    def old_run() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(operation)
+
+    old = threading.Thread(target=old_run, name="old")
+    old.start()
+    assert old_started.wait(timeout=2)
+    fast = threading.Thread(
+        target=lambda: results.append(router.execute_sync(operation)), name="fast"
+    )
+    fast.start()
+    fast.join(timeout=2)
+    release_old.set()
+    old.join(timeout=2)
+    assert results == ["new success"]
+    assert router.keys[0].runtime_state == "ready"
+    assert router.keys[0].failure_count == 0
+
+
+def test_concurrent_same_generation_cross_kind_failure_does_not_merge() -> None:
+    barrier = threading.Barrier(2)
+    events = []
+    router = FofaKeyRouter([key("A", "secret-a")], on_state_change=events.append)
+
+    def operation(_secret: str, _base_url: str) -> None:
+        barrier.wait(timeout=2)
+        if threading.current_thread().name == "rate":
+            raise FofaError("rate", kind="rate_limit")
+        raise FofaError("daily", kind="daily_limit")
+
+    def run() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(operation)
+
+    threads = [
+        threading.Thread(target=run, name="rate"),
+        threading.Thread(target=run, name="daily"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    state = router.keys[0]
+    assert state.failure_count == 1
+    assert state.failure_kind in {FofaFailureKind.RATE_LIMIT.value, FofaFailureKind.DAILY_LIMIT.value}
+    assert len([event for event in events if event.name == "A"]) == 1
+
+
+def test_merged_rate_failures_preserve_longer_upstream_retry_after() -> None:
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    now, _advance = clock(start)
+    barrier = threading.Barrier(2)
+    router = FofaKeyRouter([key("A", "secret-a")], active_name="A", now=now)
+
+    def operation(_secret: str, _base_url: str) -> None:
+        barrier.wait(timeout=2)
+        retry_after = 1000 if threading.current_thread().name == "long" else None
+        raise FofaError("rate", kind="rate_limit", retry_after=retry_after)
+
+    def run() -> None:
+        with pytest.raises(FofaPoolExhaustedError):
+            router.execute_sync(operation)
+
+    threads = [
+        threading.Thread(target=run, name="long"),
+        threading.Thread(target=run, name="short"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    assert router.keys[0].failure_count == 2
+    assert router.keys[0].cooldown_until == start + timedelta(seconds=1000)
