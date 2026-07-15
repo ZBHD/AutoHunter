@@ -55,6 +55,17 @@ def test_daily_limit_wins_over_generic_quota_marker() -> None:
     assert retry_after == 3600
 
 
+def test_daily_limit_wins_over_conflicting_http_rate_status() -> None:
+    kind, code, retry_after = classify(
+        "[820041] daily quota exceeded",
+        status=429,
+    )
+
+    assert kind == "daily_limit"
+    assert code == "820041"
+    assert retry_after == 3600
+
+
 def test_standalone_daily_marker_is_daily_limit() -> None:
     assert classify("每日", status=200)[0] == "daily_limit"
 
@@ -310,6 +321,42 @@ def test_search_data_error_prefers_daily_limit(monkeypatch) -> None:
     assert exc_info.value.kind == "daily_limit"
     assert exc_info.value.code == "820041"
     assert exc_info.value.retry_after == 3600
+
+
+def test_classifies_before_redacting_marker_like_key(monkeypatch) -> None:
+    key = "Too Many"
+
+    class Response:
+        status_code = 200
+        text = key
+        headers = {}
+
+        @staticmethod
+        def json():
+            return {"error": True, "errmsg": key}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(
+        "app.tools.netguard.assert_safe_outbound_url",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(fofa_client.FofaError) as exc_info:
+        asyncio.run(fofa_client.search(key, 'domain="example.com"'))
+
+    assert exc_info.value.kind == "rate_limit"
+    assert key not in str(exc_info.value)
+    assert key not in repr(exc_info.value)
 
 
 def test_get_userinfo_uses_shared_auth_classification(monkeypatch) -> None:

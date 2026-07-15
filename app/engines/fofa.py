@@ -32,15 +32,17 @@ def _structured_error(
     display_message: str | None = None,
     key: str | None = None,
 ) -> FofaError:
-    message = redact_fofa_secrets(message, key)
-    display_message = redact_fofa_secrets(display_message, key) if display_message else None
+    safe_message = redact_fofa_secrets(message, key)
+    safe_display_message = (
+        redact_fofa_secrets(display_message, key) if display_message else None
+    )
     kind, code, retry_seconds = classify_fofa_failure(
         message,
         status=status,
         retry_after=retry_after,
     )
     return FofaError(
-        display_message or message,
+        safe_display_message or safe_message,
         kind=kind,
         code=code,
         retry_after=retry_seconds,
@@ -130,7 +132,7 @@ class FofaEngine(SearchEngine):
                         retry_after=_retry_after(resp),
                         display_message=f"FOFA 返回非 JSON (HTTP {resp.status_code})",
                         key=api_key,
-                    )
+                    ) from None
         except FofaError:
             raise
         except httpx.HTTPError as e:
@@ -139,7 +141,7 @@ class FofaEngine(SearchEngine):
                 message,
                 display_message=f"FOFA 请求失败: {message}",
                 key=api_key,
-            ) from e
+            ) from None
 
         if not isinstance(data, dict):
             raise _structured_error(
