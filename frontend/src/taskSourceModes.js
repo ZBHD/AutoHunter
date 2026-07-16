@@ -15,3 +15,19 @@ export function isFofaPoolMode(source, engine) {
   const normalizedEngine = String(engine || "").trim().toLowerCase();
   return !normalizedEngine || normalizedEngine === "fofa";
 }
+
+export function fofaKeyPatch({
+  initialMode = "global",
+  finalMode = "global",
+  finalIsFofa = true,
+  key = "",
+} = {}) {
+  const hadTaskOverride = initialMode === "task";
+  const finalTaskMode = finalIsFofa && finalMode === "task";
+  const normalizedKey = String(key || "").trim();
+
+  if (finalTaskMode && normalizedKey) return { key: normalizedKey };
+  if (hadTaskOverride && !finalTaskMode) return { key: null };
+  // A global task with no existing override is always a no-op.
+  return {};
+}

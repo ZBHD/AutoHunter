@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "./VulnerabilityTypeSelector.vue";
-import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode } from "../taskSourceModes.js";
+import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode, fofaKeyPatch } from "../taskSourceModes.js";
 
 const props = defineProps({
   open: Boolean,
@@ -73,7 +73,6 @@ const form = reactive({
   page_size: 100,
   concurrency: 3,
   site_recon_mode: "full",
-  fofa_key_mode_touched: false,
 });
 const original = reactive({
   use_global_pool: true,
@@ -81,6 +80,7 @@ const original = reactive({
   fofa_base_url: "",
   max_pages: 20,
   page_size: 100,
+  fofa_key_mode: "global",
 });
 const isSiteMode = computed(() => form.target_source === "site");
 const isAutoMode = computed(() => isAutoSource(form.target_source));
@@ -98,13 +98,11 @@ function handleTargetSourceChange() {
 function handleEngineChange() {
   if (!isFofaMode.value) {
     form.fofa_key_mode = "global";
-    form.fofa_key_mode_touched = false;
   }
 }
 
 function setFofaKeyMode(mode) {
   form.fofa_key_mode = mode;
-  form.fofa_key_mode_touched = true;
 }
 
 function fill(task) {
@@ -132,7 +130,6 @@ function fill(task) {
   form.prompt_version = modelCfg.prompt_version || "current";
   form.fofa_key = "";
   form.fofa_key_mode = fofaCfg.key_source === "task" ? "task" : "global";
-  form.fofa_key_mode_touched = false;
   form.fofa_base_url = fofaCfg.base_url || "";
   form.max_pages = fofaCfg.max_pages ?? 20;
   form.page_size = fofaCfg.page_size ?? 100;
@@ -142,6 +139,7 @@ function fill(task) {
   original.fofa_base_url = form.fofa_base_url;
   original.max_pages = Number(form.max_pages);
   original.page_size = Number(form.page_size);
+  original.fofa_key_mode = form.fofa_key_mode;
   // 重置模型列表状态（打开弹窗时 watch 会随即自动 loadModels 拉好列表）
   models.value = [];
   modelsError.value = "";
@@ -173,15 +171,16 @@ async function save() {
   const pageSize = parseInt(form.page_size) || 100;
   const fofaConfig = {};
   const engineConfig = {};
+  Object.assign(fofaConfig, fofaKeyPatch({
+    initialMode: original.fofa_key_mode,
+    finalMode: form.fofa_key_mode,
+    finalIsFofa: isFofaMode.value,
+    key: form.fofa_key,
+  }));
   if (isFofaMode.value) {
     if (maxPages !== original.max_pages) fofaConfig.max_pages = maxPages;
     if (pageSize !== original.page_size) fofaConfig.page_size = pageSize;
     if (form.intent_mode !== original.intent_mode) fofaConfig.intent_mode = form.intent_mode;
-    if (form.fofa_key_mode_touched && form.fofa_key_mode === "global") {
-      fofaConfig.key = null;
-    } else if (form.fofa_key_mode === "task" && form.fofa_key.trim()) {
-      fofaConfig.key = form.fofa_key.trim();
-    }
     if (form.fofa_base_url !== original.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
   } else if (isAutoMode.value) {
     if (form.fofa_key.trim()) engineConfig.key = form.fofa_key.trim();

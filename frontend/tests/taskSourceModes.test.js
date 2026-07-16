@@ -6,6 +6,7 @@ import {
   isManualOnly,
   isSiteSource,
   isFofaPoolMode,
+  fofaKeyPatch,
 } from "../src/taskSourceModes.js";
 
 const source = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
@@ -29,6 +30,44 @@ test("uses FOFA pool for auto source with FOFA or default engine only", () => {
   assert.equal(isFofaPoolMode("site", ""), false);
 });
 
+test("clears a task override after non-FOFA round trip back to FOFA", () => {
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    finalMode: "global",
+    finalIsFofa: true,
+  }), { key: null });
+});
+
+test("builds FOFA key patches for explicit global, no-op, and blank cases", () => {
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    finalMode: "global",
+    finalIsFofa: true,
+  }), { key: null });
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    finalMode: "global",
+    finalIsFofa: false,
+  }), { key: null });
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    finalMode: "task",
+    finalIsFofa: true,
+    key: "",
+  }), {});
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "global",
+    finalMode: "global",
+    finalIsFofa: true,
+  }), {});
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "global",
+    finalMode: "task",
+    finalIsFofa: true,
+    key: "  task-secret  ",
+  }), { key: "task-secret" });
+});
+
 test("create and edit forms expose an independent FOFA key source switch", () => {
   const create = source("../src/views/CreateView.vue");
   const edit = source("../src/components/TaskEditModal.vue");
@@ -39,4 +78,6 @@ test("create and edit forms expose an independent FOFA key source switch", () =>
     assert.match(view, /不参与全局轮换/);
     assert.match(view, /isFofaPoolMode/);
   }
+  assert.match(edit, /fofaKeyPatch\(/);
+  assert.match(edit, /initialMode:\s*original\.fofa_key_mode/);
 });
