@@ -70,6 +70,7 @@ const form = reactive({
   max_pages: 20,
   page_size: 100,
   concurrency: 3,
+  site_recon_mode: "full",
 });
 const original = reactive({
   use_global_pool: true,
@@ -83,6 +84,10 @@ const dedicatedKeyRequired = computed(() => (
   !form.use_global_pool && (original.use_global_pool || !form.api_key_set)
 ));
 
+function handleTargetSourceChange() {
+  if (isSiteMode.value) form.site_recon_mode = "full";
+}
+
 function fill(task) {
   if (!task) return;
   const modelCfg = task.model_config_data || {};
@@ -92,6 +97,7 @@ function fill(task) {
   form.vuln_types = [...(task.vuln_types || [])];
   form.hunt_direction = task.hunt_direction || "";
   form.target_source = task.target_source || "fofa";
+  form.site_recon_mode = fofaCfg.site_recon_mode || "full";
   form.engine = task.engine || "";
   form.fofa_query = task.fofa_query || "";
   form.intent_mode = fofaCfg.intent_mode || "";
@@ -150,6 +156,7 @@ async function save() {
   if (form.intent_mode !== original.intent_mode) fofaConfig.intent_mode = form.intent_mode;
   if (form.fofa_key.trim()) fofaConfig.key = form.fofa_key.trim();
   if (form.fofa_base_url !== original.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
+  if (isSiteMode.value) fofaConfig.site_recon_mode = form.site_recon_mode;
 
   const updated = await api.updateTask(props.task.id, {
     name: form.name,
@@ -190,13 +197,28 @@ async function save() {
           </select>
         </label>
         <label>目标来源
-          <select v-model="form.target_source">
+          <select v-model="form.target_source" @change="handleTargetSourceChange">
             <option value="fofa">FOFA 自动搜</option>
             <option value="manual">手动清单</option>
             <option value="both">两者</option>
             <option value="site">单站协作</option>
           </select>
         </label>
+        <div v-if="isSiteMode" class="site-recon-mode full">
+          <div class="model-mode-switch" role="group" aria-label="入口盘点模式">
+            <button type="button" :class="{ active: form.site_recon_mode === 'full' }"
+              :aria-pressed="form.site_recon_mode === 'full'"
+              @click="form.site_recon_mode = 'full'">
+              完整入口盘点
+            </button>
+            <button type="button" :class="{ active: form.site_recon_mode === 'light' }"
+              :aria-pressed="form.site_recon_mode === 'light'"
+              @click="form.site_recon_mode = 'light'">
+              轻量入口盘点（最多 18 轮）
+            </button>
+          </div>
+          <p class="model-mode-copy">轻量模式保留全部路由，仅将 site_map 预算限制为最多 18 轮。</p>
+        </div>
         <label v-if="!isSiteMode">搜索引擎
           <select v-model="form.engine">
             <option value="">默认引擎</option>

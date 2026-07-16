@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
+from app.agents import site_collab
 from app.agents.history import bounded_tool_content, compact_messages
 from app.deepen_context import render_deepen_brief
 from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
@@ -96,6 +97,22 @@ class Worker:
 
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
+
+    def _site_event_metadata(self) -> dict[str, str]:
+        route = (self.target_meta or {}).get("site_collab_route")
+        if not isinstance(route, dict):
+            return {}
+        source = str(route.get("source") or "").strip()
+        if not source:
+            return {}
+        metadata = {"site_route": source}
+        if source == "site_map":
+            metadata["site_recon_mode"] = (
+                site_collab.SITE_RECON_LIGHT
+                if route.get("recon_mode") == site_collab.SITE_RECON_LIGHT
+                else site_collab.SITE_RECON_FULL
+            )
+        return metadata
 
     def _initial_js_tool_enabled(self) -> bool:
         if worker_config.js_tool_always_on:
@@ -207,6 +224,8 @@ class Worker:
         )
 
     def run(self) -> WorkerResult:
+        start_event = {"target": self.target, "prompt_version": self.prompt_version}
+        start_event.update(self._site_event_metadata())
         if self.deepen_context:
             user_content = (
                 self._intel_block()
@@ -214,7 +233,7 @@ class Worker:
                 + self._deepen_brief()
                 + self._hunt_direction_block()
             )
-            self._emit("worker_start", target=self.target, mode="deepen", prompt_version=self.prompt_version)
+            start_event["mode"] = "deepen"
         else:
             user_content = (
                 self._intel_block()
@@ -223,7 +242,7 @@ class Worker:
                 + self._hunt_direction_block()
                 + "只挖此目标；自主侦察取证，结束调用 finish。"
             )
-            self._emit("worker_start", target=self.target, prompt_version=self.prompt_version)
+        self._emit("worker_start", **start_event)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": worker_system_prompt(self.src_type, self.prompt_version)},
             {"role": "user", "content": _WORKER_STATIC_PREFIX},
@@ -506,6 +525,13 @@ class Worker:
         )
         if configured_soft_cap > 0:
             soft_rounds = min(soft_rounds, configured_soft_cap)
+        site_route = (self.target_meta or {}).get("site_collab_route") or {}
+        if (
+            site_route.get("source") == "site_map"
+            and site_route.get("recon_mode") == site_collab.SITE_RECON_LIGHT
+        ):
+            max_rounds = min(max_rounds, site_collab.SITE_RECON_LIGHT_MAX_ROUNDS)
+            soft_rounds = min(soft_rounds, site_collab.SITE_RECON_LIGHT_SOFT_ROUNDS)
         return max(1, max_rounds), max(1, min(soft_rounds, max_rounds))
 
     def _cancelled_result(self, rounds: int) -> WorkerResult:

@@ -22,6 +22,7 @@ const form = reactive({
   base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
   prompt_version: "current",
   fofa_key: "", fofa_base_url: "", max_pages: 20, concurrency: 3,
+  site_recon_mode: "full",
 });
 const inherited = reactive({
   fofa_base_url: "",
@@ -30,6 +31,10 @@ const inherited = reactive({
   concurrency: 3,
 });
 const isSiteMode = computed(() => form.target_source === "site");
+
+function handleTargetSourceChange() {
+  if (isSiteMode.value) form.site_recon_mode = "full";
+}
 
 async function submit() {
   const modelConfig = {
@@ -50,6 +55,7 @@ async function submit() {
   if (form.fofa_base_url && form.fofa_base_url !== inherited.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
   if (maxPages !== inherited.max_pages) fofaConfig.max_pages = maxPages;
   if (form.intent_mode !== inherited.intent_mode) fofaConfig.intent_mode = form.intent_mode;
+  if (isSiteMode.value) fofaConfig.site_recon_mode = form.site_recon_mode;
 
   const body = {
     name: form.name,
@@ -110,13 +116,28 @@ onMounted(async () => {
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
       </label>
       <label>目标来源
-        <select v-model="form.target_source">
+        <select v-model="form.target_source" @change="handleTargetSourceChange">
           <option value="fofa">FOFA 自动搜</option>
           <option value="manual">手动清单</option>
           <option value="both">两者</option>
           <option value="site">单站协作</option>
         </select>
       </label>
+      <div v-if="isSiteMode" class="site-recon-mode">
+        <div class="model-mode-switch" role="group" aria-label="入口盘点模式">
+          <button type="button" :class="{ active: form.site_recon_mode === 'full' }"
+            :aria-pressed="form.site_recon_mode === 'full'"
+            @click="form.site_recon_mode = 'full'">
+            完整入口盘点
+          </button>
+          <button type="button" :class="{ active: form.site_recon_mode === 'light' }"
+            :aria-pressed="form.site_recon_mode === 'light'"
+            @click="form.site_recon_mode = 'light'">
+            轻量入口盘点（最多 18 轮）
+          </button>
+        </div>
+        <p class="model-mode-copy">轻量模式保留全部路由，仅将 site_map 预算限制为最多 18 轮。</p>
+      </div>
       <label v-if="!isSiteMode">搜索引擎
         <select v-model="form.engine">
           <option value="">默认引擎</option>

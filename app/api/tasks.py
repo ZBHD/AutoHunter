@@ -78,6 +78,7 @@ def _observer_model_config() -> dict:
 def _observer_fofa_config() -> dict:
     return {
         "max_pages": 0, "page_size": 0, "intent_mode": "",
+        "site_recon_mode": site_collab.SITE_RECON_FULL,
         "key_set": False, "current_query": "", "cursor": 0,
         "collector_phase": "", "collector_phase_text": "",
     }
@@ -212,6 +213,7 @@ def _public_fofa_config(task: Task) -> dict:
         "max_pages": eff["max_pages"],
         "page_size": eff["page_size"],
         "intent_mode": eff["intent_mode"],
+        "site_recon_mode": site_collab.recon_mode_for(task),
         "key_set": bool(eff["key"]),
         "current_query": cfg.get("current_query", ""),
         "cursor": cfg.get("cursor", 0),
@@ -451,6 +453,13 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
     if not task:
         raise HTTPException(404, "任务不存在")
 
+    previous_target_source = task.target_source
+    site_recon_mode_supplied = (
+        req.fofa_config is not None
+        and "site_recon_mode" in req.fofa_config.model_fields_set
+        and req.fofa_config.site_recon_mode is not None
+    )
+
     if req.name is not None:
         task.name = req.name.strip() or task.name
     if req.src_type is not None:
@@ -507,10 +516,23 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
             if intent_mode not in {"", "syntax", "intent"}:
                 raise HTTPException(400, "intent_mode 必须是空/syntax/intent")
             cfg["intent_mode"] = intent_mode
+        if "site_recon_mode" in patch and patch["site_recon_mode"] is not None:
+            cfg["site_recon_mode"] = patch["site_recon_mode"]
+            cfg.pop("skip_site_recon", None)
         if req.fofa_query is not None and req.fofa_query != old_query:
             cfg.pop("current_query", None)
             cfg["cursor"] = 0
             cfg["history"] = []
+        task.fofa_config = cfg
+
+    if (
+        previous_target_source != "site"
+        and req.target_source == "site"
+        and not site_recon_mode_supplied
+    ):
+        cfg = dict(task.fofa_config or {})
+        cfg["site_recon_mode"] = site_collab.SITE_RECON_FULL
+        cfg.pop("skip_site_recon", None)
         task.fofa_config = cfg
 
     await session.commit()
@@ -645,6 +667,8 @@ async def task_board(task_id: str, request: Request, session: AsyncSession = Dep
                 "score": w.get("score", 0),
                 "score_reason": "",
                 "mode": w.get("mode", ""),
+                "site_route": w.get("site_route", ""),
+                "site_recon_mode": w.get("site_recon_mode", ""),
             })
         live = safe_live
 

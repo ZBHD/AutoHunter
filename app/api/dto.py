@@ -61,6 +61,7 @@ class FofaConfigDTO(BaseModel):
     max_pages: int = 20
     page_size: int = 100
     intent_mode: str = ""
+    site_recon_mode: Literal["full", "light"] = "full"
 
 
 class EngineConfigDTO(BaseModel):
@@ -121,6 +122,7 @@ class PartialFofaConfigDTO(BaseModel):
     max_pages: Optional[int] = None
     page_size: Optional[int] = None
     intent_mode: Optional[str] = None
+    site_recon_mode: Optional[Literal["full", "light"]] = None
 
 
 class PartialEngineConfigDTO(BaseModel):

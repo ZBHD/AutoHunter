@@ -124,9 +124,39 @@ ROUTES: tuple[SiteRoute, ...] = (
 _ROUTE_BY_SOURCE = {r.source: r for r in ROUTES}
 DISCOVERY_ROUTES = tuple(r for r in ROUTES if r.phase == 0)
 FOLLOWUP_ROUTES = tuple(r for r in ROUTES if r.phase > 0)
+SITE_RECON_FULL = "full"
+SITE_RECON_LIGHT = "light"
+SITE_RECON_LIGHT_MAX_ROUNDS = 18
+SITE_RECON_LIGHT_SOFT_ROUNDS = 12
 # 开局并发入队的全部固定路线（侦察 + 主题深挖）。单站协作要「快」，
 # 5 条主题路线不再苦等侦察跑完，开局即和侦察一起并发抢 worker。
 INITIAL_ROUTES = DISCOVERY_ROUTES + FOLLOWUP_ROUTES
+
+
+def recon_mode_for(task: object | None) -> str:
+    config = getattr(task, "fofa_config", None)
+    if not isinstance(config, dict):
+        return SITE_RECON_FULL
+    if "site_recon_mode" in config:
+        mode = config.get("site_recon_mode")
+        return SITE_RECON_LIGHT if mode == SITE_RECON_LIGHT else SITE_RECON_FULL
+    if config.get("skip_site_recon") is True:
+        return SITE_RECON_LIGHT
+    return SITE_RECON_FULL
+
+
+def runtime_route_meta(route: SiteRoute, task: object | None) -> dict:
+    meta = {
+        "source": route.source,
+        "label": route.label,
+        "focus": route.focus,
+        "js_first": route.js_first,
+    }
+    if route.source == "site_map":
+        meta["recon_mode"] = recon_mode_for(task)
+    return meta
+
+
 FOCUSED_ROUTE = SiteRoute(
     source="site_focus",
     label="定向 API 追打",
@@ -205,6 +235,7 @@ def render_context(
     site_info: str = "",
     coverage_block: str = "",
     focus_note: str = "",
+    recon_mode: str = SITE_RECON_FULL,
 ) -> str:
     lines = [
         "# 单站协作分工",
@@ -214,6 +245,12 @@ def render_context(
         "- 覆盖要求：发现 API/入口后要逐项做最小安全验证；没出洞也要用 report_coverage 记录覆盖面。",
         "- 收敛规则：能打穿就 submit_finding；有明确据点但差一步就写 deepen_lead；无实证不要交半成品。",
     ]
+    if route.source == "site_map" and recon_mode == SITE_RECON_LIGHT:
+        lines += [
+            "- 轻量侦察预算：本路线最多 18 轮；从第 12 轮开始软收敛，但不得提前省略最低覆盖。",
+            "- 轻量最低覆盖顺序：首页与跳转链；robots.txt / sitemap.xml；API 文档与前端主要路由；"
+            "存在可用登录态时至少完成一次内部菜单/API 盘点；覆盖完成后先调用 report_coverage，再 finish。",
+        ]
     if route.phase > 0:
         # 主题深挖路线：区别于侦察路线，强调复用侦察成果 + 多轮深挖 + 用 deepen_lead 触发自动接力。
         lines += [
@@ -221,7 +258,8 @@ def render_context(
             "打穿就 submit_finding；差一步（有据点但缺 ID/凭据/回显）就写 deepen_lead，"
             "系统会自动接力深挖、出洞后还会自动扩大危害；确认无洞也要说清测了哪些入口、为何不通。"
             "不要首页加几个常见路径扫一遍就 finish。",
-            "- 复用侦察：site_map/site_js 侦察路线与你并发在跑，成果会陆续上报。"
+            f"- 复用侦察：{'site_map（轻量）/site_js' if recon_mode == SITE_RECON_LIGHT else 'site_map/site_js'} "
+            "侦察路线与你并发在跑，成果会陆续上报。"
             "下方【若已有覆盖摘要】就优先在这些已知入口上做本路线的定向验证，别从零重复侦察；"
             "【若暂无覆盖摘要】说明侦察还在跑，你直接按本路线 focus 自己快速摸一遍相关入口就开打，"
             "不要空等侦察——先扒首页/JS 找本路线相关接口（如认证路线找登录/越权接口），边测边深挖。",

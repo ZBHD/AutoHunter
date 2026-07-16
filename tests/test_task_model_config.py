@@ -123,6 +123,13 @@ async def _stored_hunt_direction(session_maker, task_id: str) -> str:
         return task.hunt_direction
 
 
+async def _stored_fofa_config(session_maker, task_id: str) -> dict:
+    async with session_maker() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        return dict(task.fofa_config or {})
+
+
 async def _insert_task(session_maker, task_id: str, model_config: dict) -> None:
     async with session_maker() as session:
         session.add(
@@ -143,6 +150,174 @@ async def _insert_task(session_maker, task_id: str, model_config: dict) -> None:
             )
         )
         await session.commit()
+
+
+async def _insert_site_task_with_fofa_config(
+    session_maker, task_id: str, fofa_config: dict
+) -> None:
+    async with session_maker() as session:
+        session.add(
+            Task(
+                id=task_id,
+                name=f"Task {task_id}",
+                src_type="edusrc",
+                vuln_types=[],
+                src_rules="",
+                target_source="site",
+                fofa_query="",
+                manual_targets=[],
+                model_config_json={"use_global_pool": True},
+                fofa_config=fofa_config,
+                engine="",
+                concurrency=1,
+                status="created",
+            )
+        )
+        await session.commit()
+
+
+def test_site_recon_mode_persists_on_create_and_patch_preserves_runtime_cursor(task_api) -> None:
+    client, session_maker = task_api
+
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Light site task",
+            "target_source": "site",
+            "fofa_config": {"site_recon_mode": "light"},
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    assert created.json()["fofa_config"]["site_recon_mode"] == "light"
+    assert asyncio.run(_stored_fofa_config(session_maker, task_id)) == {
+        "site_recon_mode": "light"
+    }
+
+    async def add_cursor() -> None:
+        async with session_maker() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
+            task.fofa_config = {
+                **(task.fofa_config or {}),
+                "cursor": 7,
+                "skip_site_recon": True,
+            }
+            await session.commit()
+
+    asyncio.run(add_cursor())
+    patched = client.patch(
+        f"/api/tasks/{task_id}",
+        json={"fofa_config": {"site_recon_mode": "full"}},
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["fofa_config"]["site_recon_mode"] == "full"
+    assert asyncio.run(_stored_fofa_config(session_maker, task_id)) == {
+        "site_recon_mode": "full",
+        "cursor": 7,
+    }
+
+
+def test_legacy_skip_site_recon_is_publicly_reported_as_light(task_api) -> None:
+    client, session_maker = task_api
+    asyncio.run(
+        _insert_site_task_with_fofa_config(
+            session_maker, "legacy-site-mode", {"skip_site_recon": True}
+        )
+    )
+
+    response = client.get("/api/tasks/legacy-site-mode")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fofa_config"]["site_recon_mode"] == "light"
+
+
+def test_switching_to_site_defaults_recon_mode_to_full(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Switch to site",
+            "target_source": "manual",
+            "fofa_config": {"site_recon_mode": "light"},
+        },
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"target_source": "site"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fofa_config"]["site_recon_mode"] == "full"
+    assert asyncio.run(_stored_fofa_config(session_maker, created["id"])) == {
+        "site_recon_mode": "full"
+    }
+
+
+def test_switching_to_site_honors_explicit_recon_mode(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Explicit site mode", "target_source": "manual"},
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "target_source": "site",
+            "fofa_config": {"site_recon_mode": "light"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fofa_config"]["site_recon_mode"] == "light"
+    assert asyncio.run(_stored_fofa_config(session_maker, created["id"])) == {
+        "site_recon_mode": "light"
+    }
+
+
+def test_switching_to_site_defaults_null_recon_mode_to_full(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Null site mode",
+            "target_source": "manual",
+            "fofa_config": {"site_recon_mode": "light"},
+        },
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "target_source": "site",
+            "fofa_config": {"site_recon_mode": None},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["fofa_config"]["site_recon_mode"] == "full"
+    assert asyncio.run(_stored_fofa_config(session_maker, created["id"])) == {
+        "site_recon_mode": "full"
+    }
+
+
+def test_create_rejects_unknown_site_recon_mode(task_api) -> None:
+    client, _session_maker = task_api
+
+    response = client.post(
+        "/api/tasks",
+        json={
+            "name": "Invalid site mode",
+            "target_source": "site",
+            "fofa_config": {"site_recon_mode": "auto"},
+        },
+    )
+
+    assert response.status_code == 422, response.text
 
 
 def test_create_task_persists_and_returns_global_pool_default(task_api) -> None:
@@ -230,7 +405,11 @@ def test_observer_task_list_and_detail_hide_hunt_direction(task_api) -> None:
     client, _session_maker = task_api
     created = client.post(
         "/api/tasks",
-        json={"name": "Private direction", "hunt_direction": "敏感挖掘方向"},
+        json={
+            "name": "Private direction",
+            "hunt_direction": "敏感挖掘方向",
+            "fofa_config": {"site_recon_mode": "light"},
+        },
     ).json()
     headers = {"x-autohunter-token": "observer-token"}
 
@@ -242,6 +421,8 @@ def test_observer_task_list_and_detail_hide_hunt_direction(task_api) -> None:
     item = next(task for task in listed.json() if task["id"] == created["id"])
     assert item["hunt_direction"] == ""
     assert detailed.json()["hunt_direction"] == ""
+    assert item["fofa_config"]["site_recon_mode"] == "full"
+    assert detailed.json()["fofa_config"]["site_recon_mode"] == "full"
     assert "敏感挖掘方向" not in listed.text
     assert "敏感挖掘方向" not in detailed.text
 
