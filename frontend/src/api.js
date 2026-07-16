@@ -245,6 +245,8 @@ export const api = {
   stop: (id) => req("POST", `/api/tasks/${id}/stop`),
   results: (id, conf, q) => req("GET", `/api/tasks/${id}/results${qs({ confidence: conf, q })}`),
   reviewQueue: (id, q, opts = {}) => req("GET", `/api/tasks/${id}/review-queue${qs({ q, ...opts })}`),
+  globalReviewQueue: (q, opts = {}) => req("GET", `/api/review-queue${qs({ q, ...opts })}`),
+  globalReviewStats: () => req("GET", "/api/review-queue/stats"),
   submitList: (id, submitted, q, opts = {}) =>
     req("GET", `/api/tasks/${id}/submit-list${qs({ submitted, q, ...opts })}`),
   rejectedList: (id, q) => req("GET", `/api/tasks/${id}/rejected${qs({ q })}`),

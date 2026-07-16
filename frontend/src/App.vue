@@ -23,7 +23,7 @@ const showTokenModal = ref(false);
 const tokenInput = ref("");
 const tokenModalReason = ref("switch");
 const toastMsg = ref("");
-const operationCounts = ref({ missedPending: 0, killsweepFailed: 0 });
+const operationCounts = ref({ reviewPending: 0, missedPending: 0, killsweepFailed: 0 });
 const visibleNavigation = computed(() => primaryNavigation(authRoleRef.value, operationCounts.value));
 
 function toast(message, ms = 2600) {
@@ -41,14 +41,18 @@ function openTokenDialog(reason = "switch") {
 
 async function refreshOperationCounts() {
   if (!["full", "readonly"].includes(authRoleRef.value)) {
-    operationCounts.value = { missedPending: 0, killsweepFailed: 0 };
+    operationCounts.value = { reviewPending: 0, missedPending: 0, killsweepFailed: 0 };
     return;
   }
-  const [missed, killsweep] = await Promise.allSettled([
+  const [reviews, missed, killsweep] = await Promise.allSettled([
+    api.globalReviewStats(),
     api.missedSignalStats(),
     api.killsweepStats(),
   ]);
   operationCounts.value = {
+    reviewPending: reviews.status === "fulfilled"
+      ? Number(reviews.value?.pending ?? 0)
+      : operationCounts.value.reviewPending,
     missedPending: missed.status === "fulfilled"
       ? Number(missed.value?.pending ?? missed.value?.pending_count ?? 0)
       : operationCounts.value.missedPending,
@@ -134,6 +138,7 @@ onUnmounted(() => {
         class="navbtn" :class="{ active: isNavigationActive(item, route.path) }">
         <span class="nav-icon" aria-hidden="true">
           <svg v-if="item.id === 'tasks'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="11" width="18" height="4" rx="1"/><rect x="3" y="18" width="18" height="3" rx="1"/></svg>
+          <svg v-else-if="item.id === 'reviews'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5h6"/><path d="M9 3h6a2 2 0 0 1 2 2v1h2v15H5V6h2V5a2 2 0 0 1 2-2Z"/><path d="m9 14 2 2 4-4"/></svg>
           <svg v-else-if="item.id === 'missed'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>
           <svg v-else-if="item.id === 'killsweeps'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
           <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v.09A1.65 1.65 0 0 0 20.91 10H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/></svg>
@@ -157,6 +162,7 @@ onUnmounted(() => {
       class="bottom-nav-item" :class="{ active: isNavigationActive(item, route.path) }">
       <span class="bottom-nav-icon" aria-hidden="true">
         <svg v-if="item.id === 'tasks'" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="11" width="18" height="4" rx="1"/><rect x="3" y="18" width="18" height="3" rx="1"/></svg>
+        <svg v-else-if="item.id === 'reviews'" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5h6"/><path d="M9 3h6a2 2 0 0 1 2 2v1h2v15H5V6h2V5a2 2 0 0 1 2-2Z"/><path d="m9 14 2 2 4-4"/></svg>
         <svg v-else-if="item.id === 'missed'" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>
         <svg v-else-if="item.id === 'killsweeps'" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
         <svg v-else viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v.09A1.65 1.65 0 0 0 20.91 10H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/></svg>

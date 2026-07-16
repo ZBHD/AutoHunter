@@ -71,6 +71,24 @@ def test_findings_download_status_filter_and_batch_mark(tmp_path):
         assert [item["id"] for item in review.json()] == ["finding-a"]
         assert review.json()[0]["downloaded"] is True
 
+        global_review = client.get("/api/review-queue", params={"limit": 50})
+        assert global_review.status_code == 200
+        assert global_review.json()["total"] == 1
+        assert global_review.json()["items"][0]["id"] == "finding-a"
+        assert global_review.json()["items"][0]["task_name"] == "Task A"
+        assert global_review.json()["items"][0]["task_src_type"] == "edusrc"
+
+        global_stats = client.get("/api/review-queue/stats")
+        assert global_stats.status_code == 200
+        assert global_stats.json() == {"pending": 1}
+
+        filtered_global = client.get(
+            "/api/review-queue",
+            params={"download_status": "downloaded", "q": "Task A", "limit": 1},
+        )
+        assert filtered_global.status_code == 200
+        assert [item["id"] for item in filtered_global.json()["items"]] == ["finding-a"]
+
         client.post(
             "/api/tasks/task-a/findings/mark-downloaded",
             json={"finding_ids": ["finding-archived"]},

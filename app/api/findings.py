@@ -320,6 +320,69 @@ async def user_review_queue(task_id: str, search: Optional[str] = Query(None, al
     return [d for d in out if _matches_query(d, search)]
 
 
+@router.get("/review-queue/stats")
+async def global_review_queue_stats(session: AsyncSession = Depends(get_session)):
+    """所有任务的待人工复审数量。"""
+    total = await session.scalar(
+        select(func.count(Finding.id))
+        .join(Review, Review.finding_id == Finding.id)
+        .where(Review.verdict == "accepted", Review.user_status == "pending")
+    )
+    return {"pending": int(total or 0)}
+
+
+@router.get("/review-queue")
+async def global_review_queue(search: Optional[str] = Query(None, alias="q"),
+                              task_id: Optional[str] = None,
+                              download_status: Optional[str] = Query(None),
+                              limit: int = Query(50, ge=1, le=200),
+                              offset: int = Query(0, ge=0),
+                              session: AsyncSession = Depends(get_session)):
+    """跨任务汇总 AI 已采纳但尚未人工处理的复审项。"""
+    filters = [Review.verdict == "accepted", Review.user_status == "pending"]
+    q = (
+        select(Finding, Review, Task.name, Task.src_type)
+        .join(Review, Review.finding_id == Finding.id)
+        .join(Task, Task.id == Finding.task_id)
+    )
+    if task_id:
+        filters.append(Finding.task_id == task_id)
+    if download_status == "downloaded":
+        filters.append(Finding.markdown_downloaded_at.is_not(None))
+    elif download_status == "pending":
+        filters.append(Finding.markdown_downloaded_at.is_(None))
+    elif download_status:
+        raise HTTPException(400, "download_status 必须是 downloaded 或 pending")
+    q = q.where(*filters).order_by(Review.score.desc().nullslast(), Finding.created_at.desc())
+
+    def _to_dict(f, r, task_name, src_type):
+        item = _finding_dict(f, r, compact=True)
+        item.update({"task_name": task_name or f.task_id, "task_src_type": src_type or ""})
+        return item
+
+    if search and search.strip():
+        rows = (await session.execute(q)).all()
+        items = [_to_dict(f, r, task_name, src_type) for f, r, task_name, src_type in rows]
+        items = [item for item in items if _matches_query(item, search)]
+        total = len(items)
+        page = items[offset:offset + limit]
+    else:
+        total = int(await session.scalar(
+            select(func.count(Finding.id))
+            .join(Review, Review.finding_id == Finding.id)
+            .where(*filters)
+        ) or 0)
+        rows = (await session.execute(q.offset(offset).limit(limit))).all()
+        page = [_to_dict(f, r, task_name, src_type) for f, r, task_name, src_type in rows]
+    return {
+        "items": page,
+        "has_more": offset + limit < total,
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+    }
+
+
 @router.get("/tasks/{task_id}/submit-list")
 async def submit_list(task_id: str, submitted: Optional[bool] = None,
                       search: Optional[str] = Query(None, alias="q"),

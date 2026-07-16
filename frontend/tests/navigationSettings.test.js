@@ -9,12 +9,13 @@ import {
 
 const source = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 
-test("full and readonly roles receive the four primary navigation items", () => {
+test("full and readonly roles receive the five primary navigation items", () => {
   for (const role of ["full", "readonly"]) {
     assert.deepEqual(
       primaryNavigation(role).map(({ label, to }) => [label, to]),
       [
         ["任务", "/"],
+        ["复审", "/reviews"],
         ["疑似", "/missed-signals"],
         ["通杀", "/killsweeps"],
         ["设置", "/settings"],
@@ -30,6 +31,7 @@ test("observer navigation is limited to tasks and settings", () => {
   );
   assert.equal(canAccessRoute("observer", "/settings"), true);
   assert.equal(canAccessRoute("observer", "/missed-signals"), false);
+  assert.equal(canAccessRoute("observer", "/reviews"), false);
   assert.equal(canAccessRoute("observer", "/killsweeps"), false);
 });
 
@@ -37,16 +39,18 @@ test("only full access can open task creation while readonly can open operations
   assert.equal(canAccessRoute("full", "/create"), true);
   assert.equal(canAccessRoute("readonly", "/create"), false);
   assert.equal(canAccessRoute("readonly", "/missed-signals"), true);
+  assert.equal(canAccessRoute("readonly", "/reviews"), true);
   assert.equal(canAccessRoute("readonly", "/killsweeps"), true);
 });
 
-test("navigation only shows the failed killsweep badge", () => {
-  const items = primaryNavigation("full", { missedPending: 7, killsweepFailed: 3 });
+test("navigation shows review pending and failed killsweep badges", () => {
+  const items = primaryNavigation("full", { reviewPending: 9, missedPending: 7, killsweepFailed: 3 });
+  assert.equal(items.find((item) => item.id === "reviews")?.badge, 9);
   assert.equal(items.find((item) => item.id === "missed")?.badge, 0);
   assert.equal(items.find((item) => item.id === "killsweeps")?.badge, 3);
 });
 
-test("application shell renders one shared four-item nav model on desktop and mobile", () => {
+test("application shell renders one shared five-item nav model on desktop and mobile", () => {
   const app = source("../src/App.vue");
 
   assert.match(app, /primaryNavigation/);
@@ -105,6 +109,8 @@ test("frontend API exposes paginated task, missed-signal, and killsweep operatio
 
   assert.match(api, /terminalTargets:/);
   assert.match(api, /rawFindings:/);
+  assert.match(api, /globalReviewQueue:/);
+  assert.match(api, /globalReviewStats:/);
   assert.match(api, /missedSignalStats:/);
   assert.match(api, /missedSignals:/);
   assert.match(api, /missedSignalDraft:/);
