@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -10,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api import findings as findings_api
 from app.api import tasks as tasks_api
+from app.config import FofaKeyConfig
 from app.db.models import Base, Finding, Target, Task, TaskEvent
 from app.db.session import get_session
+from app.fofa.router import FofaKeyRouter
 
 
 @pytest.fixture
@@ -23,7 +26,19 @@ def operations_api(tmp_path):
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         async with session_maker() as session:
-            session.add(Task(id="task-ops", name="Operations", status="running"))
+            session.add(Task(
+                id="task-ops",
+                name="Operations",
+                status="running",
+                target_source="fofa",
+                engine="fofa",
+                fofa_config={
+                    "runtime_state": "rate_limited",
+                    "failure_kind": "rate_limit",
+                    "failure_count": 2,
+                    "cooldown_until": "2026-07-17T00:20:00Z",
+                },
+            ))
             session.add_all([
                 Target(
                     id="target-done", task_id="task-ops", url="https://done.example",
@@ -225,10 +240,182 @@ def test_start_task_reenables_search(
         return None
 
     monkeypatch.setattr(tasks_api.manager, "ensure_running", no_op)
+    retry = datetime(2026, 7, 17, 0, 20, tzinfo=timezone.utc)
+    global_router = FofaKeyRouter([
+        FofaKeyConfig(
+            name="Primary",
+            key="global-secret",
+            runtime_state="rate_limited",
+            failure_kind="rate_limit",
+            cooldown_until=retry,
+        )
+    ])
+    monkeypatch.setattr(
+        tasks_api,
+        "fofa_router_for_task",
+        lambda _task: global_router,
+        raising=False,
+    )
     started = operations_api.post("/api/tasks/task-ops/start")
 
     assert started.status_code == 200
     assert started.json()["search_enabled"] is True
+    assert started.json()["fofa_config"]["collector_phase"] == "initializing"
+    assert (
+        started.json()["fofa_config"]["collector_phase_text"]
+        == "正在初始化 FOFA 搜集引擎"
+    )
+    assert global_router.state_snapshot[0].cooldown_until == retry
+
+    async def persisted_config() -> dict:
+        async with operations_api._session_maker() as session:
+            task = await session.get(Task, "task-ops")
+            return dict(task.fofa_config or {})
+
+    config = asyncio.run(persisted_config())
+    assert config["collector_phase_payload"] == {}
+    assert "runtime_state" not in config
+    assert "cooldown_until" not in config
+
+
+def test_start_task_initializes_other_auto_engines_but_not_manual_or_site(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def seed_tasks() -> None:
+        async with operations_api._session_maker() as session:
+            session.add_all([
+                Task(
+                    id="task-quake",
+                    name="Quake",
+                    target_source="both",
+                    engine="quake",
+                    status="created",
+                ),
+                Task(
+                    id="task-manual",
+                    name="Manual",
+                    target_source="manual",
+                    engine="fofa",
+                    status="created",
+                ),
+                Task(
+                    id="task-site",
+                    name="Site",
+                    target_source="site",
+                    engine="fofa",
+                    status="created",
+                ),
+            ])
+            await session.commit()
+
+    asyncio.run(seed_tasks())
+
+    async def no_op(_task_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(tasks_api.manager, "ensure_running", no_op)
+    monkeypatch.setattr(
+        tasks_api,
+        "fofa_router_for_task",
+        lambda _task: (_ for _ in ()).throw(
+            AssertionError("非 FOFA 引擎不得访问 FOFA Router")
+        ),
+        raising=False,
+    )
+
+    quake = operations_api.post("/api/tasks/task-quake/start")
+    manual = operations_api.post("/api/tasks/task-manual/start")
+    site = operations_api.post("/api/tasks/task-site/start")
+
+    assert quake.status_code == 200
+    assert quake.json()["fofa_config"]["collector_phase"] == "initializing"
+    assert (
+        quake.json()["fofa_config"]["collector_phase_text"]
+        == "正在初始化 quake 搜集引擎"
+    )
+    assert manual.status_code == 200
+    assert "collector_phase" not in manual.json()["fofa_config"] or not manual.json()[
+        "fofa_config"
+    ]["collector_phase"]
+    assert site.status_code == 200
+    assert "collector_phase" not in site.json()["fofa_config"] or not site.json()[
+        "fofa_config"
+    ]["collector_phase"]
+
+
+def test_task_response_merges_credential_free_fofa_runtime_summary(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = FofaKeyRouter(
+        [
+            FofaKeyConfig(name="Primary", key="secret-primary"),
+            FofaKeyConfig(name="Disabled", key="secret-disabled", enabled=False),
+        ],
+        active_name="Primary",
+    )
+    monkeypatch.setattr(
+        tasks_api, "fofa_router_for_task", lambda _task: router, raising=False
+    )
+
+    response = operations_api.get("/api/tasks/task-ops")
+
+    assert response.status_code == 200
+    config = response.json()["fofa_config"]
+    assert config["key_source"] == "global_pool"
+    assert config["active_key_name"] == "Primary"
+    assert config["pool_available"] == 1
+    assert config["pool_total"] == 2
+    assert "secret-primary" not in response.text
+    assert "secret-disabled" not in response.text
+
+
+def test_observer_task_response_hides_fofa_names_counts_and_credentials(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTOHUNTER_OBSERVER_TOKEN", "observer-token")
+
+    async def set_runtime_config() -> None:
+        async with operations_api._session_maker() as session:
+            task = await session.get(Task, "task-ops")
+            task.fofa_config = {
+                "key": "observer-secret",
+                "last_key_name": "Observer Hidden Key",
+                "pool_available": 1,
+                "pool_total": 2,
+                "pool_state": "cooling",
+                "collector_phase": "querying",
+                "collector_phase_text": "正在使用 Observer Hidden Key",
+            }
+            await session.commit()
+
+    asyncio.run(set_runtime_config())
+    monkeypatch.setattr(
+        tasks_api,
+        "fofa_router_for_task",
+        lambda _task: (_ for _ in ()).throw(
+            AssertionError("observer 快照不得访问 FOFA Router")
+        ),
+        raising=False,
+    )
+
+    response = operations_api.get(
+        "/api/tasks/task-ops",
+        headers={"x-autohunter-token": "observer-token"},
+    )
+
+    assert response.status_code == 200
+    config = response.json()["fofa_config"]
+    assert config["pool_state"] == "cooling"
+    assert config["collector_phase"] == "querying"
+    assert "active_key_name" not in config
+    assert "last_key_name" not in config
+    assert "pool_available" not in config
+    assert "pool_total" not in config
+    assert "observer-secret" not in response.text
+    assert "Observer Hidden Key" not in response.text
 
 
 def test_running_task_rejects_src_type_switch_but_paused_task_allows_it(

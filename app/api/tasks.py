@@ -16,12 +16,14 @@ from app.db.models import (
     RawEvidence, RawEvidenceChunk, Review, Target, Task, TaskEvent, to_cst_iso,
 )
 from app.db.session import get_session
+from app.fofa.runtime import public_runtime_summary
 from app.llm.usage import usage_snapshot
 from app.orchestrator import manager
 from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import CaptureCleanupError, cleanup_evidence_spool
 from app.security import resolve_role, token_from_headers
 from app.settings_service import (
+    fofa_router_for_task,
     is_masked_secret,
     resolve_engine_config,
     resolve_llm_config,
@@ -73,12 +75,18 @@ def _observer_model_config() -> dict:
     }
 
 
-def _observer_fofa_config() -> dict:
+def _observer_fofa_config(task: Task | None = None) -> dict:
+    cfg = dict(task.fofa_config or {}) if task is not None else {}
+    pool_state = str(cfg.get("pool_state") or "")
+    if pool_state not in {"ready", "cooling", "blocked"}:
+        pool_state = ""
     return {
         "max_pages": 0, "page_size": 0, "intent_mode": "",
         "site_recon_mode": site_collab.SITE_RECON_FULL,
         "key_set": False, "current_query": "", "cursor": 0,
-        "collector_phase": "", "collector_phase_text": "",
+        "pool_state": pool_state,
+        "collector_phase": str(cfg.get("collector_phase") or ""),
+        "collector_phase_text": "",
     }
 
 
@@ -205,7 +213,7 @@ def _patch_task_model_config(current: dict | None, patch: dict) -> dict:
 def _public_fofa_config(task: Task) -> dict:
     cfg = dict(task.fofa_config or {})
     eff = resolve_engine_config(task)
-    return {
+    result = {
         "engine": eff.get("engine", "fofa"),
         "base_url": eff["base_url"],
         "max_pages": eff["max_pages"],
@@ -221,6 +229,12 @@ def _public_fofa_config(task: Task) -> dict:
         "last_target_filter_evaluated": cfg.get("last_target_filter_evaluated", 0),
         "last_skipped_filter": cfg.get("last_skipped_filter", 0),
     }
+    if (
+        task.target_source in {"fofa", "both"}
+        and str(eff.get("engine") or "").casefold() == "fofa"
+    ):
+        result.update(public_runtime_summary(task, fofa_router_for_task(task)))
+    return result
 
 
 def _task_to_dto(t: Task, stats: TaskStats | None = None,
@@ -236,7 +250,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         src_rules="" if observer else (t.src_rules or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
         model_config_data=model_config,
-        fofa_config=_observer_fofa_config() if observer else _public_fofa_config(t),
+        fofa_config=_observer_fofa_config(t) if observer else _public_fofa_config(t),
         search_enabled=bool(t.search_enabled),
         engine_config={} if observer else {"engine": t.engine or ""},
         llm_usage={} if observer else usage_snapshot(t.id, model_config.get("model", "")),
@@ -700,7 +714,7 @@ async def task_board(task_id: str, request: Request, session: AsyncSession = Dep
         "task_status": task.status,
         "live_workers": live,
         "stats": stats.model_dump(),
-        "fofa_config": _observer_fofa_config() if observer else _public_fofa_config(task),
+        "fofa_config": _observer_fofa_config(task) if observer else _public_fofa_config(task),
         "model_config_data": _observer_model_config() if observer else _public_model_config(task),
         "llm_usage": {} if observer else usage_snapshot(task.id, resolve_llm_config(task).model),
         "events": events,
@@ -914,6 +928,16 @@ async def start_task(task_id: str, session: AsyncSession = Depends(get_session))
             "fofa_auth_fail_count", "last_fofa_error", "rate_limit_until",
         ):
             fc.pop(field, None)
+        task.fofa_config = fc
+    if task.target_source in {"fofa", "both"}:
+        fc = dict(task.fofa_config or {})
+        engine_name = str(resolve_engine_config(task).get("engine") or "fofa")
+        display_name = "FOFA" if engine_name.casefold() == "fofa" else engine_name
+        fc.update(
+            collector_phase="initializing",
+            collector_phase_text=f"正在初始化 {display_name} 搜集引擎",
+            collector_phase_payload={},
+        )
         task.fofa_config = fc
     await session.commit()
     await manager.ensure_running(task_id)
