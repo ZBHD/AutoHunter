@@ -26,6 +26,7 @@ from app.settings_service import (
     LLMProviderNotFoundError,
     LLMProviderOrderError,
     LLMProviderValidationError,
+    adopt_legacy_fofa_key,
     create_fofa_key,
     create_llm_provider,
     delete_fofa_key,
@@ -148,6 +149,16 @@ async def test_llm_provider(
 async def get_fofa_keys(session: AsyncSession = Depends(get_session)):
     try:
         return await list_fofa_keys(session, include_legacy=True)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.post("/fofa-keys/legacy/adopt")
+async def post_adopt_legacy_fofa_key(
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await adopt_legacy_fofa_key(session)
     except ValueError as exc:
         _raise_provider_http_error(exc)
 

@@ -294,6 +294,53 @@ def test_legacy_key_is_read_only_and_unknown_names_return_404(
     ).status_code == 404
 
 
+def test_legacy_key_can_be_adopted_then_managed_without_returning_after_delete(
+    fofa_key_api, monkeypatch
+) -> None:
+    client, session_maker = fofa_key_api
+    secret = "legacy-adopt-secret"
+    monkeypatch.setenv("FOFA_KEY", secret)
+    monkeypatch.setenv("FOFA_BASE_URL", "http://legacy.example/api.php")
+
+    adopted = client.post("/api/settings/fofa-keys/legacy/adopt")
+    assert adopted.status_code == 200, adopted.text
+    item = adopted.json()["fofa_keys"][0]
+    assert item["name"] == "Legacy Key"
+    assert item["source"] == "database"
+    assert item["read_only"] is False
+    assert item["base_url"] == "http://legacy.example/api.php"
+    assert secret not in adopted.text
+
+    edited = client.put(
+        "/api/settings/fofa-keys/Legacy%20Key",
+        json={"base_url": "https://managed.example/api.php"},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["fofa_keys"][0]["base_url"] == "https://managed.example/api.php"
+
+    deleted = client.delete("/api/settings/fofa-keys/Legacy%20Key")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"fofa_keys": []}
+    assert client.get("/api/settings/fofa-keys").json() == {"fofa_keys": []}
+    assert client.get("/api/settings").json()["fofa_keys"] == []
+    assert asyncio.run(_raw_keys(session_maker)) == []
+
+    async def healthy_provider(_provider):
+        return {
+            "ok": True,
+            "latency_ms": 1,
+            "model": "test",
+            "protocol": "openai_chat",
+            "error": "",
+        }
+
+    monkeypatch.setattr(settings_service, "probe_llm_provider", healthy_provider)
+    health = client.post("/api/settings/health-check")
+    assert health.status_code == 200, health.text
+    assert "fofa_result" not in health.json()
+    assert health.json()["fofa_results"] == []
+
+
 def test_malformed_stored_pool_rejects_reads_and_mutations_without_data_loss(
     fofa_key_api,
 ) -> None:

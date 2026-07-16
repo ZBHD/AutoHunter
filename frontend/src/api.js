@@ -142,7 +142,12 @@ async function req(method, url, body, retriedAuth = false, overrideToken = "") {
     opt.headers["Content-Type"] = "application/json";
     opt.body = JSON.stringify(body);
   }
-  const res = await fetch(base + url, opt);
+  let res;
+  try {
+    res = await fetch(base + url, opt);
+  } catch {
+    throw new Error("连接服务器失败，请检查服务状态或网络后重试");
+  }
   const text = await res.text();
   if (res.status === 401 && !retriedAuth) {
     const newToken = await openTokenModal("auth");
@@ -167,7 +172,12 @@ async function streamSSE(url, body, onEvent, retriedAuth = false) {
   const headers = { "Content-Type": "application/json" };
   const token = apiToken();
   if (token) headers["X-Autohunter-Token"] = token;
-  const res = await fetch(base + url, { method: "POST", headers, body: JSON.stringify(body) });
+  let res;
+  try {
+    res = await fetch(base + url, { method: "POST", headers, body: JSON.stringify(body) });
+  } catch {
+    throw new Error("连接服务器失败，请检查服务状态或网络后重试");
+  }
 
   if (res.status === 401 && !retriedAuth) {
     const newToken = await openTokenModal("auth");
@@ -263,6 +273,8 @@ export const api = {
   orderLlmProviders: (names) =>
     req("PUT", "/api/settings/llm-providers/order", { names }),
   listFofaKeys: () => req("GET", "/api/settings/fofa-keys"),
+  adoptLegacyFofaKey: () =>
+    req("POST", "/api/settings/fofa-keys/legacy/adopt"),
   createFofaKey: (data) => req("POST", "/api/settings/fofa-keys", data),
   updateFofaKey: (name, data) =>
     req("PUT", `/api/settings/fofa-keys/${encodeURIComponent(name)}`, data),

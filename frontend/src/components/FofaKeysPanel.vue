@@ -227,6 +227,28 @@ async function toggleKey(item) {
   }
 }
 
+async function adoptLegacy(item) {
+  if (!isLegacyFofaKey(item) || mutationBusy.value) return;
+  actionError.value = "";
+  markBusy(item.name, true);
+  mutationBusy.value = true;
+  try {
+    const response = await api.adoptLegacyFofaKey();
+    const adopted = fofaKeyList(response).find((candidate) => candidate.name === item.name);
+    applyKeys(response);
+    testResults.delete(item.name);
+    emit("mutated");
+    mutationBusy.value = false;
+    markBusy(item.name, false);
+    await openEditor(adopted || item);
+  } catch (error) {
+    actionError.value = errorMessage(error);
+  } finally {
+    markBusy(item.name, false);
+    mutationBusy.value = false;
+  }
+}
+
 async function testKey(item) {
   if (mutationBusy.value) return;
   actionError.value = "";
@@ -430,7 +452,10 @@ onUnmounted(() => {
                 </svg>
               </button>
             </template>
-            <span v-else class="provider-readonly">只读 · 使用一键检测</span>
+            <button v-else type="button" :disabled="mutationBusy || busyNames.has(item.name)"
+              @click="adoptLegacy(item)">
+              {{ busyNames.has(item.name) ? "接管中..." : "接管并编辑" }}
+            </button>
           </div>
         </article>
       </div>

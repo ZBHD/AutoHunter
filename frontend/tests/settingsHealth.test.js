@@ -133,6 +133,12 @@ test("frontend API exposes the fixed no-body health-check endpoint", () => {
   );
 });
 
+test("frontend API translates fetch transport failures into a clear Chinese message", () => {
+  const source = readFileSync(new URL("../src/api.js", import.meta.url), "utf8");
+
+  assert.match(source, /连接服务器失败，请检查服务状态或网络后重试/);
+});
+
 test("frontend API exposes FOFA key CRUD, ordering, and detection endpoints", () => {
   const source = readFileSync(new URL("../src/api.js", import.meta.url), "utf8");
 
@@ -168,6 +174,8 @@ test("FOFA key panel exposes health synchronization and all pool actions", () =>
   assert.match(source, /api\.deleteFofaKey\(/);
   assert.match(source, /api\.testFofaKey\(/);
   assert.match(source, /api\.orderFofaKeys\(/);
+  assert.match(source, /api\.adoptLegacyFofaKey\(/);
+  assert.match(source, /接管并编辑/);
   assert.match(source, /resolved_url/);
   assert.match(source, /endpoint_mode/);
   assert.match(source, /http_status/);

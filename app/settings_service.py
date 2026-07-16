@@ -360,6 +360,13 @@ def _resolve_legacy_fofa_base_url() -> str:
     return "https://fofa.info"
 
 
+def _legacy_fofa_is_suppressed(value: Any) -> bool:
+    """Return whether the old single-key fallback has been explicitly adopted."""
+    if isinstance(value, SystemSettings):
+        value = value.fofa
+    return isinstance(value, dict) and value.get("legacy_suppressed") is True
+
+
 def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
     """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
     if task is not None:
@@ -386,6 +393,9 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
             except (TypeError, ValidationError):
                 logger.error("忽略无法解析的缓存 FOFA Key: name=<invalid>")
         return keys
+
+    if _legacy_fofa_is_suppressed(_cache.get("fofa")):
+        return []
 
     fofa = dict(_cache.get("fofa") or {})
     engines = dict(_cache.get("engines") or {})
@@ -506,6 +516,8 @@ def resolve_engine_key(engine_name: str, task: Task | None = None) -> str:
     if engine_name == "fofa":
         fofa = effective["fofa"]
         if fofa.get("enabled") is False:
+            return ""
+        if not effective.get("fofa_keys") and _legacy_fofa_is_suppressed(fofa):
             return ""
         if fofa.get("key"):
             return str(fofa["key"])
@@ -793,7 +805,7 @@ def public_settings_view() -> dict[str, Any]:
             ]
         except FofaKeyValidationError:
             fofa_keys_view = []
-    else:
+    elif not _legacy_fofa_is_suppressed(fofa):
         legacy = resolve_fofa_keys()[0]
         fofa_keys_view = [
             _fofa_api_view(
@@ -1104,6 +1116,8 @@ async def list_fofa_keys(
         return _fofa_list_response(items, active_name=_active_fofa_name(row, items))
     if not include_legacy:
         return {"fofa_keys": []}
+    if _legacy_fofa_is_suppressed(row):
+        return {"fofa_keys": []}
     legacy = _legacy_fofa_key_from_row(row)
     return {
         "fofa_keys": [
@@ -1114,6 +1128,32 @@ async def list_fofa_keys(
             )
         ]
     }
+
+
+async def adopt_legacy_fofa_key(session: AsyncSession) -> dict[str, Any]:
+    """Copy the old single-key configuration into the managed FOFA pool."""
+    async with _provider_write_transaction(session) as row:
+        items = _stored_fofa_keys(row)
+        if items:
+            response = _fofa_list_response(
+                items, active_name=_active_fofa_name(row, items)
+            )
+            await session.rollback()
+            return response
+
+        legacy = _legacy_fofa_key_from_row(row)
+        if not legacy.key:
+            raise FofaKeyValidationError("旧配置没有可接管的 FOFA Key")
+        managed = _validated_fofa_key(_fofa_payload(legacy))
+        row.fofa_keys = [_fofa_payload(managed)]
+        fofa = dict(row.fofa or {})
+        fofa["legacy_suppressed"] = True
+        fofa["active_key_name"] = managed.name
+        row.fofa = fofa
+        await session.commit()
+        _publish_settings_cache(row)
+        _invalidate_fofa_router_cache()
+        return _fofa_list_response([managed], active_name=managed.name)
 
 
 def _reject_legacy_fofa_mutation(
@@ -1521,8 +1561,13 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
         for provider in providers
     }
     stored_fofa_keys = _stored_fofa_keys(row)
-    uses_legacy_fofa = not stored_fofa_keys
-    fofa_snapshots = stored_fofa_keys or [_legacy_fofa_key_from_row(row)]
+    uses_legacy_fofa = (
+        not stored_fofa_keys and not _legacy_fofa_is_suppressed(row)
+    )
+    fofa_snapshots = (
+        stored_fofa_keys
+        or ([_legacy_fofa_key_from_row(row)] if uses_legacy_fofa else [])
+    )
     fofa_fingerprints = {
         _fofa_name_key(item.name): _fofa_fingerprint(item)
         for item in fofa_snapshots

@@ -337,10 +337,10 @@ onUnmounted(() => {
               <small>Collector 默认资产搜集参数</small>
             </legend>
             <div class="settings-grid">
-              <label class="full">兼容回退端点
+              <label class="full">旧配置兼容端点
                 <input v-model="form.fofa_base_url" type="url" placeholder="https://fofa.info" />
               </label>
-              <p class="field-hint full">仅供旧单 Key 和旧任务回退；Key 池中的端点请在对应行单独设置。</p>
+              <p class="field-hint full">仅当 FOFA Key 池为空且未接管 Legacy Key 时，旧 .env 或历史设置使用此端点；Key 池中的 URL 以对应行设置为准。</p>
               <label>默认最大页数 <input v-model="form.max_pages" type="number" min="1" /></label>
               <label>每页条数 <input v-model="form.page_size" type="number" min="1" /></label>
               <label class="full">默认搜集方式
