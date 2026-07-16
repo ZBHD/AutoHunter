@@ -89,6 +89,7 @@ def operations_api(tmp_path):
     app.dependency_overrides[get_session] = override_session
 
     with TestClient(app) as client:
+        client._session_maker = session_maker
         yield client
 
     asyncio.run(engine.dispose())
@@ -228,6 +229,31 @@ def test_start_task_reenables_search(
 
     assert started.status_code == 200
     assert started.json()["search_enabled"] is True
+
+
+def test_running_task_rejects_src_type_switch_but_paused_task_allows_it(
+    operations_api: TestClient,
+) -> None:
+    running = operations_api.patch(
+        "/api/tasks/task-ops",
+        json={"src_type": "enterprise"},
+    )
+    assert running.status_code == 409
+    assert "暂停" in running.json()["detail"]
+
+    async def pause_task() -> None:
+        async with operations_api._session_maker() as session:
+            task = await session.get(Task, "task-ops")
+            task.status = "paused"
+            await session.commit()
+
+    asyncio.run(pause_task())
+    paused = operations_api.patch(
+        "/api/tasks/task-ops",
+        json={"src_type": "enterprise"},
+    )
+    assert paused.status_code == 200
+    assert paused.json()["src_type"] == "enterprise"
 
 
 def test_terminal_targets_are_paginated_and_include_finding_counts(

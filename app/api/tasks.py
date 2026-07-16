@@ -1,8 +1,6 @@
 """任务相关 API：创建 / 列表 / 详情 / 启停。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -463,6 +461,8 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
     if req.name is not None:
         task.name = req.name.strip() or task.name
     if req.src_type is not None:
+        if task.status == "running":
+            raise HTTPException(status_code=409, detail="运行中的任务需暂停后切换 SRC 模式")
         task.src_type = normalize_src_type(req.src_type)
     if req.vuln_types is not None:
         task.vuln_types = [v.strip() for v in req.vuln_types if str(v).strip()]
