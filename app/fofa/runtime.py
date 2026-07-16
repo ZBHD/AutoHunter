@@ -71,7 +71,7 @@ def public_runtime_summary(
         for item in cooling
         if item.cooldown_until is not None
     ]
-    return {
+    result = {
         "key_source": source,
         "active_key_name": (
             str(router.active_name or "") if source == "global_pool" else ""
@@ -86,3 +86,12 @@ def public_runtime_summary(
         "last_rotation": _public_rotation(cfg.get("last_rotation")),
         "cooldown_until": _iso(min(retry_values) if retry_values else None),
     }
+    # Collector markers are fixed, credential-free status values. Include
+    # them only while present so older snapshots retain their stable shape.
+    if "fofa_pool_summary" in cfg:
+        result["fofa_pool_summary"] = str(cfg.get("fofa_pool_summary") or "")[:200]
+    if "fofa_next_retry_at" in cfg:
+        result["fofa_next_retry_at"] = str(cfg.get("fofa_next_retry_at") or "")
+    if "fofa_pool_blocked" in cfg:
+        result["fofa_pool_blocked"] = bool(cfg.get("fofa_pool_blocked"))
+    return result

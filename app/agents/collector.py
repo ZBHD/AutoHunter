@@ -31,7 +31,7 @@ from app.engines import get_engine, EngineResult, QuakeRateLimitError
 from app.tools.leakcreds import query_leaked_creds
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.fofa.client import FofaError
-from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
+from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError, FofaRequestAttempt
 from app.settings_service import llm_router_for_task_optional, resolve_engine_config, resolve_skip_score_threshold
 
 _EDUSRC_ORG_FILTER = 'org="China Education and Research Network Center"'
@@ -488,6 +488,7 @@ async def _fofa_collect(
         if fofa_router is None:
             from app.settings_service import fofa_router_for_task
             fofa_router = fofa_router_for_task(task)
+        attempts: list[FofaRequestAttempt] = []
         try:
             res = await fofa_router.execute_async(
                 lambda routed_key, routed_base: engine.search(
@@ -496,7 +497,8 @@ async def _fofa_collect(
                     page=next_cursor,
                     page_size=size,
                     base_url=routed_base,
-                )
+                ),
+                on_attempt=attempts.append,
             )
         except FofaPoolExhaustedError as exc:
             retry_at = exc.next_retry_at
@@ -513,6 +515,7 @@ async def _fofa_collect(
                     fofa_error="pool_cooldown",
                     cursor=cursor,
                     next_retry_at=retry_iso,
+                    event_kind="fofa_pool_waiting",
                 )
             else:
                 cfg["fofa_pool_blocked"] = True
@@ -525,6 +528,7 @@ async def _fofa_collect(
                     "FOFA 凭据池暂无可用 Key，已暂停本轮",
                     fofa_error="pool_blocked",
                     cursor=cursor,
+                    event_kind="fofa_pool_blocked",
                 )
             return 0
         except FofaError as exc:
@@ -540,6 +544,39 @@ async def _fofa_collect(
                 cursor=cursor,
             )
             return 0
+        success_attempt = next(
+            (item for item in reversed(attempts) if getattr(item, "outcome", "") == "success"),
+            None,
+        )
+        if success_attempt is not None:
+            success_name = str(getattr(success_attempt, "key_name", "") or "")
+            if success_name:
+                cfg["last_key_name"] = success_name
+            failed_attempts = [
+                item for item in attempts
+                if item.outcome == "failed"
+                and item.failure_kind in {"auth", "rate_limit", "daily_limit"}
+            ]
+            if failed_attempts and success_name:
+                failed_attempt = failed_attempts[-1]
+                from_name = failed_attempt.key_name
+                reason = failed_attempt.failure_kind
+                if from_name and reason:
+                    cfg["last_rotation"] = {
+                        "from_key_name": from_name,
+                        "to_key_name": success_name,
+                        "reason": reason,
+                    }
+                    await report(
+                        "querying",
+                        f"已切换到备用 Key：{success_name}",
+                        event_kind="fofa_key_rotated",
+                        from_key_name=from_name,
+                        to_key_name=success_name,
+                        reason=reason,
+                    )
+            elif not failed_attempts:
+                cfg.pop("last_rotation", None)
         cfg.pop("fofa_next_retry_at", None)
         cfg.pop("fofa_pool_blocked", None)
         cfg.pop("fofa_pool_summary", None)

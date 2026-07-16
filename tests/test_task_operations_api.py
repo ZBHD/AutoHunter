@@ -127,6 +127,9 @@ def test_task_response_exposes_search_enabled(operations_api: TestClient) -> Non
 def test_search_stream_marks_stop_and_drain_events_as_important() -> None:
     assert tasks_api._stream_event_visible("search_stopped", "info") is True
     assert tasks_api._stream_event_visible("search_drained", "info") is True
+    assert tasks_api._stream_event_visible("fofa_key_rotated", "info") is True
+    assert tasks_api._stream_event_visible("fofa_pool_waiting", "info") is True
+    assert tasks_api._stream_event_visible("fofa_pool_blocked", "info") is True
 
 
 def test_stop_search_is_atomic_for_concurrent_sessions(
@@ -416,6 +419,65 @@ def test_observer_task_response_hides_fofa_names_counts_and_credentials(
     assert "pool_total" not in config
     assert "observer-secret" not in response.text
     assert "Observer Hidden Key" not in response.text
+
+
+def test_board_exposes_safe_fofa_runtime_markers_without_event_payload_secrets(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry = datetime(2026, 7, 17, 0, 20, tzinfo=timezone.utc)
+    router = FofaKeyRouter(
+        [
+            FofaKeyConfig(
+                name="Primary",
+                key="board-secret",
+                runtime_state="rate_limited",
+                failure_kind="rate_limit",
+                cooldown_until=retry,
+            )
+        ],
+        active_name="Primary",
+    )
+    monkeypatch.setattr(
+        tasks_api, "fofa_router_for_task", lambda _task: router, raising=False
+    )
+
+    async def seed_runtime() -> None:
+        async with operations_api._session_maker() as session:
+            task = await session.get(Task, "task-ops")
+            task.fofa_config = {
+                "collector_phase": "fofa_cooldown",
+                "collector_phase_text": "FOFA 凭据池处于冷却期",
+                "fofa_pool_summary": "FOFA 凭据池暂不可用，等待冷却后重试",
+                "fofa_next_retry_at": "2026-07-17T00:20:00Z",
+                "last_key_name": "Primary",
+            }
+            session.add(TaskEvent(
+                task_id="task-ops",
+                agent="collector",
+                kind="fofa_pool_waiting",
+                level="info",
+                message="FOFA 凭据池处于冷却期",
+                payload={"key": "event-secret", "base_url": "https://secret.example"},
+            ))
+            await session.commit()
+
+    asyncio.run(seed_runtime())
+    response = operations_api.get("/api/tasks/task-ops/board")
+
+    assert response.status_code == 200
+    config = response.json()["fofa_config"]
+    assert config["collector_phase"] == "fofa_cooldown"
+    assert config["pool_state"] == "cooling"
+    assert config["fofa_pool_summary"] == "FOFA 凭据池暂不可用，等待冷却后重试"
+    assert config["fofa_next_retry_at"] == "2026-07-17T00:20:00Z"
+    assert any(
+        event["kind"] == "fofa_pool_waiting"
+        for event in response.json()["events"]
+    )
+    assert "board-secret" not in response.text
+    assert "event-secret" not in response.text
+    assert "secret.example" not in response.text
 
 
 def test_running_task_rejects_src_type_switch_but_paused_task_allows_it(

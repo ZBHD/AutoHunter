@@ -42,6 +42,7 @@ _TASK_LLM_PROVIDER_FIELDS = (
 _STREAM_NOISE_KINDS = frozenset({"refill", "cluster_cooldown_skip", "skip", "ping"})
 _STREAM_IMPORTANT_KINDS = frozenset({
     "collector_phase",
+    "fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked",
     "target_done", "target_requeued", "timeout", "auto_deepen", "salvage",
     "coverage_reported", "site_followups_spawned",
     "review_done", "review_deferred", "review_cancelled",
