@@ -572,11 +572,6 @@ class FofaKeyRouter(Generic[T]):
                 have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
-                attempt = FofaRequestAttempt(
-                    key_name=candidate.name,
-                    outcome="failed",
-                    failure_kind=kind.value,
-                )
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
                     transient_error = self._safe_error(error, kind)
@@ -584,7 +579,16 @@ class FofaKeyRouter(Generic[T]):
                     retry_after = error.retry_after if isinstance(error, FofaError) else None
                     self._mark_failure(candidate, kind, retry_after)
                     pool_failure = self._pool_failure(candidate, error, kind)
-                self._notify_attempt(on_attempt, attempt, self._redact)
+                if on_attempt is not None:
+                    self._notify_attempt(
+                        on_attempt,
+                        FofaRequestAttempt(
+                            key_name=candidate.name,
+                            outcome="failed",
+                            failure_kind=kind.value,
+                        ),
+                        self._redact,
+                    )
             if transient_error is not None:
                 raise transient_error from None
             if pool_failure is not None:
@@ -592,11 +596,12 @@ class FofaKeyRouter(Generic[T]):
                 continue
             if have_result:
                 self._mark_success(candidate)
-                self._notify_attempt(
-                    on_attempt,
-                    FofaRequestAttempt(key_name=candidate.name, outcome="success"),
-                    self._redact,
-                )
+                if on_attempt is not None:
+                    self._notify_attempt(
+                        on_attempt,
+                        FofaRequestAttempt(key_name=candidate.name, outcome="success"),
+                        self._redact,
+                    )
                 return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 
@@ -618,11 +623,6 @@ class FofaKeyRouter(Generic[T]):
                 have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
-                attempt = FofaRequestAttempt(
-                    key_name=candidate.name,
-                    outcome="failed",
-                    failure_kind=kind.value,
-                )
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
                     transient_error = self._safe_error(error, kind)
@@ -630,7 +630,16 @@ class FofaKeyRouter(Generic[T]):
                     retry_after = error.retry_after if isinstance(error, FofaError) else None
                     self._mark_failure(candidate, kind, retry_after)
                     pool_failure = self._pool_failure(candidate, error, kind)
-                self._notify_attempt(on_attempt, attempt, self._redact)
+                if on_attempt is not None:
+                    self._notify_attempt(
+                        on_attempt,
+                        FofaRequestAttempt(
+                            key_name=candidate.name,
+                            outcome="failed",
+                            failure_kind=kind.value,
+                        ),
+                        self._redact,
+                    )
             if transient_error is not None:
                 raise transient_error from None
             if pool_failure is not None:
@@ -638,11 +647,12 @@ class FofaKeyRouter(Generic[T]):
                 continue
             if have_result:
                 self._mark_success(candidate)
-                self._notify_attempt(
-                    on_attempt,
-                    FofaRequestAttempt(key_name=candidate.name, outcome="success"),
-                    self._redact,
-                )
+                if on_attempt is not None:
+                    self._notify_attempt(
+                        on_attempt,
+                        FofaRequestAttempt(key_name=candidate.name, outcome="success"),
+                        self._redact,
+                    )
                 return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+import app.fofa.router as fofa_router
 from app.config import FofaKeyConfig
 from app.fofa.client import FofaError
 from app.fofa.router import (
@@ -196,6 +197,22 @@ def test_async_attempt_callback_reports_failed_then_success() -> None:
     ]
 
 
+def test_sync_daily_limit_attempt_callback_reports_failed_then_success() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
+
+    def operation(secret: str, _base_url: str) -> str:
+        if secret == "key-a":
+            raise FofaError("daily limit", kind="daily_limit")
+        return "ok"
+
+    assert router.execute_sync(operation, on_attempt=attempts.append) == "ok"
+    assert attempts == [
+        FofaRequestAttempt(key_name="A", outcome="failed", failure_kind="daily_limit"),
+        FofaRequestAttempt(key_name="B", outcome="success"),
+    ]
+
+
 def test_attempt_callback_reports_transient_before_error_and_does_not_rotate() -> None:
     attempts: list[FofaRequestAttempt] = []
     router = FofaKeyRouter([key("A", "secret-a"), key("B", "secret-b")], active_name="A")
@@ -238,6 +255,24 @@ def test_execute_without_attempt_callback_keeps_legacy_calls() -> None:
         return await router.execute_async(lambda *_: _async_value("async"))
 
     assert asyncio.run(scenario()) == "async"
+
+
+def test_execute_without_attempt_callback_does_not_allocate_attempt_metadata(monkeypatch) -> None:
+    allocations = 0
+
+    def spy(*_args, **_kwargs):
+        nonlocal allocations
+        allocations += 1
+        return object()
+
+    monkeypatch.setattr(fofa_router, "FofaRequestAttempt", spy)
+    router = FofaKeyRouter([key("A", "key-a")])
+    assert router.execute_sync(lambda *_: "ok") == "ok"
+    with pytest.raises(FofaPoolExhaustedError):
+        router.execute_sync(
+            lambda *_: (_ for _ in ()).throw(FofaError("invalid", kind="auth"))
+        )
+    assert allocations == 0
 
 
 def test_request_attempt_is_immutable() -> None:
