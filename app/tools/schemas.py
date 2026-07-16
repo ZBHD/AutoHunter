@@ -7,7 +7,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from app.tools.src_toolkit import ENTERPRISE_BLOCKED_SRC_TOOLS
+from app.tools.src_toolkit import (
+    DEFAULT_ROUTE_TOOL_SEQUENCE,
+    ENTERPRISE_BLOCKED_SRC_TOOLS,
+    ROUTE_TOOL_SEQUENCES,
+    SRC_TOOL_CATALOG,
+)
 
 TOOL_SCHEMAS = [
     {
@@ -863,6 +868,14 @@ ENTERPRISE_SESSION_TOOL_SCHEMAS = SESSION_TOOL_SCHEMAS
 REVIEWER_TOOL_SCHEMAS = _compact_descriptions(REVIEWER_TOOL_SCHEMAS)
 KILLSWEEP_TOOL_SCHEMAS = _compact_descriptions(KILLSWEEP_TOOL_SCHEMAS)
 ESCALATE_TOOL_SCHEMAS = _compact_descriptions(ESCALATE_TOOL_SCHEMAS)
+ESCALATE_TOOL_SCHEMAS = [
+    schema
+    for schema in ESCALATE_TOOL_SCHEMAS
+    if (
+        schema.get("function", {}).get("name") not in SRC_TOOL_CATALOG
+        or "escalate" in SRC_TOOL_CATALOG[schema["function"]["name"]].roles
+    )
+]
 COLLECTOR_QUERY_SCHEMAS = _compact_descriptions(COLLECTOR_QUERY_SCHEMAS)
 COLLECTOR_EDU_SCHEMAS = _compact_descriptions(COLLECTOR_EDU_SCHEMAS)
 
@@ -880,7 +893,178 @@ def _enterprise_schema_copy(schema: dict) -> dict:
     return copied
 
 
-def worker_tool_schemas(enterprise: bool = False, include_js: bool = False) -> list[dict]:
+def _enterprise_tool_allowed(name: str) -> bool:
+    spec = SRC_TOOL_CATALOG.get(name)
+    return (
+        name not in ENTERPRISE_BLOCKED_SRC_TOOLS
+        and (spec is None or spec.enterprise_allowed)
+    )
+
+
+ALWAYS_VISIBLE_TOOLS = frozenset({
+    "http_request",
+    "run_shell",
+    "decode_transform",
+    "session_set",
+    "check_duplicate_finding",
+    "submit_finding",
+    "report_intel",
+    "report_coverage",
+    "finish",
+    "submit_escalation",
+    "abandon_escalation",
+})
+
+WORKFLOW_TOOL_STAGES: dict[str, frozenset[str]] = {
+    "recon": frozenset({
+        "probe_http",
+        "fingerprint_waf",
+        "scan_web_ports",
+        "fofa_lookup",
+        "extract_http_surface",
+        "analyze_api_schema",
+        "analyze_javascript",
+    }),
+    "locate": frozenset({
+        "crawl_endpoints",
+        "discover_content",
+        "discover_parameters",
+        "analyze_javascript",
+        "extract_http_surface",
+        "analyze_api_schema",
+        "analyze_auth_material",
+    }),
+    "verify": frozenset({
+        "compare_http_responses",
+        "analyze_api_schema",
+        "extract_http_surface",
+        "analyze_auth_material",
+        "suggest_waf_bypass",
+        "scan_nuclei",
+        "verify_xss",
+    }),
+    "evidence": frozenset({
+        "compare_http_responses",
+        "analyze_api_schema",
+        "extract_http_surface",
+        "analyze_auth_material",
+    }),
+}
+
+
+def _deduplicated_schemas(*groups: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    seen: set[str] = set()
+    for schema in (item for group in groups for item in group):
+        name = _schema_name(schema)
+        if name and name not in seen:
+            seen.add(name)
+            result.append(schema)
+    return result
+
+
+def _schemas_for_role(role: str, *, include_js: bool) -> list[dict]:
+    if role == "worker":
+        groups = [TOOL_SCHEMAS, SESSION_TOOL_SCHEMAS]
+        if include_js:
+            groups.append(JS_ANALYZER_TOOL_SCHEMAS)
+        return _deduplicated_schemas(*groups)
+    if role == "escalate":
+        return _deduplicated_schemas(ESCALATE_TOOL_SCHEMAS, SESSION_TOOL_SCHEMAS)
+    return []
+
+
+def _allowed_tool_names(
+    stage: str,
+    role: str,
+    *,
+    enterprise: bool,
+    route_id: str,
+    include_js: bool,
+) -> set[str]:
+    if stage not in WORKFLOW_TOOL_STAGES:
+        return set()
+    if role == "escalate" and stage not in {"verify", "evidence"}:
+        return set()
+
+    visible = set(ALWAYS_VISIBLE_TOOLS) | set(WORKFLOW_TOOL_STAGES[stage])
+    if role == "escalate":
+        visible.discard("check_duplicate_finding")
+        visible.discard("submit_finding")
+        visible.discard("report_intel")
+        visible.discard("report_coverage")
+        visible.discard("finish")
+
+    if role == "worker" and stage == "locate":
+        sequence = ROUTE_TOOL_SEQUENCES.get(route_id, DEFAULT_ROUTE_TOOL_SEQUENCE)
+        route_names = set(sequence)
+        visible = {
+            name for name in visible
+            if name not in SRC_TOOL_CATALOG or name in route_names
+        }
+        if route_id in ROUTE_TOOL_SEQUENCES:
+            visible = {
+                name for name in visible
+                if name not in SRC_TOOL_CATALOG
+                or not SRC_TOOL_CATALOG[name].routes
+                or route_id in SRC_TOOL_CATALOG[name].routes
+            }
+
+    allowed: set[str] = set()
+    for schema in _schemas_for_role(role, include_js=include_js):
+        name = _schema_name(schema)
+        if name not in visible:
+            continue
+        spec = SRC_TOOL_CATALOG.get(name)
+        if spec is not None:
+            if role not in spec.roles:
+                continue
+            if enterprise and not spec.enterprise_allowed:
+                continue
+        if enterprise and name in ENTERPRISE_BLOCKED_SRC_TOOLS:
+            continue
+        allowed.add(name)
+    return allowed
+
+
+def tool_schemas_for(
+    stage: str,
+    role: str,
+    *,
+    enterprise: bool = False,
+    route_id: str = "",
+    include_js: bool = False,
+) -> list[dict]:
+    """Return unique schemas admitted by stage, role, route and SRC policy."""
+
+    schemas = _schemas_for_role(role, include_js=include_js)
+    names = _allowed_tool_names(
+        str(stage or "").strip().lower(),
+        str(role or "").strip().lower(),
+        enterprise=enterprise,
+        route_id=str(route_id or "").strip(),
+        include_js=include_js,
+    )
+    selected = [schema for schema in schemas if _schema_name(schema) in names]
+    if enterprise:
+        return [_enterprise_schema_copy(schema) for schema in selected]
+    return selected
+
+
+def worker_tool_schemas(
+    enterprise: bool = False,
+    include_js: bool = False,
+    stage: str = "",
+    route_id: str = "",
+) -> list[dict]:
+    if stage:
+        return tool_schemas_for(
+            stage,
+            "worker",
+            enterprise=enterprise,
+            route_id=route_id,
+            include_js=include_js,
+        )
     schemas = list(TOOL_SCHEMAS) + list(SESSION_TOOL_SCHEMAS)
     if include_js:
         schemas += list(JS_ANALYZER_TOOL_SCHEMAS)
@@ -889,19 +1073,19 @@ def worker_tool_schemas(enterprise: bool = False, include_js: bool = False) -> l
     return [
         _enterprise_schema_copy(schema)
         for schema in schemas
-        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
+        if _enterprise_tool_allowed(_schema_name(schema))
     ]
 
 
-def escalate_tool_schemas(enterprise: bool = False) -> list[dict]:
-    schemas = list(ESCALATE_TOOL_SCHEMAS) + list(SESSION_TOOL_SCHEMAS)
-    if not enterprise:
-        return schemas
-    return [
-        _enterprise_schema_copy(schema)
-        for schema in schemas
-        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
-    ]
+def escalate_tool_schemas(
+    enterprise: bool = False,
+    stage: str = "verify",
+) -> list[dict]:
+    return tool_schemas_for(
+        stage,
+        "escalate",
+        enterprise=enterprise,
+    )
 
 
 def killsweep_tool_schemas(enterprise: bool = False) -> list[dict]:
@@ -912,5 +1096,5 @@ def killsweep_tool_schemas(enterprise: bool = False) -> list[dict]:
     return [
         _enterprise_schema_copy(schema)
         for schema in schemas
-        if _schema_name(schema) not in ENTERPRISE_BLOCKED_SRC_TOOLS
+        if _enterprise_tool_allowed(_schema_name(schema))
     ]

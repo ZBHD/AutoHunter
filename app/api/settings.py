@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dto import (
+    FofaKeyDTO,
+    FofaKeyOrderDTO,
+    FofaKeyUpdateDTO,
     LLMProtocol,
     LLMProviderDTO,
     LLMProviderOrderDTO,
@@ -14,21 +17,33 @@ from app.api.dto import (
 )
 from app.db.session import get_session
 from app.settings_service import (
+    FofaKeyConflictError,
+    FofaKeyNotFoundError,
+    FofaKeyOrderError,
+    FofaKeyReadOnlyError,
+    FofaKeyValidationError,
     LLMProviderConflictError,
     LLMProviderNotFoundError,
     LLMProviderOrderError,
     LLMProviderValidationError,
+    adopt_legacy_fofa_key,
+    create_fofa_key,
     create_llm_provider,
+    delete_fofa_key,
     delete_llm_provider,
     get_llm_provider,
     is_masked_secret,
+    list_fofa_keys,
     list_llm_providers,
     list_available_models,
     probe_llm_provider,
     public_settings_view,
     refresh_cache,
+    reorder_fofa_keys,
     reorder_llm_providers,
     run_settings_health_check,
+    test_fofa_key,
+    update_fofa_key,
     update_llm_provider,
     update_settings,
 )
@@ -51,13 +66,13 @@ async def check_settings_health(session: AsyncSession = Depends(get_session)):
 
 
 def _raise_provider_http_error(exc: ValueError) -> None:
-    if isinstance(exc, LLMProviderConflictError):
+    if isinstance(exc, (LLMProviderConflictError, FofaKeyConflictError)):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if isinstance(exc, LLMProviderNotFoundError):
+    if isinstance(exc, (LLMProviderNotFoundError, FofaKeyNotFoundError)):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if isinstance(exc, LLMProviderOrderError):
+    if isinstance(exc, (LLMProviderOrderError, FofaKeyOrderError, FofaKeyReadOnlyError)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if isinstance(exc, LLMProviderValidationError):
+    if isinstance(exc, (LLMProviderValidationError, FofaKeyValidationError)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     raise exc
 
@@ -130,6 +145,83 @@ async def test_llm_provider(
     return await probe_llm_provider(provider)
 
 
+@router.get("/fofa-keys")
+async def get_fofa_keys(session: AsyncSession = Depends(get_session)):
+    try:
+        return await list_fofa_keys(session, include_legacy=True)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.post("/fofa-keys/legacy/adopt")
+async def post_adopt_legacy_fofa_key(
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await adopt_legacy_fofa_key(session)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.post("/fofa-keys")
+async def post_fofa_key(
+    body: FofaKeyDTO,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await create_fofa_key(session, body.model_dump())
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+# Keep this static route before /{name} so "order" is never treated as a key name.
+@router.put("/fofa-keys/order")
+async def put_fofa_key_order(
+    body: FofaKeyOrderDTO,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await reorder_fofa_keys(session, body.names)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.put("/fofa-keys/{name}")
+async def put_fofa_key(
+    name: str,
+    body: FofaKeyUpdateDTO,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await update_fofa_key(
+            session, name, body.model_dump(exclude_unset=True)
+        )
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.delete("/fofa-keys/{name}")
+async def remove_fofa_key(
+    name: str,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await delete_fofa_key(session, name)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
+@router.post("/fofa-keys/{name}/test")
+async def probe_saved_fofa_key(
+    name: str,
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return await test_fofa_key(session, name)
+    except ValueError as exc:
+        _raise_provider_http_error(exc)
+
+
 class ModelsProbeRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
@@ -177,3 +269,9 @@ async def put_settings(
 ):
     payload = body.model_dump(exclude_unset=True)
     return await update_settings(session, payload)
+    create_fofa_key,
+    delete_fofa_key,
+    list_fofa_keys,
+    reorder_fofa_keys,
+    test_fofa_key,
+    update_fofa_key,

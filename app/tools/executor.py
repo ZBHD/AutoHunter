@@ -11,12 +11,15 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
 from copy import copy
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Optional
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -27,7 +30,12 @@ from app.tools.evidence import (
     analyze_api_schema as _analyze_api_schema,
     compare_http_responses as _compare_http_responses,
 )
-from app.tools.guard import CommandBlocked, check_command
+from app.tools.guard import (
+    ENTERPRISE_ALLOWED_PARSERS,
+    CommandBlocked,
+    check_command,
+    check_enterprise_command,
+)
 from app.tools.http_surface import extract_http_surface as _extract_http_surface
 from app.tools.js_analyzer import analyze_javascript as analyze_js_text
 from app.tools.js_analyzer import analyze_url as analyze_js_url
@@ -36,8 +44,19 @@ from app.tools.src_toolkit import (
     SRC_TOOL_NAMES,
     SrcToolError,
     build_src_plan,
+    parse_src_capture,
+    parse_src_output,
 )
 from app.tools.waf_advisor import suggest_waf_bypass as _suggest_waf_bypass
+from app.fofa import endpoints as fofa_endpoints
+from app.fofa.client import (
+    FofaError,
+    _FOFA_ALLOWED_HOSTS,
+    classify_fofa_failure,
+    extract_fofa_error,
+    extract_fofa_response_failure,
+)
+from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
 
 _FOFA_BASE = "https://fofa.info"
 # FOFA 只读查询硬上限：worker 用它确认归属/探攻击面，不是测绘，给小额度即可。
@@ -51,6 +70,20 @@ _SESSION_MAX_HEADERS = 30
 _WORKDIR_MAX_BYTES = int(os.environ.get("WORKER_WORKDIR_MAX_BYTES", str(50 * 1024 * 1024)))
 _SHELL_CAPTURE_MAX_BYTES = int(os.environ.get("WORKER_SHELL_CAPTURE_MAX_BYTES", str(512 * 1024)))
 _HTTP_MAX_BYTES = int(os.environ.get("WORKER_HTTP_MAX_BYTES", str(1024 * 1024)))
+_MAX_HTTP_REDIRECTS = 3
+
+
+def _scope_host(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    host = str(parsed.hostname or "").rstrip(".").lower()
+    # Test and local worker identifiers are not network scopes.  Real URL,
+    # dotted host, IPv4/IPv6 and localhost targets remain enforceable.
+    if not (parsed.scheme in {"http", "https"} or "." in host or ":" in host or host == "localhost"):
+        return ""
+    return host
 
 
 class _CaptureWriter:
@@ -185,6 +218,7 @@ class ToolExecutor:
         enterprise: bool = False,
         fofa_key: str = "",
         fofa_base_url: str = "",
+        fofa_router: FofaKeyRouter | None = None,
         capture_full: bool = False,
         scope_target: str = "",
     ):
@@ -195,6 +229,15 @@ class ToolExecutor:
         self.enterprise = enterprise
         self.fofa_key = fofa_key or ""
         self.fofa_base_url = (fofa_base_url or _FOFA_BASE).rstrip("/")
+        if fofa_router is not None:
+            self.fofa_router = fofa_router
+        elif self.fofa_key:
+            from app.config import FofaKeyConfig
+            self.fofa_router = FofaKeyRouter([
+                FofaKeyConfig(name="Legacy", key=self.fofa_key, base_url=self.fofa_base_url)
+            ], active_name="Legacy")
+        else:
+            self.fofa_router = None
         self.capture_full = bool(capture_full)
         # 每个目标独立工作目录
         safe_name = "".join(c if c.isalnum() else "_" for c in target)[:60]
@@ -244,6 +287,30 @@ class ToolExecutor:
         timeout = max(1, min(timeout, worker_config.shell_timeout_max))
         try:
             check_command(command, enterprise=self.enterprise)
+            if self.enterprise:
+                argv = check_enterprise_command(
+                    command,
+                    scope_target=self.scope_target,
+                    allowed_parsers=ENTERPRISE_ALLOWED_PARSERS,
+                )
+                process_argv = argv
+                process_env = None
+                if tuple(argv[:3]) == ("python", "-m", "app.tools.local_parsers"):
+                    process_argv = (sys.executable, *argv[1:])
+                    process_env = os.environ.copy()
+                    project_root = str(Path(__file__).resolve().parents[2])
+                    existing_pythonpath = process_env.get("PYTHONPATH", "")
+                    process_env["PYTHONPATH"] = os.pathsep.join(
+                        item for item in (project_root, existing_pythonpath) if item
+                    )
+                return self._run_process(
+                    process_argv,
+                    timeout=timeout,
+                    shell=False,
+                    capture_tool="run_shell",
+                    display_command=command,
+                    env=process_env,
+                )
         except CommandBlocked as e:
             return {"ok": False, "blocked": True, "error": str(e)}
 
@@ -257,12 +324,13 @@ class ToolExecutor:
 
     def _run_process(
         self,
-        command: str | list[str],
+        command: str | list[str] | tuple[str, ...],
         *,
         timeout: int,
         shell: bool,
         capture_tool: str,
         display_command: str,
+        env: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Run one bounded process, preserving the existing capture/cancel contract."""
         capture = self._new_capture(capture_tool)
@@ -286,6 +354,7 @@ class ToolExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # 独立进程组，便于超时整组 kill
+                env=env,
             )
             self._active_procs.add(proc)
             deadline = start + timeout
@@ -412,29 +481,79 @@ class ToolExecutor:
         """Execute one structured SRC tool plan without invoking a command shell."""
         name = str(tool or "").strip()
         if name not in SRC_TOOL_NAMES:
-            return {"ok": False, "kind": "arg_error", "error": f"未知 SRC 工具: {name}"}
+            return {
+                "ok": False,
+                "process_ok": False,
+                "parse_ok": False,
+                "failure_kind": "unknown_tool",
+                "kind": "arg_error",
+                "summary": {},
+                "tool": name,
+                "error": f"未知 SRC 工具: {name}",
+            }
         if self.enterprise and name in ENTERPRISE_BLOCKED_SRC_TOOLS:
             return {
                 "ok": False,
-                "blocked": True,
+                "process_ok": False,
+                "parse_ok": False,
+                "failure_kind": "enterprise_policy",
                 "kind": "enterprise_policy",
+                "summary": {},
+                "blocked": True,
                 "tool": name,
                 "error": "企业 SRC 模式禁止使用 Nuclei 类漏洞扫描工具；请改用已知入口的最小请求验证。",
             }
         try:
+            plan_args = self._src_args_with_session(name, dict(args or {}))
             plan = build_src_plan(
                 name,
-                self._src_args_with_session(name, dict(args or {})),
+                plan_args,
                 scope_target=self.scope_target,
             )
         except SrcToolError as exc:
             return {
                 "ok": False,
-                "blocked": bool(exc.blocked),
+                "process_ok": False,
+                "parse_ok": False,
+                "failure_kind": "scope" if exc.blocked else "arg",
                 "kind": "arg_error",
+                "summary": {},
+                "blocked": bool(exc.blocked),
                 "tool": name,
                 "error": str(exc),
             }
+
+        requested_follow_redirects = plan.follow_redirects
+        redirect_metadata: dict[str, Any] = {}
+        if name == "probe_http" and requested_follow_redirects:
+            redirect_result = self.http_request(
+                url=str(plan_args.get("url") or ""),
+                method="GET",
+                headers=_normalize_headers(plan_args.get("headers")),
+                follow_redirects=True,
+                timeout=max(3, min(int(plan_args.get("request_timeout") or 10), 30)),
+                body_preview_limit=512,
+                _capture_enabled=False,
+            )
+            for key in (
+                "redirect_chain",
+                "final_url",
+                "redirect_location",
+                "redirect_blocked",
+                "redirect_limit_reached",
+            ):
+                if key in redirect_result:
+                    redirect_metadata[key] = redirect_result[key]
+            final_url = str(redirect_result.get("final_url") or "")
+            if redirect_result.get("ok") and final_url and not redirect_result.get("redirect_blocked"):
+                redirected_args = dict(plan_args)
+                redirected_args["url"] = final_url
+                redirected_args["follow_redirects"] = False
+                plan = build_src_plan(
+                    name,
+                    redirected_args,
+                    scope_target=self.scope_target,
+                )
 
         for index, token in enumerate(plan.argv[:-1]):
             if token == "-w":
@@ -442,7 +561,11 @@ class ToolExecutor:
                 if not wordlist.is_file():
                     return {
                         "ok": False,
+                        "process_ok": False,
+                        "parse_ok": False,
+                        "failure_kind": "missing_resource",
                         "kind": "missing_resource",
+                        "summary": {},
                         "tool": name,
                         "error": f"内置字典不存在: {wordlist}",
                     }
@@ -451,8 +574,12 @@ class ToolExecutor:
         if not binary:
             return {
                 "ok": False,
-                "missing_tool": True,
+                "process_ok": False,
+                "parse_ok": False,
+                "failure_kind": "missing_binary",
                 "kind": "missing_tool",
+                "summary": {},
+                "missing_tool": True,
                 "tool": name,
                 "binary": plan.binary,
                 "error": f"SRC 工具 {plan.binary} 未安装；请重新构建包含安全工具层的镜像。",
@@ -463,8 +590,12 @@ class ToolExecutor:
         except CommandBlocked as exc:
             return {
                 "ok": False,
-                "blocked": True,
+                "process_ok": False,
+                "parse_ok": False,
+                "failure_kind": "command_policy",
                 "kind": "command_policy",
+                "summary": {},
+                "blocked": True,
                 "tool": name,
                 "error": str(exc),
             }
@@ -481,7 +612,46 @@ class ToolExecutor:
             "binary": plan.binary,
             "command": display_command,
             "guidance": plan.guidance,
+            "follow_redirects": requested_follow_redirects,
+            **redirect_metadata,
         })
+        process_ok = bool(result.get("ok"))
+        if bool(result.get("cancelled")):
+            process_failure = "cancelled"
+        elif bool(result.get("timed_out")):
+            process_failure = "timeout"
+        elif not process_ok:
+            process_failure = "nonzero_exit"
+        else:
+            process_failure = ""
+
+        capture = result.get("_capture")
+        if isinstance(capture, dict):
+            parsed = parse_src_capture(name, capture, self.scope_target)
+            capture_failure = (
+                "capture_unavailable" if parsed.failure_kind == "capture_unavailable" else ""
+            )
+        else:
+            parsed = parse_src_output(
+                name,
+                str(result.get("output") or ""),
+                self.scope_target,
+            )
+            parsed = replace(parsed, partial=True, remaining_unknown=True)
+            capture_failure = "capture_unavailable"
+
+        failure_kind = process_failure or capture_failure
+        if not failure_kind and not parsed.parse_ok:
+            failure_kind = parsed.failure_kind or "parse_error"
+        result.update(
+            {
+                "process_ok": process_ok,
+                "parse_ok": parsed.parse_ok,
+                "failure_kind": failure_kind,
+                "summary": asdict(parsed),
+                "ok": process_ok and parsed.parse_ok and not parsed.remaining_unknown,
+            }
+        )
         return result
 
     @staticmethod
@@ -530,6 +700,14 @@ class ToolExecutor:
             return None
         return log_file
 
+    def _enforce_scope_url(self, url: str) -> None:
+        expected = _scope_host(self.scope_target)
+        actual = _scope_host(url)
+        if not actual or (expected and actual != expected):
+            raise CommandBlocked(
+                f"HTTP URL 超出当前目标范围: {actual or '<invalid>'}"
+            )
+
     # ---- http_request ----
     def http_request(
         self,
@@ -541,30 +719,91 @@ class ToolExecutor:
         follow_redirects: bool = False,
         timeout: int = 20,
         body_preview_limit: Optional[int] = None,
+        _capture_enabled: bool = True,
     ) -> dict[str, Any]:
         # LLM 可能把 headers 传成非 dict 形态（list["K: V"] / "K: V\nK2: V2" / None），
         # 直接喂给 dict()/httpx 会抛 "dictionary update sequence element..." 崩掉整个 agent。
         # 这里统一规范化成 dict，容错所有 agent 的 http_request 调用。
         headers = _normalize_headers(headers)
+        try:
+            self._enforce_scope_url(url)
+        except CommandBlocked as exc:
+            return {
+                "ok": False,
+                "blocked": True,
+                "failure_kind": "scope",
+                "error": str(exc),
+                "url": url,
+            }
         # 会话保持：把已维持的 cookie/header 合并进本次请求（用户传的同名键优先）。
         merged_headers, session_applied = self._apply_session(headers, url)
 
-        capture = self._new_capture("http_request")
+        capture = self._new_capture("http_request") if _capture_enabled else None
         req: httpx.Request | None = None
+        initial_req: httpx.Request | None = None
         resp: httpx.Response | None = None
+        redirect_chain: list[str] = []
+        redirect_location = ""
+        redirect_blocked = False
+        redirect_limit_reached = False
+        current_url = url
+        current_method = method.upper()
+        current_data = data
+        current_json = json_body
         try:
             with httpx.Client(
                 verify=False,
-                follow_redirects=follow_redirects,
+                follow_redirects=False,
                 timeout=timeout,
                 cookies=self._session_cookie_jar,
             ) as client:
-                req = client.build_request(
-                    method.upper(), url, headers=merged_headers, content=data, json=json_body
-                )
-                if capture is not None:
-                    capture.write_channel("request", self._raw_request_bytes(req))
-                resp = client.send(req, stream=True)
+                for hop in range(_MAX_HTTP_REDIRECTS + 1):
+                    req = client.build_request(
+                        current_method,
+                        current_url,
+                        headers=merged_headers,
+                        content=current_data,
+                        json=current_json,
+                    )
+                    if initial_req is None:
+                        initial_req = req
+                    if capture is not None and hop == 0:
+                        capture.write_channel("request", self._raw_request_bytes(req))
+                    resp = client.send(req, stream=True)
+                    redirect_chain.append(
+                        f"{resp.status_code} {resp.request.method} {resp.request.url}"
+                    )
+                    location = resp.headers.get("location")
+                    next_url = str(urljoin(str(resp.url), location)) if location else ""
+                    location_in_scope = True
+                    if next_url:
+                        redirect_location = next_url
+                        try:
+                            self._enforce_scope_url(next_url)
+                        except CommandBlocked:
+                            redirect_blocked = True
+                            location_in_scope = False
+                    if not (
+                        follow_redirects
+                        and location
+                        and location_in_scope
+                        and resp.status_code in {301, 302, 303, 307, 308}
+                    ):
+                        break
+                    if hop >= _MAX_HTTP_REDIRECTS:
+                        redirect_limit_reached = True
+                        break
+                    client.cookies.extract_cookies(resp)
+                    status_code = resp.status_code
+                    resp.close()
+                    if status_code == 303 or (
+                        status_code in {301, 302}
+                        and current_method not in {"GET", "HEAD"}
+                    ):
+                        current_method = "GET"
+                        current_data = None
+                        current_json = None
+                    current_url = next_url
                 response_capture = capture.open_channel("response") if capture is not None else None
                 if response_capture is not None:
                     response_capture.write(self._raw_response_head(resp))
@@ -589,7 +828,7 @@ class ToolExecutor:
         # 原始请求行（取证/格式参考）。响应报文不再单独回传：状态码 + response_headers +
         # body 已结构化提供，raw_response 会与它们 100% 重复，是当轮就纯冗余的双份大文本。
         # 模型 submit_finding 时按 prompt 规范从 body 自行裁剪取证，不依赖这份 raw_response。
-        raw_req = self._raw_request(req, data, json_body)
+        raw_req = self._raw_request(initial_req or req, data, json_body)
 
         response_headers = dict(resp.headers)
         set_cookie_headers = resp.headers.get_list("set-cookie")
@@ -605,13 +844,15 @@ class ToolExecutor:
         }
         if set_cookie_headers:
             result["set_cookie_headers"] = set_cookie_headers
-        history = list(resp.history or [])
-        if history:
-            result["redirect_chain"] = [
-                f"{item.status_code} {item.request.method} {item.url}" for item in history
-            ] + [f"{resp.status_code} {resp.request.method} {resp.url}"]
-            result["redirect_chain"] = result["redirect_chain"][:12]
+        if len(redirect_chain) > 1 or redirect_location:
+            result["redirect_chain"] = redirect_chain[:12]
             result["final_url"] = str(resp.url)
+        if redirect_location:
+            result["redirect_location"] = redirect_location
+        if redirect_blocked:
+            result["redirect_blocked"] = True
+        if redirect_limit_reached:
+            result["redirect_limit_reached"] = True
         if session_applied:
             result["session_applied"] = session_applied
         if session_updated:
@@ -851,7 +1092,7 @@ class ToolExecutor:
         用途：① 确认目标归属（org/备案/证书）填准 owner；② 看同 IP/同域还开了
         哪些端口/服务，发现隐藏攻击面。只读查询，不对目标产生任何请求。
         """
-        if not self.fofa_key:
+        if self.fofa_router is None:
             return {"ok": False, "error": "未配置 FOFA key，无法查询。",
                     "guidance": "跳过测绘，直接用 http_request 验证归属（看证书/页脚/备案）。"}
         q = (query or "").strip()
@@ -861,22 +1102,73 @@ class ToolExecutor:
         safe_size = max(1, min(int(size or 10), _FOFA_LOOKUP_MAX_SIZE))
         import base64 as _b64
         params = {
-            "key": self.fofa_key,
             "qbase64": _b64.b64encode(q.encode("utf-8")).decode("ascii"),
             "fields": "host,ip,port,title,domain,org,protocol",
             "page": "1", "size": str(safe_size), "full": "false",
         }
+
+        def operation(key: str, base_url: str):
+            result = fofa_endpoints.request_sync(
+                key,
+                base_url,
+                purpose="search",
+                params=params,
+                timeout=25,
+                allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+            )
+            if result.category == "network":
+                message = str(result.error or "网络错误")
+                raise FofaError(message, kind="transient")
+            response = result.response
+            if response is None:
+                raise FofaError("FOFA 返回为空", kind="transient")
+            category = str(result.category or "")
+            if category in {"auth", "rate_limit", "daily_limit"}:
+                text = extract_fofa_response_failure(response)
+                kind, code, retry_after = classify_fofa_failure(
+                    text, status=getattr(response, "status_code", None)
+                )
+                raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+            if not 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
+                text = extract_fofa_response_failure(response)
+                kind, code, retry_after = classify_fofa_failure(
+                    text, status=getattr(response, "status_code", None)
+                )
+                raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+            try:
+                data = response.json()
+            except Exception:
+                raise FofaError("FOFA 返回非 JSON", kind="transient") from None
+            if not isinstance(data, dict):
+                raise FofaError("FOFA 返回格式异常", kind="transient")
+            if data.get("error"):
+                message, _display = extract_fofa_error(data, "FOFA 错误")
+                kind, code, retry_after = classify_fofa_failure(message)
+                raise FofaError(message, kind=kind, code=code, retry_after=retry_after)
+            return data
+
         try:
-            with httpx.Client(timeout=25) as client:
-                resp = client.get(f"{self.fofa_base_url}/api/v1/search/all", params=params)
-                data = resp.json()
-        except Exception as e:
-            return {"ok": False, "error": f"FOFA 调用失败: {type(e).__name__}: {e}",
+            data = self.fofa_router.execute_sync(operation)
+        except FofaPoolExhaustedError as exc:
+            retry_at = exc.next_retry_at.isoformat().replace("+00:00", "Z") if exc.next_retry_at else None
+            return {
+                "ok": False,
+                "kind": "pool_exhausted",
+                "error": "FOFA 凭据池暂不可用",
+                **({"next_retry_at": retry_at} if retry_at else {}),
+                "guidance": "FOFA 暂不可用，稍后重试。",
+            }
+        except FofaError as exc:
+            return {
+                "ok": False,
+                "kind": str(exc.kind or "transient"),
+                "error": "FOFA 请求失败",
+                **({"next_retry_after": exc.retry_after} if exc.retry_after is not None else {}),
+                "guidance": "FOFA 不可用，改用 http_request 直接验证归属。",
+            }
+        except Exception:
+            return {"ok": False, "kind": "transient", "error": "FOFA 调用失败",
                     "guidance": "FOFA 不可用，改用 http_request 直接验证归属。"}
-        if not isinstance(data, dict):
-            return {"ok": False, "error": "FOFA 返回格式异常"}
-        if data.get("error"):
-            return {"ok": False, "error": f"FOFA 错误: {data.get('errmsg', '')}"[:300]}
         def _cell(row: list, i: int) -> str:
             # FOFA 字段可能为 null/非字符串，统一转成安全字符串，杜绝 None[:n] 崩溃。
             return str(row[i]) if len(row) > i and row[i] is not None else ""

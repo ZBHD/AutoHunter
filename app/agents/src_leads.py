@@ -166,10 +166,10 @@ def _public_value(
         return _text(sanitized)
     if not parsed.netloc:
         if "?" not in raw:
-            path = _scrub_path_userinfo(_strip_bare_userinfo(raw.split("#", 1)[0]))
+            path = _strip_bare_userinfo(raw.split("#", 1)[0])
             return _text(path)
         path, query = raw.split("?", 1)
-        clean_path = _scrub_path_userinfo(_strip_bare_userinfo(path.split('#', 1)[0]))
+        clean_path = _strip_bare_userinfo(path.split('#', 1)[0])
         sanitized = f"{clean_path}?{_query_names(query)}"
         return _text(sanitized)
 
@@ -183,13 +183,17 @@ def _public_value(
     except ValueError:
         # A malformed port is discarded rather than exposing authority text.
         port = None
+        malformed_authority = True
+    else:
+        malformed_authority = False
     if not host:
         return _text(_fallback_public(raw))
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         host = f"{host}:{port}"
-    sanitized = urlunsplit((scheme, host, _scrub_path_userinfo(parsed.path), _query_names(parsed.query), ""))
+    path = _scrub_path_userinfo(parsed.path) if malformed_authority else parsed.path
+    sanitized = urlunsplit((scheme, host, path, _query_names(parsed.query), ""))
     return _text(sanitized)
 
 

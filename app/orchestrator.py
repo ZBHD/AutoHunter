@@ -62,9 +62,9 @@ from app.killsweep_service import (
 )
 from app.llm.router import LLMRouter
 from app.settings_service import (
+    fofa_router_for_task,
     llm_router_for_task,
-    resolve_fofa_base_url,
-    resolve_fofa_key,
+    resolve_engine_config,
     resolve_worker_prompt_version,
 )
 from app.schemas import Finding as FindingSchema
@@ -744,17 +744,29 @@ class TaskRunner:
             if self._stop.is_set():
                 return
 
-            # FOFA 账号连续无效达阈值 → 自动暂停任务，不再空转刷无效请求。
-            fofa_fail = int((task.fofa_config or {}).get("fofa_auth_fail_count", 0))
-            if FOFA_AUTH_FAIL_PAUSE_THRESHOLD and fofa_fail >= FOFA_AUTH_FAIL_PAUSE_THRESHOLD:
-                last_err = (task.fofa_config or {}).get("last_fofa_error", "")
-                reason = f"FOFA 账号连续 {fofa_fail} 次无效，已自动暂停任务，请检查/更换 FOFA key 后重新启动"
+            # 只有 Router 明确报告全凭据池为 terminal 才暂停任务；冷却和
+            # transient 状态由下一轮继续尝试，不触发控制面暂停。
+            fofa_cfg = task.fofa_config or {}
+            engine_name = str(resolve_engine_config(task).get("engine") or "")
+            if engine_name == "fofa" and fofa_cfg.get("fofa_pool_blocked"):
+                reason = str(fofa_cfg.get("fofa_pool_summary") or "FOFA 凭据池暂无可用 Key")
                 task.status = "paused"
                 await session.commit()
-                await self._log(session, "orchestrator", "auto_paused", f"{reason}（最后错误：{last_err}）",
-                                fofa_auth_fail=fofa_fail, fofa_error=last_err)
+                await self._log(session, "orchestrator", "auto_paused", reason,
+                                fofa_error="pool_blocked")
                 await self.pause(reason)
                 return
+            if engine_name != "fofa":
+                fofa_fail = int(fofa_cfg.get("fofa_auth_fail_count", 0))
+                if FOFA_AUTH_FAIL_PAUSE_THRESHOLD and fofa_fail >= FOFA_AUTH_FAIL_PAUSE_THRESHOLD:
+                    last_err = str(fofa_cfg.get("last_fofa_error") or "")
+                    reason = f"{engine_name or '搜索引擎'} 账号连续 {fofa_fail} 次无效，已自动暂停任务"
+                    task.status = "paused"
+                    await session.commit()
+                    await self._log(session, "orchestrator", "auto_paused", f"{reason}（最后错误：{last_err}）",
+                                    fofa_auth_fail=fofa_fail, fofa_error=last_err)
+                    await self.pause(reason)
+                    return
 
             if added:
                 fc = task.fofa_config or {}
@@ -1955,14 +1967,14 @@ class TaskRunner:
         hunt_direction = ""
         fofa_key = ""
         fofa_base_url = ""
+        fofa_router = None
         async with SessionLocal() as session:
             tgt = await session.get(Target, target_id)
             task_obj = await session.get(Task, task_id)
             if task_obj:
                 src_type = task_obj.src_type or "edusrc"
                 hunt_direction = (task_obj.hunt_direction or "").strip()
-                fofa_key = resolve_fofa_key(task_obj)
-                fofa_base_url = resolve_fofa_base_url(task_obj)
+                fofa_router = fofa_router_for_task(task_obj)
             if tgt:
                 tgt.status = "scanning"
                 self._live[target_id]["score"] = tgt.priority_score
@@ -2045,6 +2057,7 @@ class TaskRunner:
                             duplicate_history=duplicate_history,
                             cancel_event=cancel_event, src_type=src_type,
                             fofa_key=fofa_key, fofa_base_url=fofa_base_url,
+                            fofa_router=fofa_router,
                             prompt_version=prompt_version)
             worker_holder["worker"] = worker
             try:
@@ -3417,6 +3430,10 @@ class TaskRunner:
         from app.agents.killsweep import KillsweepHunter
 
         loop = asyncio.get_running_loop()
+        # Legacy raw credential arguments remain empty; the shared Router
+        # carries the credential/base URL pair into the worker thread.
+        fofa_key = ""
+        fofa_base_url = ""
         async with SessionLocal() as session:
             attempt = await claim_killsweep_attempt(session, attempt_id)
             if attempt is None:
@@ -3435,8 +3452,7 @@ class TaskRunner:
                 await session.commit()
                 return
             await session.commit()
-            fofa_key = resolve_fofa_key(task)
-            fofa_base_url = resolve_fofa_base_url(task)
+            fofa_router = fofa_router_for_task(task)
             src_type = (task.src_type or "edusrc")
             finding_dict = {
                 "id": finding.id,
@@ -3452,7 +3468,7 @@ class TaskRunner:
             origin_host = finding.target_url
             case_id = case.id
 
-        if not fofa_key:
+        if not any(snapshot.key_set and snapshot.enabled for snapshot in fofa_router.state_snapshot):
             await self._finalize_killsweep_failure(
                 attempt_id,
                 kind="missing_fofa",
@@ -3525,6 +3541,7 @@ class TaskRunner:
                 src_type=src_type,
                 cancel_event=cancel_event,
                 fofa_base_url=fofa_base_url,
+                fofa_router=fofa_router,
             )
             try:
                 return hunter.run().model_dump(mode="json")

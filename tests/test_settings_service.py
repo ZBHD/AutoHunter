@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.config import LLMProviderConfig
+from app.config import FofaKeyConfig, LLMProviderConfig
 from app.db.models import Base, SystemSettings, Task
 from app import settings_service
 
@@ -19,11 +20,12 @@ def restore_settings_cache():
     settings_service._cache = original
 
 
-def set_cache(*, providers=None, legacy=None, fofa=None, engines=None) -> None:
+def set_cache(*, providers=None, legacy=None, fofa=None, engines=None, fofa_keys=None) -> None:
     settings_service._cache = {
         "llm": legacy or {},
         "llm_providers": providers if providers is not None else [],
         "fofa": fofa or {},
+        "fofa_keys": fofa_keys if fofa_keys is not None else [],
         "engines": engines or {},
         "defaults": {},
         "updated_at": None,
@@ -40,6 +42,20 @@ def provider_dict(name: str, **overrides):
         "weight": 5,
         "protocol": "openai_chat",
         "enabled": True,
+    }
+    data.update(overrides)
+    return data
+
+
+def fofa_key_dict(name: str, key: str, **overrides):
+    data = {
+        "name": name,
+        "key": key,
+        "enabled": True,
+        "runtime_state": "ready",
+        "failure_kind": "",
+        "failure_count": 0,
+        "cooldown_until": None,
     }
     data.update(overrides)
     return data
@@ -136,6 +152,210 @@ def test_saved_fofa_settings_drive_runtime_resolution(monkeypatch) -> None:
         "page_size": 25,
         "intent_mode": "syntax",
     }
+
+
+def test_empty_fofa_pool_uses_legacy_key(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_KEY", "legacy-secret")
+    set_cache(fofa_keys=[], fofa={})
+
+    keys = settings_service.resolve_fofa_keys()
+
+    assert [(item.name, item.key) for item in keys] == [("Legacy Key", "legacy-secret")]
+
+
+def test_fofa_pool_preserves_per_key_base_urls() -> None:
+    set_cache(
+        fofa_keys=[
+            fofa_key_dict("Primary", "pool-secret", base_url="https://a.example/api"),
+            fofa_key_dict("Secondary", "pool-secret-2", base_url="http://b.example:8080"),
+        ]
+    )
+
+    keys = settings_service.resolve_fofa_keys()
+
+    assert [(item.name, item.base_url) for item in keys] == [
+        ("Primary", "https://a.example/api"),
+        ("Secondary", "http://b.example:8080"),
+    ]
+
+
+def test_task_override_uses_task_base_url() -> None:
+    set_cache(
+        fofa={"base_url": "https://global.example"},
+        fofa_keys=[fofa_key_dict("Primary", "pool-secret")],
+    )
+    task = make_task({})
+    task.fofa_config = {
+        "key": "task-secret",
+        "base_url": "http://task.example:8080/private/api",
+    }
+
+    keys = settings_service.resolve_fofa_keys(task)
+
+    assert [(item.name, item.key, item.base_url) for item in keys] == [
+        ("Task override", "task-secret", "http://task.example:8080/private/api")
+    ]
+
+
+def test_task_override_base_url_falls_back_to_legacy_base_url() -> None:
+    set_cache(
+        fofa={"base_url": "https://global.example"},
+        fofa_keys=[fofa_key_dict("Primary", "pool-secret")],
+    )
+    task = make_task({})
+    task.fofa_config = {"key": "task-secret"}
+
+    keys = settings_service.resolve_fofa_keys(task)
+
+    assert [(item.name, item.key, item.base_url) for item in keys] == [
+        ("Task override", "task-secret", "https://global.example")
+    ]
+
+
+def test_legacy_fofa_base_url_precedence(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_BASE_URL", "https://env.example/api")
+    set_cache(
+        fofa={"key": "legacy-secret", "base_url": "https://saved.example"},
+        engines={"fofa": {"base_url": "https://engine.example/api"}},
+    )
+
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://saved.example"
+
+    set_cache(fofa={"key": "legacy-secret"})
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://env.example/api"
+
+    monkeypatch.delenv("FOFA_BASE_URL", raising=False)
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://fofa.info"
+
+
+def test_legacy_fofa_base_url_environment_wins_old_engine_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_BASE_URL", "https://env.example/api")
+    set_cache(
+        fofa={"key": "legacy-secret"},
+        engines={"fofa": {"base_url": "https://engine.example/api"}},
+    )
+
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://env.example/api"
+
+
+def test_legacy_fofa_base_url_keeps_old_engine_compatibility_fallback(monkeypatch) -> None:
+    monkeypatch.delenv("FOFA_BASE_URL", raising=False)
+    set_cache(
+        fofa={"key": "legacy-secret"},
+        engines={"fofa": {"base_url": "https://engine.example/api"}},
+    )
+
+    assert settings_service.resolve_fofa_keys()[0].base_url == "https://engine.example/api"
+
+
+def test_fofa_legacy_resolution_prefers_saved_fofa_then_engine_then_environment(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_KEY", "env-secret")
+    set_cache(
+        fofa={"key": "saved-fofa-secret"},
+        engines={"fofa": {"key": "engine-secret"}},
+    )
+
+    keys = settings_service.resolve_fofa_keys()
+
+    assert [(item.name, item.key) for item in keys] == [("Legacy Key", "saved-fofa-secret")]
+
+    set_cache(fofa={}, engines={"fofa": {"key": "engine-secret"}})
+    assert settings_service.resolve_fofa_keys()[0].key == "engine-secret"
+
+
+def test_nonempty_fofa_pool_wins_over_legacy_key(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_KEY", "legacy-secret")
+    set_cache(fofa_keys=[fofa_key_dict("Primary", "pool-secret")])
+
+    keys = settings_service.resolve_fofa_keys()
+
+    assert [(item.name, item.key) for item in keys] == [("Primary", "pool-secret")]
+    assert keys[0].base_url == "https://fofa.info"
+
+
+def test_malformed_fofa_pool_log_does_not_expose_name_or_key(caplog) -> None:
+    secret = "secret-in-name-VERYSECRET"
+    set_cache(
+        fofa_keys=[
+            {
+                "name": f"prefix-{secret}-suffix",
+                "key": secret,
+            }
+        ]
+    )
+
+    with caplog.at_level(logging.ERROR, logger="autohunter.settings"):
+        assert settings_service.resolve_fofa_keys() == []
+
+    assert secret not in caplog.text
+    assert "name=<invalid>" in caplog.text
+
+
+def test_model_copy_update_is_revalidated_at_fofa_pool_boundary(caplog) -> None:
+    item = FofaKeyConfig(name="Primary", key="secret-a")
+    invalid = item.model_copy(update={"key": item.name})
+    set_cache(fofa_keys=[invalid])
+
+    with caplog.at_level(logging.ERROR, logger="autohunter.settings"):
+        assert settings_service.resolve_fofa_keys() == []
+
+    assert "Primary" not in caplog.text
+    assert "name=<invalid>" in caplog.text
+
+
+def test_nonempty_disabled_fofa_pool_does_not_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_KEY", "legacy-secret")
+    set_cache(fofa_keys=[fofa_key_dict("Disabled", "pool-secret", enabled=False)])
+
+    keys = settings_service.resolve_fofa_keys()
+
+    assert [(item.name, item.key) for item in keys] == [("Disabled", "pool-secret")]
+    assert keys[0].enabled is False
+
+
+def test_task_fofa_key_override_wins_over_global_pool() -> None:
+    set_cache(fofa_keys=[fofa_key_dict("Primary", "pool-secret")])
+    task = make_task({})
+    task.fofa_config = {"key": "task-secret"}
+
+    keys = settings_service.resolve_fofa_keys(task)
+
+    assert [(item.name, item.key) for item in keys] == [("Task override", "task-secret")]
+
+
+def test_fofa_key_cache_and_effective_settings_do_not_share_mutable_lists() -> None:
+    stored = [fofa_key_dict("Primary", "pool-secret", base_url="https://primary.example/api")]
+    set_cache(fofa_keys=stored)
+
+    effective = settings_service.effective_settings()
+    effective["fofa_keys"][0]["name"] = "Changed"
+    effective["fofa_keys"][0]["base_url"] = "https://changed.example"
+
+    assert settings_service._cache["fofa_keys"][0]["name"] == "Primary"
+    assert settings_service._cache["fofa_keys"][0]["base_url"] == "https://primary.example/api"
+
+
+def test_publish_settings_cache_deep_copies_fofa_key_pool() -> None:
+    stored = [fofa_key_dict("Primary", "pool-secret", base_url="https://primary.example/api")]
+    row = SystemSettings(id="global", fofa_keys=stored)
+
+    settings_service._publish_settings_cache(row)
+    stored[0]["name"] = "Changed"
+    row.fofa_keys[0]["key"] = "changed-secret"
+
+    assert settings_service._cache["fofa_keys"] == [
+        fofa_key_dict("Primary", "pool-secret", base_url="https://primary.example/api")
+    ]
+
+
+def test_public_view_does_not_expose_fofa_key_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("FOFA_KEY", "legacy-secret")
+    set_cache(fofa_keys=[fofa_key_dict("Primary", "pool-secret")])
+
+    public = settings_service.public_settings_view()
+
+    assert "pool-secret" not in repr(public)
+    assert "legacy-secret" not in repr(public)
 
 
 def test_disabled_global_fofa_keeps_task_specific_key_available() -> None:

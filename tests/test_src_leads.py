@@ -287,6 +287,36 @@ def test_parameter_identity_includes_endpoint_method_and_location() -> None:
     assert len({lead_key(base), lead_key(other_endpoint), lead_key(other_method), lead_key(other_location)}) == 4
 
 
+def test_email_like_paths_keep_distinct_lead_identity() -> None:
+    alice = _candidate(
+        endpoint_key="GET https://a.test/users/alice@example.com",
+        value="https://a.test/users/alice@example.com",
+    )
+    bob = _candidate(
+        endpoint_key="GET https://a.test/users/bob@example.com",
+        value="https://a.test/users/bob@example.com",
+    )
+
+    assert alice.endpoint_key == "GET https://a.test/users/alice@example.com"
+    assert bob.endpoint_key == "GET https://a.test/users/bob@example.com"
+    assert lead_key(alice) != lead_key(bob)
+
+
+def test_merge_candidate_rejects_distinct_email_like_paths() -> None:
+    alice = _candidate(
+        endpoint_key="GET https://a.test/users/alice@example.com",
+        value="https://a.test/users/alice@example.com",
+    )
+    bob = _candidate(
+        endpoint_key="GET https://a.test/users/bob@example.com",
+        value="https://a.test/users/bob@example.com",
+    )
+    lead = Lead.from_candidate(alice, round_no=1)
+
+    with pytest.raises(ValueError, match="identity"):
+        merge_candidate(lead, bob)
+
+
 def test_lead_starts_pending_with_bounded_private_references() -> None:
     lead = Lead.from_candidate(_candidate(), round_no=1, capture_id="cap-1")
 

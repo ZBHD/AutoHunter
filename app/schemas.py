@@ -74,6 +74,7 @@ class WorkerResult(BaseModel):
     rounds: int = 0
     error: Optional[str] = None
     deepen_lead: str = Field("", description="突破入口但未打穿时的定向深挖线索，触发自动回火再派一轮")
+    lead_summary: dict = Field(default_factory=dict, description="本轮 SRC 候选线索的有界结算摘要")
     reported_intel: list[dict] = Field(default_factory=list, description="worker 主动上报的可复用情报，编排层落全局情报库")
     reported_coverage: list[dict] = Field(default_factory=list, description="单站协作覆盖记录，编排层写事件流供后续 worker 复用")
 

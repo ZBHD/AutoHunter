@@ -168,6 +168,55 @@ def test_old_system_settings_table_gains_provider_pool_column() -> None:
     asyncio.run(scenario())
 
 
+def test_old_system_settings_table_gains_fofa_key_pool_column() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                other_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name != "system_settings"
+                ]
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.create_all(sync_conn, tables=other_tables)
+                )
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE system_settings (
+                        id VARCHAR(32) PRIMARY KEY,
+                        llm JSON DEFAULT '{}',
+                        fofa JSON DEFAULT '{}',
+                        engines JSON DEFAULT '{}',
+                        defaults JSON DEFAULT '{}',
+                        llm_providers JSON DEFAULT '[]',
+                        updated_at DATETIME
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    """INSERT INTO system_settings (id, fofa)
+                       VALUES ('global', '{"key":"legacy-secret","max_pages":7}')"""
+                )
+
+                await _auto_migrate(conn)
+
+                columns = await conn.exec_driver_sql("PRAGMA table_info(system_settings)")
+                names = {row[1] for row in columns.fetchall()}
+                assert "fofa_keys" in names
+
+                value = await conn.exec_driver_sql(
+                    "SELECT fofa, fofa_keys FROM system_settings WHERE id='global'"
+                )
+                assert value.one() == (
+                    '{"key":"legacy-secret","max_pages":7}',
+                    "[]",
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_raw_evidence_table_gains_private_spool_registry_without_data_loss() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

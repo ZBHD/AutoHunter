@@ -1,7 +1,9 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { api, authReadyRef, authRoleRef, loadAuthRole } from "../api.js";
+import FofaKeysPanel from "../components/FofaKeysPanel.vue";
 import LlmProvidersPanel from "../components/LlmProvidersPanel.vue";
+import { isFofaKeyUsable } from "../fofaKeys.js";
 import {
   isProviderUsable,
   markHealthCheckStale,
@@ -19,10 +21,14 @@ const saving = ref(false);
 const toastMsg = ref("");
 const meta = ref({ updated_at: null });
 const providers = ref([]);
+const fofaKeys = ref([]);
 const providerPanel = ref(null);
+const fofaKeyPanel = ref(null);
 const healthChecking = ref(false);
 const healthResponse = ref(null);
 const healthError = ref("");
+const fofaNowMs = ref(Date.now());
+let fofaClock = null;
 const systemLoaded = ref(false);
 const theme = ref("dark");
 const systemAccess = computed(() => shouldLoadSystemSettings(authRoleRef.value));
@@ -33,11 +39,11 @@ const roleLabel = computed(() => ({
   none: "未认证",
 }[authRoleRef.value] || "未认证"));
 const enabledProviders = computed(() => providers.value.filter(isProviderUsable));
+const enabledFofaKeys = computed(() => fofaKeys.value.filter((item) => isFofaKeyUsable(item, fofaNowMs.value)));
+const activeFofaKey = computed(() => fofaKeys.value.find((item) => item.is_active));
 const healthSummary = computed(() => summarizeHealthCheck(healthResponse.value || {}));
 
 const form = reactive({
-  fofa_key: "",
-  fofa_key_set: false,
   fofa_base_url: "",
   max_pages: 20,
   page_size: 100,
@@ -57,6 +63,11 @@ function markHealthStale() {
   healthResponse.value = markHealthCheckStale(healthResponse.value);
 }
 
+function healthResultKey(result, index) {
+  const source = result.protocol || result.model ? "llm" : "fofa";
+  return `${source}:${result.name}:${index}`;
+}
+
 async function runHealthCheck() {
   if (healthChecking.value) return;
   healthChecking.value = true;
@@ -65,6 +76,7 @@ async function runHealthCheck() {
     const response = await api.healthCheck();
     healthResponse.value = response;
     providerPanel.value?.applyHealthCheck(response);
+    fofaKeyPanel.value?.applyHealthCheck(response);
   } catch (error) {
     healthError.value = String(error?.message || error || "检测失败")
       .replace(/^\d+\s*/, "")
@@ -84,8 +96,7 @@ async function load() {
     const s = await api.getSettings();
     meta.value = { updated_at: s.updated_at };
     providers.value = s.llm_providers || [];
-    form.fofa_key = "";
-    form.fofa_key_set = s.fofa?.key_set;
+    fofaKeys.value = s.fofa_keys || [];
     form.fofa_base_url = s.fofa?.base_url || "";
     form.max_pages = s.fofa?.max_pages ?? 20;
     form.page_size = s.fofa?.page_size ?? 100;
@@ -123,11 +134,8 @@ async function save() {
         worker_prompt_version: form.worker_prompt_version,
       },
     };
-    if (form.fofa_key.trim()) body.fofa.key = form.fofa_key.trim();
     const s = await api.updateSettings(body);
     meta.value = { updated_at: s.updated_at };
-    form.fofa_key = "";
-    form.fofa_key_set = s.fofa?.key_set;
     markHealthStale();
     toast("系统配置已保存");
   } catch (e) {
@@ -142,12 +150,16 @@ watch(authRoleRef, async (role) => {
 });
 
 onMounted(async () => {
+  fofaClock = window.setInterval(() => (fofaNowMs.value = Date.now()), 1000);
   theme.value = currentTheme();
   if (!authReadyRef.value) {
     await loadAuthRole();
     return;
   }
   if (systemAccess.value && !systemLoaded.value) await load();
+});
+onUnmounted(() => {
+  if (fofaClock) window.clearInterval(fofaClock);
 });
 </script>
 
@@ -237,9 +249,9 @@ onMounted(async () => {
         <div class="settings-health">
           <div>
             <span>FOFA</span>
-            <b>{{ form.max_pages }} 页 · {{ form.page_size }} / 页</b>
+            <b>{{ fofaKeys.length ? `${enabledFofaKeys.length} 可用 · ${fofaKeys.length} 已加载` : "未配置 Key" }}</b>
           </div>
-          <i :class="{ on: form.fofa_key_set }">{{ form.fofa_key_set ? "key set" : "no key" }}</i>
+          <i :class="{ on: activeFofaKey }">{{ activeFofaKey ? activeFofaKey.name : "pool idle" }}</i>
         </div>
         <dl class="settings-facts">
           <div>
@@ -256,7 +268,7 @@ onMounted(async () => {
           </div>
         </dl>
         <p class="settings-note">
-          权重决定每次调用的首选 Provider；单次失败后会按列表顺序切换到其余可用通道。
+          LLM 按权重选择 Provider；FOFA 按列表顺序轮换，并在限流冷却结束后自动恢复。
         </p>
         <section class="settings-health-check" :class="{ stale: healthSummary.stale }">
           <button type="button" class="primary settings-health-action"
@@ -283,9 +295,10 @@ onMounted(async () => {
                 <span><b>{{ healthSummary.passed }}</b>通过</span>
                 <span><b>{{ healthSummary.failed }}</b>失败</span>
                 <span><b>{{ healthSummary.autoDisabled }}</b>停用</span>
+                <span><b>{{ healthSummary.autoBlocked }}</b>阻断</span>
               </div>
               <ul class="health-check-results">
-                <li v-for="result in healthSummary.results" :key="result.name"
+                <li v-for="(result, index) in healthSummary.results" :key="healthResultKey(result, index)"
                   :class="{
                     ok: result.ok,
                     failed: !result.ok,
@@ -315,22 +328,19 @@ onMounted(async () => {
 
       <div class="settings-main">
         <LlmProvidersPanel ref="providerPanel" @change="providers = $event" @mutated="markHealthStale" />
+        <FofaKeysPanel ref="fofaKeyPanel" @change="fofaKeys = $event" @mutated="markHealthStale" />
 
         <form class="form settings-form" @submit.prevent="save">
           <fieldset class="settings-block">
             <legend>
-              <span>FOFA</span>
+              <span>FOFA 搜集默认</span>
               <small>Collector 默认资产搜集参数</small>
             </legend>
             <div class="settings-grid">
-              <label class="full">FOFA key
-                <input v-model="form.fofa_key" type="password"
-                  :placeholder="form.fofa_key_set ? '已配置，留空不修改' : 'FOFA API Key'" />
+              <label class="full">旧配置兼容端点
+                <input v-model="form.fofa_base_url" type="url" placeholder="https://fofa.info" />
               </label>
-              <label class="full">API 端点
-                <input v-model="form.fofa_base_url" placeholder="https://fofa.info" />
-              </label>
-              <p class="field-hint full">自定义 FOFA 兼容端点（私有部署/镜像/代理网关），留空用官方地址。</p>
+              <p class="field-hint full">仅当 FOFA Key 池为空且未接管 Legacy Key 时，旧 .env 或历史设置使用此端点；Key 池中的 URL 以对应行设置为准。</p>
               <label>默认最大页数 <input v-model="form.max_pages" type="number" min="1" /></label>
               <label>每页条数 <input v-model="form.page_size" type="number" min="1" /></label>
               <label class="full">默认搜集方式
@@ -366,7 +376,7 @@ onMounted(async () => {
 
           <div class="settings-actions">
             <button type="submit" class="primary" :disabled="saving">{{ saving ? "保存中…" : "保存配置" }}</button>
-            <span>FOFA 密钥留空时不会覆盖已有值。</span>
+            <span>Key 与端点请在上方 FOFA Key 池中分别管理。</span>
           </div>
         </form>
       </div>

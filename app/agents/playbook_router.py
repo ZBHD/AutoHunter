@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 import re
 from urllib.parse import urlparse
 
+from app.tools.src_toolkit import (
+    DEFAULT_ROUTE_TOOL_SEQUENCE,
+    ROUTE_TOOL_SEQUENCES,
+)
+
 
 @dataclass(frozen=True)
 class RoutePlan:
@@ -27,6 +32,7 @@ class RoutePlan:
     avoid: tuple[str, ...]
     finish_hint: str
     alternates: tuple[str, ...] = field(default_factory=tuple)
+    tool_sequence: tuple[str, ...] = field(default_factory=tuple)
 
     def as_dict(self) -> dict:
         return {
@@ -41,6 +47,7 @@ class RoutePlan:
             "avoid": list(self.avoid),
             "finish_hint": self.finish_hint,
             "alternates": list(self.alternates),
+            "tool_sequence": list(self.tool_sequence),
         }
 
 
@@ -472,6 +479,10 @@ def _build_plan(score: float, route: _RouteDef, tags: list[str], evidence: list[
         avoid=route.avoid,
         finish_hint=route.finish_hint,
         alternates=tuple(alternates),
+        tool_sequence=ROUTE_TOOL_SEQUENCES.get(
+            route.route_id,
+            DEFAULT_ROUTE_TOOL_SEQUENCE,
+        ),
     )
 
 
@@ -485,6 +496,8 @@ def render_playbook_block(plan: RoutePlan) -> str:
         lines.append(f"- 命中信号：{', '.join(plan.tags[:8])}")
     if plan.evidence:
         lines.append("- 证据片段：" + "；".join(plan.evidence[:5]))
+    if plan.tool_sequence:
+        lines.append("- 下一阶段工具：" + " -> ".join(plan.tool_sequence))
     lines.append("- 先做：")
     for item in plan.focus[:4]:
         lines.append(f"  - {item}")

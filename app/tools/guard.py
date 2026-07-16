@@ -6,7 +6,18 @@
 """
 from __future__ import annotations
 
+import math
 import re
+import shlex
+from collections.abc import Mapping
+from urllib.parse import urlsplit
+
+
+_MAX_ENTERPRISE_VALUE = 16 * 1024
+ENTERPRISE_ALLOWED_PARSERS: dict[str, tuple[str, ...]] = {
+    mode: ("python", "-m", "app.tools.local_parsers", mode)
+    for mode in ("json", "headers", "urlencode")
+}
 
 # 会自毁运行环境的命令模式（大小写不敏感）。仅拦这些，不拦攻击。
 _SELF_DESTRUCT_PATTERNS = [
@@ -63,6 +74,141 @@ _ENTERPRISE_COMPILED = [(re.compile(p, re.IGNORECASE), msg) for p, msg in _ENTER
 
 class CommandBlocked(Exception):
     pass
+
+
+def _tokenize_command(command: str) -> list[str]:
+    text = str(command or "")
+    if not text.strip() or len(text) > _MAX_ENTERPRISE_VALUE + 4096:
+        raise CommandBlocked("企业命令为空或超过长度上限")
+    quote = ""
+    escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if char in {"'", '"'}:
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            continue
+        if char in {"`", "\r", "\n"} or text[index : index + 2] == "$(":
+            raise CommandBlocked("企业命令包含 shell 控制语法")
+        if not quote and char in {"|", ";", "&", "<", ">"}:
+            raise CommandBlocked("企业命令包含 shell 控制语法")
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError as exc:
+        raise CommandBlocked(f"企业命令引号格式错误: {exc}") from exc
+
+
+def _command_host(value: str) -> str:
+    text = str(value or "").strip()
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    return str(parsed.hostname or "").rstrip(".").lower()
+
+
+def _validate_curl_tokens(tokens: list[str], scope_target: str) -> None:
+    urls: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            if token in {"-s", "-S", "-i", "-I"} or (
+                token.startswith("-")
+                and not token.startswith("--")
+                and len(token) > 2
+                and set(token[1:]) <= {"s", "S", "i", "I"}
+            ):
+                index += 1
+                continue
+            if token not in {
+                "-X", "-H", "--data", "--data-raw", "--max-time", "--connect-timeout"
+            }:
+                raise CommandBlocked(f"企业 curl 参数未登记: {token}")
+            if index + 1 >= len(tokens):
+                raise CommandBlocked(f"企业 curl 参数缺少值: {token}")
+            value = tokens[index + 1]
+            if token == "-X" and not re.fullmatch(r"[A-Za-z]{3,12}", value):
+                raise CommandBlocked("企业 curl 请求方法格式错误")
+            if token == "-H":
+                if (
+                    value.startswith("@")
+                    or ":" not in value
+                    or len(value) > 4096
+                    or any(c in value for c in "\r\n")
+                ):
+                    raise CommandBlocked("企业 curl Header 格式错误")
+                header_name = value.split(":", 1)[0].strip().lower()
+                blocked_headers = {
+                    "host", "proxy", "forwarded", "x-forwarded-host", "x-forwarded-for",
+                    "x-original-url", "x-rewrite-url", "x-http-method-override",
+                }
+                if header_name in blocked_headers or "proxy" in header_name:
+                    raise CommandBlocked(f"企业 curl Header 不允许覆盖路由: {header_name}")
+            elif token in {"--data", "--data-raw"}:
+                if token == "--data" and value.startswith("@"):
+                    raise CommandBlocked("企业 curl 请求体不得从文件读取")
+                if len(value.encode("utf-8")) > _MAX_ENTERPRISE_VALUE:
+                    raise CommandBlocked("企业 curl 请求体超过 16 KiB")
+            elif token in {"--max-time", "--connect-timeout"}:
+                try:
+                    seconds = float(value)
+                except ValueError as exc:
+                    raise CommandBlocked(f"企业 curl 超时格式错误: {token}") from exc
+                if not math.isfinite(seconds) or seconds <= 0 or seconds > 30:
+                    raise CommandBlocked("企业 curl 超时必须在 0 到 30 秒之间")
+            index += 2
+            continue
+        parsed = urlsplit(token)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise CommandBlocked(f"企业 curl 仅接受一个完整 HTTP URL: {token}")
+        urls.append(token)
+        index += 1
+
+    if len(urls) != 1:
+        raise CommandBlocked("企业 curl 必须且只能包含一个 URL")
+    expected = _command_host(scope_target)
+    actual = _command_host(urls[0])
+    if not expected or actual != expected:
+        raise CommandBlocked(f"企业 curl URL 超出当前目标范围: {actual or '<empty>'}")
+
+
+def _validate_parser_tokens(
+    tokens: list[str],
+    allowed_parsers: Mapping[str, tuple[str, ...]],
+) -> None:
+    for prefix in allowed_parsers.values():
+        fixed = tuple(str(item) for item in prefix)
+        if tuple(tokens[: len(fixed)]) != fixed:
+            continue
+        suffix = tokens[len(fixed) :]
+        if len(suffix) != 2 or suffix[0] != "--value":
+            raise CommandBlocked("本地解析器只接受固定的 --value 参数")
+        if len(suffix[1].encode("utf-8")) > _MAX_ENTERPRISE_VALUE:
+            raise CommandBlocked("本地解析器输入超过 16 KiB")
+        return
+    raise CommandBlocked("企业命令未登记，只允许 curl 或固定本地解析器")
+
+
+def check_enterprise_command(
+    command: str,
+    *,
+    scope_target: str,
+    allowed_parsers: Mapping[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Return one validated argv for the enterprise shell execution path."""
+
+    tokens = _tokenize_command(command)
+    executable = tokens[0].lower() if tokens else ""
+    if executable in {"curl", "curl.exe"}:
+        _validate_curl_tokens(tokens, scope_target)
+    else:
+        _validate_parser_tokens(tokens, allowed_parsers)
+    return tuple(tokens)
 
 
 def check_command(cmd: str, enterprise: bool = False) -> None:

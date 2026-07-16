@@ -89,14 +89,19 @@ export function providerHealthSnapshot(payload = {}) {
 
 export function summarizeHealthCheck(payload = {}) {
   const providerResults = providerHealthSnapshot(payload).results;
-  const fofaResult = normalizedHealthResult(payload?.fofa_result, "FOFA");
-  const results = fofaResult ? [...providerResults, fofaResult] : providerResults;
+  const hasFofaPool = Array.isArray(payload?.fofa_results);
+  const fofaResults = (hasFofaPool ? payload.fofa_results : [])
+    .map((item) => normalizedHealthResult(item))
+    .filter((item) => item?.name);
+  const fofaResult = hasFofaPool ? null : normalizedHealthResult(payload?.fofa_result, "FOFA");
+  const results = fofaResult ? [...providerResults, fofaResult] : [...providerResults, ...fofaResults];
   return {
     checkedAt: String(payload?.checked_at || ""),
     total: results.length,
     passed: results.filter((item) => item.ok).length,
     failed: results.filter((item) => !item.ok).length,
-    autoDisabled: providerResults.filter((item) => item.auto_disabled).length,
+    autoDisabled: results.filter((item) => item.auto_disabled).length,
+    autoBlocked: fofaResults.filter((item) => item.auto_blocked).length,
     stale: payload?.stale === true || results.some((item) => item.stale),
     results,
   };

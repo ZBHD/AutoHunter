@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 def _load_dotenv() -> None:
@@ -23,6 +31,101 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+
+def _validate_http_base_url(value: str) -> str:
+    """校验并保留 HTTP(S) 基址的路径部分。"""
+    normalized = str(value or "").strip()
+    try:
+        parsed = urlparse(normalized)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("must be an absolute HTTP(S) URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        raise ValueError("must be an absolute HTTP(S) URL")
+    return normalized
+
+
+def _key_overlaps_name(name: str, key: str) -> bool:
+    normalized_key = str(key or "").strip()
+    if not normalized_key:
+        return False
+    name_key = str(name or "").casefold()
+    key_variants = {
+        normalized_key,
+        quote(normalized_key, safe=""),
+        quote_plus(normalized_key, safe=""),
+    }
+    return any(variant.casefold() in name_key for variant in key_variants)
+
+
+FofaRuntimeState = Literal[
+    "ready", "rate_limited", "daily_cooldown", "daily_suspended", "auth_invalid"
+]
+FofaFailureKindValue = Literal["", "auth", "rate_limit", "daily_limit", "transient"]
+
+
+class FofaKeyConfig(BaseModel):
+    """单个 FOFA Key 及其可恢复运行状态。"""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    name: str
+    key: str = Field(default="", repr=False)
+    base_url: str = "https://fofa.info"
+    enabled: bool = True
+    runtime_state: FofaRuntimeState = "ready"
+    failure_kind: FofaFailureKindValue = ""
+    failure_count: int = Field(default=0, ge=0)
+    cooldown_until: datetime | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info: ValidationInfo) -> str:
+        normalized = str(value or "").strip()
+        if not normalized or "/" in normalized or "\\" in normalized:
+            raise ValueError("FOFA Key 名称必须非空且可用于 API 路径")
+        if normalized.casefold() == "order":
+            raise ValueError("FOFA Key 名称不能使用保留字 order")
+        if _key_overlaps_name(normalized, info.data.get("key", "")):
+            raise ValueError("FOFA Key 名称不能包含 Key")
+        return normalized
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str, info: ValidationInfo) -> str:
+        if _key_overlaps_name(info.data.get("name", ""), value):
+            raise ValueError("FOFA Key 名称不能包含 Key")
+        return value
+
+    @field_validator("cooldown_until")
+    @classmethod
+    def normalize_cooldown_until(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("cooldown_until 必须包含时区")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return _validate_http_base_url(value)
+
+    @model_validator(mode="after")
+    def validate_name_does_not_contain_key(self) -> "FofaKeyConfig":
+        if _key_overlaps_name(self.name, self.key):
+            raise ValueError("FOFA Key 名称不能包含 Key")
+        return self
 
 
 class LLMProviderConfig(BaseModel):
@@ -47,24 +150,7 @@ class LLMProviderConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def _http_base_url(cls, value: str) -> str:
-        normalized = str(value or "").strip()
-        try:
-            parsed = urlparse(normalized)
-            hostname = parsed.hostname
-            port = parsed.port
-        except ValueError as exc:
-            raise ValueError("must be an absolute HTTP(S) URL") from exc
-        if (
-            parsed.scheme.lower() not in {"http", "https"}
-            or not hostname
-            or (port is not None and not 1 <= port <= 65535)
-            or parsed.username is not None
-            or parsed.password is not None
-            or bool(parsed.query)
-            or bool(parsed.fragment)
-        ):
-            raise ValueError("must be an absolute HTTP(S) URL")
-        return normalized
+        return _validate_http_base_url(value)
 
     @field_validator("api_key")
     @classmethod
