@@ -68,6 +68,28 @@ test("builds FOFA key patches for explicit global, no-op, and blank cases", () =
   }), { key: "task-secret" });
 });
 
+test("preserves non-FOFA engine keys until switching back to the FOFA pool", () => {
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    initialIsFofa: false,
+    finalMode: "global",
+    finalIsFofa: false,
+  }), {});
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    initialIsFofa: false,
+    finalMode: "global",
+    finalIsFofa: true,
+  }), { key: null });
+  assert.deepEqual(fofaKeyPatch({
+    initialMode: "task",
+    initialIsFofa: false,
+    finalMode: "task",
+    finalIsFofa: true,
+    key: "new-fofa-secret",
+  }), { key: "new-fofa-secret" });
+});
+
 test("create and edit forms expose an independent FOFA key source switch", () => {
   const create = source("../src/views/CreateView.vue");
   const edit = source("../src/components/TaskEditModal.vue");
@@ -80,4 +102,6 @@ test("create and edit forms expose an independent FOFA key source switch", () =>
   }
   assert.match(edit, /fofaKeyPatch\(/);
   assert.match(edit, /initialMode:\s*original\.fofa_key_mode/);
+  assert.match(edit, /initialIsFofa:\s*original\.fofa_is_fofa/);
+  assert.match(edit, /const initialIsFofa = isFofaPoolMode\(form\.target_source, form\.engine\)/);
 });

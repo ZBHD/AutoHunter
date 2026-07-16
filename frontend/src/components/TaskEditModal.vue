@@ -81,6 +81,7 @@ const original = reactive({
   max_pages: 20,
   page_size: 100,
   fofa_key_mode: "global",
+  fofa_is_fofa: true,
 });
 const isSiteMode = computed(() => form.target_source === "site");
 const isAutoMode = computed(() => isAutoSource(form.target_source));
@@ -129,7 +130,9 @@ function fill(task) {
   form.temperature = Number(modelCfg.temperature ?? 0.3);
   form.prompt_version = modelCfg.prompt_version || "current";
   form.fofa_key = "";
-  form.fofa_key_mode = fofaCfg.key_source === "task" ? "task" : "global";
+  const initialIsFofa = isFofaPoolMode(form.target_source, form.engine);
+  const initialHasTaskKey = fofaCfg.key_source === "task";
+  form.fofa_key_mode = initialIsFofa && initialHasTaskKey ? "task" : "global";
   form.fofa_base_url = fofaCfg.base_url || "";
   form.max_pages = fofaCfg.max_pages ?? 20;
   form.page_size = fofaCfg.page_size ?? 100;
@@ -139,7 +142,8 @@ function fill(task) {
   original.fofa_base_url = form.fofa_base_url;
   original.max_pages = Number(form.max_pages);
   original.page_size = Number(form.page_size);
-  original.fofa_key_mode = form.fofa_key_mode;
+  original.fofa_key_mode = initialHasTaskKey ? "task" : "global";
+  original.fofa_is_fofa = initialIsFofa;
   // 重置模型列表状态（打开弹窗时 watch 会随即自动 loadModels 拉好列表）
   models.value = [];
   modelsError.value = "";
@@ -174,6 +178,7 @@ async function save() {
   Object.assign(fofaConfig, fofaKeyPatch({
     initialMode: original.fofa_key_mode,
     finalMode: form.fofa_key_mode,
+    initialIsFofa: original.fofa_is_fofa,
     finalIsFofa: isFofaMode.value,
     key: form.fofa_key,
   }));

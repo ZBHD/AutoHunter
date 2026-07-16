@@ -570,6 +570,36 @@ def test_patch_engine_key_wins_over_fofa_clear_in_same_request(task_api) -> None
     assert stored["key"] == "new-engine-secret"
 
 
+def test_task_engine_config_is_used_by_the_selected_non_fofa_engine(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Quake task key",
+            "engine": "quake",
+            "engine_config": {
+                "key": "quake-task-secret",
+                "base_url": "https://quake.task.example/api",
+            },
+        },
+    )
+
+    assert created.status_code == 200, created.text
+
+    async def resolved() -> dict:
+        from app.settings_service import resolve_engine_config
+
+        async with session_maker() as session:
+            task = await session.get(Task, created.json()["id"])
+            assert task is not None
+            return resolve_engine_config(task)
+
+    effective = asyncio.run(resolved())
+    assert effective["engine"] == "quake"
+    assert effective["key"] == "quake-task-secret"
+    assert effective["base_url"] == "https://quake.task.example/api"
+
+
 @pytest.mark.parametrize("replacement", ["", "********"])
 def test_patch_dedicated_task_preserves_key_for_empty_or_masked_value(
     task_api, replacement

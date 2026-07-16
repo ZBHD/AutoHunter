@@ -520,8 +520,10 @@ def resolve_engine_name(task: Task | None = None) -> str:
 def resolve_engine_key(engine_name: str, task: Task | None = None) -> str:
     """获取指定引擎的 API Key（任务级 > DB缓存 > 环境变量）。"""
     effective = effective_settings()
-    # 任务级 fofa_config 兼容旧版
-    if engine_name == "fofa" and task:
+    # 任务级配置历史上存放在 fofa_config 中；只在请求的引擎就是任务当前
+    # 引擎时读取，避免从 Quake 切回 FOFA 时误用上一引擎遗留的 Key。
+    task_engine = resolve_engine_name(task) if task else ""
+    if task and engine_name == task_engine:
         cfg = task.fofa_config or {}
         if cfg.get("key"):
             return str(cfg["key"])
@@ -542,8 +544,9 @@ def resolve_engine_base_url(engine_name: str, task: Task | None = None) -> str:
     engine = get_engine(engine_name)
     default = engine.get_default_base_url() if engine else ""
     effective = effective_settings()
-    # 任务级 fofa_config 兼容旧版
-    if engine_name == "fofa" and task:
+    # 任务级配置历史上存放在 fofa_config 中；按当前引擎限定作用域。
+    task_engine = resolve_engine_name(task) if task else ""
+    if task and engine_name == task_engine:
         cfg = task.fofa_config or {}
         if cfg.get("base_url"):
             return str(cfg["base_url"])
