@@ -365,6 +365,7 @@ async def rejected_list(task_id: str, search: Optional[str] = Query(None, alias=
 
 @router.get("/tasks/{task_id}/archived")
 async def archived_list(task_id: str, search: Optional[str] = Query(None, alias="q"),
+                        download_status: Optional[str] = Query(None),
                         limit: int = Query(0, ge=0, le=200),
                         offset: int = Query(0, ge=0),
                         session: AsyncSession = Depends(get_session)):
@@ -379,6 +380,12 @@ async def archived_list(task_id: str, search: Optional[str] = Query(None, alias=
         Review.user_status == "pending",   # 用户已处理过的不再摆进来
         Finding.status != "superseded",    # 正在回炉重挖的 deepen 前身不显示（避免和新一轮重复）
     ).order_by(Review.reviewed_at.desc().nullslast(), Review.score.desc())
+    if download_status == "downloaded":
+        q = q.where(Finding.markdown_downloaded_at.is_not(None))
+    elif download_status == "pending":
+        q = q.where(Finding.markdown_downloaded_at.is_(None))
+    elif download_status:
+        raise HTTPException(400, "download_status 必须是 downloaded 或 pending")
 
     def _to_dict(f, r):
         d = _finding_dict(f, r)

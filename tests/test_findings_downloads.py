@@ -28,7 +28,9 @@ def test_findings_download_status_filter_and_batch_mark(tmp_path):
             session.add_all([
                 Finding(id="finding-a", task_id="task-a", target_id="target-a", vuln_type="xss", title="A", severity_claimed="low", target_url="https://a.test/x"),
                 Finding(id="finding-b", task_id="task-b", target_id="target-b", vuln_type="xss", title="B", severity_claimed="low", target_url="https://b.test/x"),
+                Finding(id="finding-archived", task_id="task-a", target_id="target-a", vuln_type="xss", title="Archived", severity_claimed="low", target_url="https://a.test/archived"),
                 Review(id="review-a", finding_id="finding-a", task_id="task-a", verdict="accepted", confidence="confirmed", user_status="pending"),
+                Review(id="review-archived", finding_id="finding-archived", task_id="task-a", verdict="ignored", confidence="uncertain", user_status="pending"),
             ])
             await session.commit()
 
@@ -62,11 +64,22 @@ def test_findings_download_status_filter_and_batch_mark(tmp_path):
             "/api/tasks/task-a/findings",
             params={"compact": True, "download_status": "pending"},
         ).json()
-        assert pending["items"] == []
+        assert [item["id"] for item in pending["items"]] == ["finding-archived"]
 
         review = client.get("/api/tasks/task-a/review-queue", params={"download_status": "downloaded"})
         assert review.status_code == 200
         assert [item["id"] for item in review.json()] == ["finding-a"]
         assert review.json()[0]["downloaded"] is True
+
+        client.post(
+            "/api/tasks/task-a/findings/mark-downloaded",
+            json={"finding_ids": ["finding-archived"]},
+        )
+        archived = client.get(
+            "/api/tasks/task-a/archived",
+            params={"download_status": "downloaded", "limit": 50},
+        )
+        assert archived.status_code == 200
+        assert [item["id"] for item in archived.json()["items"]] == ["finding-archived"]
 
     asyncio.run(engine.dispose())

@@ -23,7 +23,7 @@ import {
   setThemePreference,
   shouldLoadSystemSettings,
 } from "../src/preferences.js";
-import { buildReportCoreMd, effectiveSeverity } from "../src/report.js";
+import { buildDownloadReportMd, buildReportCoreMd, effectiveSeverity } from "../src/report.js";
 
 test("list query omits empty values and preserves zero", () => {
   assert.equal(
@@ -76,6 +76,23 @@ test("raw report severity falls back to the finding claim before review", () => 
 
   assert.equal(effectiveSeverity(finding), "medium");
   assert.match(buildReportCoreMd(finding), /\| \*\*漏洞等级\*\* \| medium（- \/ 10） \|/);
+});
+
+test("download Markdown omits AI review and EduSRC import sections", () => {
+  const finding = {
+    id: "download-1",
+    title: "Download finding",
+    vuln_type: "xss",
+    target_url: "https://example.test/xss",
+    severity_claimed: "高危",
+    description: "Evidence description",
+    review: { reviewer_notes: "internal review" },
+  };
+  const md = buildDownloadReportMd(finding);
+  assert.match(md, /## 漏洞描述/);
+  assert.match(md, /## 证据链/);
+  assert.doesNotMatch(md, /## AI 审核结论/);
+  assert.doesNotMatch(md, /## EDUSRC 自动填充 JSON/);
 });
 
 test("download scope explicitly chooses all reports or current filtered reports", () => {

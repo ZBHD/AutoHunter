@@ -3,7 +3,8 @@ import { ref, onMounted, onUnmounted, computed, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, wsUrl, authRoleRef, authReadyRef, loadAuthRole } from "../api.js";
 import { copyText } from "../clipboard.js";
-import { effectiveSeverity, buildReportMd, buildEdusrcToolReport } from "../report.js";
+import { buildDownloadReportMd, effectiveSeverity, buildReportMd, buildEdusrcToolReport } from "../report.js";
+import { downloadMarkdownReports, saveMarkdownFile } from "../downloads.js";
 import ReportDrawer from "../components/ReportDrawer.vue";
 import TaskEditModal from "../components/TaskEditModal.vue";
 import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
@@ -40,6 +41,10 @@ const reviewDownloadWorking = ref(false);
 const submitItems = ref([]);       // 待提交
 const rejectedItems = ref([]);     // 已驳回
 const archivedItems = ref([]);     // AI 未采纳归档（ignored/deepen，可救回）
+const archivedSelectedIds = ref(new Set());
+const archivedDownloadStatus = ref("");
+const archivedDownloadScope = ref("filtered");
+const archivedDownloadWorking = ref(false);
 const taskKillsweepTotal = ref(0);
 const queuedTargetCount = ref(null);
 const searchDraft = ref("");
@@ -171,19 +176,20 @@ async function exportReviewMarkdown() {
   if (!source.length) return;
   reviewDownloadWorking.value = true;
   try {
-    const md = source.map((finding) => buildReportMd(finding)).join("\n\n---\n\n");
-    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-    const anchor = document.createElement("a");
-    anchor.href = URL.createObjectURL(blob);
-    anchor.download = `autohunter-${props.id.slice(0, 8)}-review.md`;
-    anchor.click();
-    URL.revokeObjectURL(anchor.href);
-    await api.markFindingsDownloaded(props.id, source.map((finding) => finding.id));
+    const downloadedIds = [];
+    await downloadMarkdownReports(source, {
+      render: (finding) => buildDownloadReportMd(finding),
+      save: async (file) => {
+        saveMarkdownFile(file);
+        if (file.finding?.id) downloadedIds.push(file.finding.id);
+      },
+    });
+    await api.markFindingsDownloaded(props.id, downloadedIds);
     const next = new Set(reviewSelectedIds.value);
-    source.forEach((finding) => next.delete(finding.id));
+    downloadedIds.forEach((id) => next.delete(id));
     reviewSelectedIds.value = next;
     await loadQueue();
-    toast(`已导出 ${source.length} 份 Markdown 报告`);
+    toast(`已下载 ${downloadedIds.length} 份 Markdown 报告`);
   } catch (error) {
     toast(`导出失败：${error?.message || error}`);
   } finally {
@@ -226,7 +232,8 @@ async function loadArchived(opts = {}) {
   const offset = reset ? 0 : archivedItems.value.length;
   archivedLoading.value = true;
   try {
-    const res = await api.archivedList(id, undefined, {
+    const res = await api.archivedList(id, searchText.value || undefined, {
+      download_status: archivedDownloadStatus.value,
       limit: ARCHIVED_PAGE_SIZE,
       offset,
     });
@@ -242,6 +249,80 @@ async function loadArchived(opts = {}) {
 async function loadMoreArchived() {
   if (archivedLoading.value || !archivedHasMore.value) return;
   await loadArchived({ reset: false });
+}
+
+function toggleArchivedSelection(id) {
+  const next = new Set(archivedSelectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  archivedSelectedIds.value = next;
+  if (next.size) archivedDownloadScope.value = "selected";
+}
+
+function toggleArchivedVisibleSelection() {
+  const ids = filteredArchived.value.map((finding) => finding.id);
+  const next = new Set(archivedSelectedIds.value);
+  const allSelected = ids.length > 0 && ids.every((id) => next.has(id));
+  if (allSelected) ids.forEach((id) => next.delete(id));
+  else ids.forEach((id) => next.add(id));
+  archivedSelectedIds.value = next;
+  archivedDownloadScope.value = next.size ? "selected" : "filtered";
+}
+
+function clearArchivedSelection() {
+  archivedSelectedIds.value = new Set();
+  archivedDownloadScope.value = "filtered";
+}
+
+async function fetchArchivedDownloadRows() {
+  if (archivedDownloadScope.value === "selected") {
+    return archivedItems.value.filter((finding) => archivedSelectedIds.value.has(finding.id));
+  }
+  const rows = [];
+  let offset = 0;
+  const query = archivedDownloadScope.value === "filtered" ? (searchText.value || undefined) : undefined;
+  const status = archivedDownloadScope.value === "filtered" ? archivedDownloadStatus.value : "";
+  for (;;) {
+    const res = await api.archivedList(props.id, query, {
+      download_status: status,
+      limit: ARCHIVED_PAGE_SIZE,
+      offset,
+    });
+    const page = Array.isArray(res) ? res : (res.items || []);
+    rows.push(...page);
+    if (Array.isArray(res) || !res.has_more || !page.length) break;
+    offset += page.length;
+  }
+  return rows;
+}
+
+async function archivedDownloadMarkdown() {
+  if (archivedDownloadWorking.value) return;
+  archivedDownloadWorking.value = true;
+  try {
+    const rows = await fetchArchivedDownloadRows();
+    if (!rows.length) return;
+    const downloadedIds = [];
+    await downloadMarkdownReports(rows, {
+      render: (finding) => buildDownloadReportMd(finding),
+      save: async (file) => {
+        saveMarkdownFile(file);
+        if (file.finding?.id) downloadedIds.push(file.finding.id);
+      },
+    });
+    if (downloadedIds.length) {
+      await api.markFindingsDownloaded(props.id, downloadedIds);
+      const next = new Set(archivedSelectedIds.value);
+      downloadedIds.forEach((id) => next.delete(id));
+      archivedSelectedIds.value = next;
+    }
+    await loadArchived({ reset: true });
+    toast(`已下载 ${downloadedIds.length} 份 Markdown 报告`);
+  } catch (error) {
+    toast(`下载失败：${error?.message || error}`);
+  } finally {
+    archivedDownloadWorking.value = false;
+  }
 }
 
 async function refreshAll(opts = {}) {
@@ -591,6 +672,11 @@ watch(reviewDownloadStatus, () => {
   if (tab.value === "review") loadQueue();
 });
 
+watch(archivedDownloadStatus, () => {
+  clearArchivedSelection();
+  if (tab.value === "archived") loadArchived({ reset: true });
+});
+
 watch(() => route.query.view, (value) => {
   const requested = ["scanned", "findings"].includes(String(value || "")) ? String(value) : "board";
   const next = taskViewForRole(requested, authRoleRef.value);
@@ -770,13 +856,16 @@ async function exportAll() {
   try {
     toast("正在生成 Markdown 文件...");
     const reports = await fetchAllSubmitReports();
-    const md = reports.map((f) => buildReportMd(f)).join("\n\n---\n\n");
-  const blob = new Blob([md], { type: "text/markdown" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `autohunter-${props.id.slice(0, 8)}-submit.md`;
-  a.click();
-    toast(`已导出 ${reports.length} 份报告`);
+    const downloadedIds = [];
+    await downloadMarkdownReports(reports, {
+      render: (finding) => buildDownloadReportMd(finding),
+      save: async (file) => {
+        saveMarkdownFile(file);
+        if (file.finding?.id) downloadedIds.push(file.finding.id);
+      },
+    });
+    await api.markFindingsDownloaded(props.id, downloadedIds);
+    toast(`已下载 ${downloadedIds.length} 份报告`);
   } finally {
     bulkWorking.value = false;
   }
@@ -966,6 +1055,11 @@ const reviewAllVisibleSelected = computed(() => (
 const filteredSubmit = computed(() => submitItems.value.filter(matchSearch));
 const filteredRejected = computed(() => rejectedItems.value.filter(matchSearch));
 const filteredArchived = computed(() => archivedItems.value.filter(matchSearch));
+const archivedSelectedCount = computed(() => archivedSelectedIds.value.size);
+const archivedAllVisibleSelected = computed(() => {
+  const ids = filteredArchived.value.map((finding) => finding.id);
+  return ids.length > 0 && ids.every((id) => archivedSelectedIds.value.has(id));
+});
 const visibleCount = computed(() => {
   if (tab.value === "review") return filteredQueue.value.length;
   if (tab.value === "submit") return filteredSubmit.value.length;
@@ -1327,7 +1421,7 @@ function siteReconModeLabel(item) {
         <small v-if="submitItems.length" class="muted">已加载 {{ submitItems.length }} 条{{ submitHasMore ? "，还有更多" : "" }}</small>
         <span class="grow"></span>
         <button @click="copyAll" :disabled="!submitItems.length || bulkWorking">复制全部 Markdown</button>
-        <button @click="exportAll" :disabled="!submitItems.length || bulkWorking">导出 .md</button>
+        <button @click="exportAll" :disabled="!submitItems.length || bulkWorking">批量下载 Markdown</button>
         <button v-if="!isEnterpriseTask" @click="copyEdusrcAll" :disabled="!submitItems.length || bulkWorking">复制 EduSRC JSON</button>
         <button v-if="!isEnterpriseTask" @click="exportEdusrcAll" :disabled="!submitItems.length || bulkWorking">导出 reports.json</button>
       </div>
@@ -1368,27 +1462,51 @@ function siteReconModeLabel(item) {
     <!-- AI 未采纳归档：ignored（疑似误杀）/ deepen 未升级，保留可回看纠错，一键救回复审 -->
     <div v-if="authRoleRef !== 'observer'" v-show="tab === 'archived'" class="list-panel">
       <div class="list-head">
-        <span>AI 未采纳</span>
-        <small>AI 判为非漏洞或深挖未升级的洞，保留在此防误杀，可点开查看、必要时「恢复到复审」</small>
-        <small v-if="archivedItems.length" class="muted">已加载 {{ archivedItems.length }} 条{{ archivedHasMore ? "，还有更多" : "" }}</small>
+        <div><span>AI 未采纳</span><small>AI 判为非漏洞或深挖未升级的洞，保留在此防误杀，可点开查看、必要时「恢复到复审」</small></div>
+        <div class="review-actions">
+          <span v-if="archivedSelectedCount">已选 {{ archivedSelectedCount }} 项</span>
+          <button type="button" @click="toggleArchivedVisibleSelection" :disabled="!filteredArchived.length">
+            {{ archivedAllVisibleSelected ? "取消全选" : "全选当前结果" }}
+          </button>
+          <button v-if="archivedSelectedCount" type="button" class="ghost" @click="clearArchivedSelection">清空选择</button>
+        </div>
+      </div>
+      <div class="review-download-bar archived-download-bar">
+        <div class="review-status-tabs" role="tablist" aria-label="AI 未采纳下载状态">
+          <button type="button" role="tab" :aria-selected="archivedDownloadStatus === ''" :class="{ active: archivedDownloadStatus === '' }" @click="archivedDownloadStatus = ''">全部</button>
+          <button type="button" role="tab" :aria-selected="archivedDownloadStatus === 'pending'" :class="{ active: archivedDownloadStatus === 'pending' }" @click="archivedDownloadStatus = 'pending'">未下载</button>
+          <button type="button" role="tab" :aria-selected="archivedDownloadStatus === 'downloaded'" :class="{ active: archivedDownloadStatus === 'downloaded' }" @click="archivedDownloadStatus = 'downloaded'">已下载</button>
+        </div>
+        <label><input v-model="archivedDownloadScope" type="radio" value="selected" :disabled="!archivedSelectedCount" /> 已选项</label>
+        <label><input v-model="archivedDownloadScope" type="radio" value="filtered" /> 当前筛选结果</label>
+        <label><input v-model="archivedDownloadScope" type="radio" value="all" /> 全部 AI 未采纳</label>
+        <button type="button" class="primary" :disabled="archivedDownloadWorking || !(archivedDownloadScope === 'selected' ? archivedSelectedCount : archivedDownloadScope === 'filtered' ? filteredArchived.length : archivedItems.length)" @click="archivedDownloadMarkdown">
+          {{ archivedDownloadWorking ? "下载中…" : "批量下载 Markdown" }}
+        </button>
       </div>
       <div v-if="!archivedItems.length" class="empty">
         暂无 AI 未采纳的漏洞（AI 审核判「非漏洞」或「深挖未升级」的洞会沉淀到这里，防止误杀）
       </div>
       <div v-else-if="!filteredArchived.length" class="empty">没有匹配当前关键词的未采纳漏洞</div>
-      <div v-for="f in filteredArchived" :key="f.id" class="result-row archived" @click="openArchived(f.id)">
+      <div v-for="f in filteredArchived" :key="f.id" class="result-row archived archived-result-row" :class="{ selected: archivedSelectedIds.has(f.id) }">
+        <label class="review-check" @click.stop>
+          <input type="checkbox" :checked="archivedSelectedIds.has(f.id)" :aria-label="`选择 ${f.title}`" @change="toggleArchivedSelection(f.id)" />
+        </label>
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
-        <div class="rr-main">
+        <div class="archived-result-open" role="button" tabindex="0" @click="openArchived(f.id)" @keyup.enter="openArchived(f.id)">
+          <div class="rr-main">
           <div class="rr-title">
             <span class="arch-tag" :class="f.archive_reason">{{ f.archive_reason_text }}</span>
             {{ f.title }}
           </div>
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
           <div v-if="f.ignore_reasons?.length" class="meta rr-note">AI 理由：{{ f.ignore_reasons.join("；") }}</div>
-        </div>
-        <div class="rr-side" @click.stop>
+          </div>
+          <div class="rr-side" @click.stop>
           <span class="score">{{ f.review?.score ?? "-" }}</span>
+          <span class="review-download-mark">{{ f.downloaded ? "已下载" : "未下载" }}</span>
           <button v-if="!readonly" class="mini-action" type="button" @click="restoreArchived(f.id)">恢复到复审</button>
+          </div>
         </div>
       </div>
       <button v-if="archivedHasMore" class="load-more" @click="loadMoreArchived" :disabled="archivedLoading">

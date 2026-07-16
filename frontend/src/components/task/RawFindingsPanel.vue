@@ -2,7 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { api } from "../../api.js";
 import { normalizePage } from "../../listQuery.js";
-import { buildReportMd, effectiveSeverity } from "../../report.js";
+import { buildDownloadReportMd, effectiveSeverity } from "../../report.js";
 import { downloadMarkdownReports, saveMarkdownFile } from "../../downloads.js";
 
 const props = defineProps({ taskId: { type: String, required: true } });
@@ -175,7 +175,7 @@ async function startDownload() {
     downloadProgress.value = { current: 0, total: details.length, stage: "正在下载独立 Markdown" };
     const downloadedIds = [];
     await downloadMarkdownReports(details, {
-      render: (finding) => buildReportMd(finding),
+      render: (finding) => buildDownloadReportMd(finding),
       save: async (file) => {
         if (cancelDownload.value) throw new Error("下载已取消");
         saveMarkdownFile(file);

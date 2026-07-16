@@ -74,7 +74,7 @@ function inferCategoryName(f) {
   return "未授权访问";
 }
 
-export function buildReportCoreMd(f) {
+export function buildReportCoreMd(f, { includeReview = true } = {}) {
   const rv = f.review || {};
   const sev = effectiveSeverity(f);
   const conf = CONF[rv.confidence] || rv.confidence || "-";
@@ -104,6 +104,14 @@ export function buildReportCoreMd(f) {
       .join("\n");
     chainBlock = `\n## 攻击链路\n\n\`${flow}\`\n\n${detail}\n`;
   }
+
+  const reviewBlock = includeReview
+    ? `## AI 审核结论
+
+> ${(rv.reviewer_notes || "-").replace(/\n/g, "\n> ")}
+${rv.user_notes ? `\n## 人工复审备注\n\n${rv.user_notes}` : ""}
+`
+    : "";
 
   return `# ${title}
 
@@ -147,11 +155,12 @@ ${f.raw_request || "-"}
 ${f.raw_response || "-"}
 \`\`\`
 ${evBlock}
-## AI 审核结论
-
-> ${(rv.reviewer_notes || "-").replace(/\n/g, "\n> ")}
-${rv.user_notes ? `\n## 人工复审备注\n\n${rv.user_notes}` : ""}
+${reviewBlock}
 ${chainBlock}`;
+}
+
+export function buildDownloadReportMd(f) {
+  return buildReportCoreMd(f, { includeReview: false });
 }
 
 export function buildEdusrcReportJson(f, content) {

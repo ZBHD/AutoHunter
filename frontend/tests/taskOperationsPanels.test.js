@@ -66,6 +66,27 @@ test("review queue supports multi-select Markdown export and download status tab
   assert.match(boardView, /markFindingsDownloaded/);
   assert.match(boardView, /复审队列[\s\S]*已下载/);
   assert.match(boardView, /复审队列[\s\S]*未下载/);
+  assert.match(boardView, /downloadMarkdownReports/);
+  assert.doesNotMatch(boardView, /source\.map\(\(finding\) => buildReportMd/);
+});
+
+test("AI 未采纳 reuses selection and independent Markdown download controls", () => {
+  assert.match(boardView, /archivedSelectedIds/);
+  assert.match(boardView, /archivedDownloadStatus/);
+  assert.match(boardView, /archivedDownloadScope/);
+  assert.match(boardView, /AI 未采纳[\s\S]*批量下载 Markdown/);
+  assert.match(boardView, /archivedDownloadMarkdown/);
+  assert.match(boardView, /downloadMarkdownReports/);
+});
+
+test("submit Markdown export uses independent files and the shared downloader", () => {
+  const start = boardView.indexOf("async function exportAll()");
+  const end = boardView.indexOf("\nfunction edusrcReports", start);
+  assert.ok(start >= 0 && end > start);
+  const handler = boardView.slice(start, end);
+  assert.match(handler, /downloadMarkdownReports/);
+  assert.match(handler, /buildDownloadReportMd/);
+  assert.doesNotMatch(handler, /join\("\\n\\n---\\n\\n"\)/);
 });
 
 test("task board exposes the stop-search control contract", () => {
