@@ -59,6 +59,11 @@ _provider_fingerprint_secret = os.urandom(32)
 # The cache is replaced when the stable credential configuration changes.
 _fofa_router_cache: "OrderedDict[object, FofaKeyRouter]" = OrderedDict()
 
+
+def _invalidate_fofa_router_cache() -> None:
+    """Drop cached global routers after an external settings state writeback."""
+    _fofa_router_cache.clear()
+
 _TASK_PROVIDER_FIELDS = frozenset({"base_url", "api_key", "model", "temperature", "protocol"})
 
 
@@ -1487,6 +1492,7 @@ async def test_fofa_key(
         await session.commit()
         await session.refresh(current_row)
         _publish_settings_cache(current_row)
+        _invalidate_fofa_router_cache()
         final_items = _stored_fofa_keys(current_row)
         final = next(
             (item for item in final_items if _fofa_name_key(item.name) == wanted),
@@ -1704,6 +1710,7 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
         await session.commit()
         await session.refresh(current_row)
         _publish_settings_cache(current_row)
+        _invalidate_fofa_router_cache()
 
         final_stored = _stored_providers(current_row)
         if final_stored:

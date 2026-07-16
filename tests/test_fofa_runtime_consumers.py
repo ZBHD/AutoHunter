@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -10,6 +11,16 @@ from app.config import FofaKeyConfig
 from app.fofa.client import FofaError
 from app.fofa.router import FofaKeyRouter
 from app.fofa.router import FofaPoolExhaustedError, FofaPoolFailure
+
+
+@pytest.fixture(autouse=True)
+def isolated_fofa_router_cache(monkeypatch):
+    import app.settings_service as settings
+
+    cache = OrderedDict()
+    monkeypatch.setattr(settings, "_fofa_router_cache", cache)
+    yield
+    cache.clear()
 
 
 def _key(name: str, value: str, base_url: str = "https://fofa.info") -> FofaKeyConfig:
@@ -32,6 +43,28 @@ def test_settings_global_router_is_sticky_and_task_override_isolated(monkeypatch
     task = SimpleNamespace(fofa_config={"key": "task-key", "base_url": "https://task.example"})
     assert settings.fofa_router_for_task(task) is not first
     assert settings.fofa_router_for_task(task).state_snapshot[0].base_url == "https://task.example"
+
+
+def test_health_state_writeback_invalidates_cached_router(monkeypatch):
+    import app.settings_service as settings
+
+    monkeypatch.setattr(settings, "_cache", {
+        "llm": {}, "llm_providers": [], "fofa": {"active_key_name": "A"},
+        "fofa_keys": [_key("A", "key-a").model_copy(update={
+            "runtime_state": "auth_invalid", "failure_kind": "auth",
+        }).model_dump(mode="json")],
+        "engines": {}, "defaults": {},
+    })
+    blocked = settings.fofa_router_for_task()
+    assert blocked.state_snapshot[0].runtime_state == "auth_invalid"
+
+    settings._cache["fofa_keys"][0].update(
+        runtime_state="ready", failure_kind="", failure_count=0, cooldown_until=None
+    )
+    settings._invalidate_fofa_router_cache()
+    recovered = settings.fofa_router_for_task()
+    assert recovered is not blocked
+    assert recovered.state_snapshot[0].runtime_state == "ready"
 
 
 def test_tool_executor_fofa_lookup_rotates_and_uses_endpoint_transport(monkeypatch, tmp_path):
