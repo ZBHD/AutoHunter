@@ -93,6 +93,8 @@ test("AI 未采纳 reuses selection and independent Markdown download controls",
   assert.match(boardView, /AI 未采纳[\s\S]*批量下载 Markdown/);
   assert.match(boardView, /archivedDownloadMarkdown/);
   assert.match(boardView, /downloadMarkdownReports/);
+  assert.match(operationsStyle, /\.result-row\.archived-result-row\s*\{\s*display:\s*grid/);
+  assert.match(operationsStyle, /\.archived-result-open[\s\S]*width:\s*100%/);
 });
 
 test("submit Markdown export uses independent files and the shared downloader", () => {
