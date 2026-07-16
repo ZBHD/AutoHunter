@@ -239,3 +239,36 @@ test("task refresh handlers capture the control epoch and reject in-flight backg
     assert.ok(guardPos >= 0 && applyPos > guardPos, `${name} must guard before applying its response`);
   }
 });
+
+test("task board renders the collector state machine and FOFA rotation events", () => {
+  assert.match(board, /collectorViewModel/);
+  assert.match(board, /mergeCollectorEvent/);
+  assert.match(board, /fofa_key_rotated/);
+  assert.match(board, /fofa_pool_waiting/);
+  assert.match(board, /fofa_pool_blocked/);
+  assert.match(board, /搜集进度/);
+  assert.match(board, /处置进度/);
+  assert.match(board, /最近使用/);
+  assert.match(board, /collectorModel\.keySourceLabel/);
+  assert.match(board, /router\.push\(['"]\/settings['"]\)/);
+  assert.match(board, /aria-live="polite"/);
+  const fmtStart = board.indexOf("function fmtEvent(ev)");
+  const fmtEnd = board.indexOf("\nfunction phaseStateText", fmtStart);
+  assert.ok(fmtStart >= 0 && fmtEnd > fmtStart);
+  const formatter = board.slice(fmtStart, fmtEnd);
+  const fallback = formatter.indexOf("if (ev.message) return ev.message");
+  const structuredFormatter = formatter.indexOf("formatFofaCollectorEvent");
+  assert.ok(structuredFormatter >= 0 && structuredFormatter < fallback, "structured FOFA formatter must run before message fallback");
+});
+
+test("collector status styles cover static failure states and reduced motion", () => {
+  assert.match(style, /\.mission-progress\.indeterminate/);
+  assert.match(style, /\.collector-stage\.tone-active/);
+  assert.match(style, /\.collector-stage\.tone-waiting/);
+  assert.match(style, /\.collector-stage\.tone-blocked/);
+  assert.match(style, /\.collector-stage\.tone-neutral/);
+  assert.match(style, /@media \(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(style, /\.collector-stage-meta\s*>\s*span\s*\{\s*white-space:\s*normal/);
+  assert.match(board, /Legacy Key/);
+  assert.match(board, /不参与池管理/);
+});

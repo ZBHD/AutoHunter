@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "../components/VulnerabilityTypeSelector.vue";
 import { defaultVulnerabilityTypes } from "../vulnerabilityTypes.js";
+import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode } from "../taskSourceModes.js";
 
 const router = useRouter();
 const adv = ref(false);
@@ -21,7 +22,7 @@ const form = reactive({
   use_global_pool: true,
   base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
   prompt_version: "current",
-  fofa_key: "", fofa_base_url: "", max_pages: 20, concurrency: 3,
+  fofa_key: "", fofa_key_mode: "global", fofa_base_url: "", max_pages: 20, concurrency: 3,
   site_recon_mode: "full",
 });
 const inherited = reactive({
@@ -31,9 +32,17 @@ const inherited = reactive({
   concurrency: 3,
 });
 const isSiteMode = computed(() => form.target_source === "site");
+const isAutoMode = computed(() => isAutoSource(form.target_source));
+const isManualOnlyMode = computed(() => isManualOnly(form.target_source));
+const isFofaMode = computed(() => isFofaPoolMode(form.target_source, form.engine));
+const showManualTargets = computed(() => isManualOnlyMode.value || isSiteSource(form.target_source) || form.target_source === "both");
 
 function handleTargetSourceChange() {
   if (isSiteMode.value) form.site_recon_mode = "full";
+}
+
+function handleEngineChange() {
+  if (!isFofaMode.value) form.fofa_key_mode = "global";
 }
 
 async function submit() {
@@ -51,10 +60,18 @@ async function submit() {
 
   const maxPages = parseInt(form.max_pages) || 20;
   const fofaConfig = {};
-  if (form.fofa_key.trim()) fofaConfig.key = form.fofa_key.trim();
-  if (form.fofa_base_url && form.fofa_base_url !== inherited.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
-  if (maxPages !== inherited.max_pages) fofaConfig.max_pages = maxPages;
-  if (form.intent_mode !== inherited.intent_mode) fofaConfig.intent_mode = form.intent_mode;
+  const engineConfig = {};
+  if (isFofaMode.value) {
+    if (form.fofa_key_mode === "task" && form.fofa_key.trim()) fofaConfig.key = form.fofa_key.trim();
+    if (form.fofa_base_url && form.fofa_base_url !== inherited.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
+    if (maxPages !== inherited.max_pages) fofaConfig.max_pages = maxPages;
+    if (form.intent_mode !== inherited.intent_mode) fofaConfig.intent_mode = form.intent_mode;
+  } else if (isAutoMode.value) {
+    if (form.fofa_key.trim()) engineConfig.key = form.fofa_key.trim();
+    if (form.fofa_base_url && form.fofa_base_url !== inherited.fofa_base_url) {
+      engineConfig.base_url = form.fofa_base_url;
+    }
+  }
   if (isSiteMode.value) fofaConfig.site_recon_mode = form.site_recon_mode;
 
   const body = {
@@ -63,13 +80,16 @@ async function submit() {
     vuln_types: [...form.vuln_types],
     hunt_direction: form.hunt_direction.trim(),
     target_source: form.target_source,
-    engine: form.engine,
-    fofa_query: form.fofa_query,
-    manual_targets: form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean),
+    engine: isAutoMode.value ? form.engine : "",
+    fofa_query: isAutoMode.value || isSiteMode.value ? form.fofa_query : "",
+    manual_targets: showManualTargets.value
+      ? form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean)
+      : [],
     src_rules: form.src_rules,
     concurrency: parseInt(form.concurrency) || 3,
     model_config_data: modelConfig,
     fofa_config: fofaConfig,
+    engine_config: engineConfig,
   };
   const task = await api.createTask(body);
   router.push(`/task/${task.id}`);
@@ -138,8 +158,8 @@ onMounted(async () => {
         </div>
         <p class="model-mode-copy">轻量模式保留全部路由，仅将 site_map 预算限制为最多 18 轮。</p>
       </div>
-      <label v-if="!isSiteMode">搜索引擎
-        <select v-model="form.engine">
+      <label v-if="isAutoMode">搜索引擎
+        <select v-model="form.engine" @change="handleEngineChange">
           <option value="">默认引擎</option>
           <option value="fofa">FOFA</option>
           <option value="quake">360 Quake</option>
@@ -149,28 +169,28 @@ onMounted(async () => {
           <option value="censys">Censys</option>
         </select>
       </label>
-      <label v-if="!isSiteMode">搜集方式
+      <label v-if="isFofaMode">搜集方式
         <select v-model="form.intent_mode">
           <option value="">自动判断（写得像语法就当语法，否则当意图）</option>
           <option value="syntax">FOFA 语法（我自己写好了）</option>
           <option value="intent">自然语言意图（让搜集 Agent 翻译成语法并逐轮演化）</option>
         </select>
       </label>
-      <label v-if="!isSiteMode">
+      <label v-if="isAutoMode">
         {{ form.intent_mode === "intent" ? "搜集意图（用大白话说要找什么）" : "FOFA 语法 / 搜集意图" }}
         <input v-model="form.fofa_query"
           :placeholder="form.src_type === 'enterprise'
             ? (form.intent_mode === 'intent' ? '例：找某集团 OA/CRM/ERP/API/运维后台资产' : 'domain=&quot;example.com&quot; || cert=&quot;示例集团&quot; || org=&quot;示例集团&quot;')
             : (form.intent_mode === 'intent' ? '例：找全国高校的统一身份认证登录系统' : 'title=&quot;统一身份认证&quot; && domain=&quot;.edu.cn&quot;')" />
       </label>
-      <label v-else>目标相关信息 / 协作重点 / 已有凭据
+      <label v-else-if="isSiteMode">目标相关信息 / 协作重点 / 已有凭据
         <textarea v-model="form.fofa_query" rows="4" placeholder="可写：重点方向、后台位置、以及【已有的登录凭据】。给了凭据 Agent 会先在前台测，再登录进系统内部深挖（越权/敏感数据/上传/写操作）。&#10;例：后台在 /admin，重点测 API、越权、上传。&#10;已有账号：test / Test@123&#10;或登录态：Cookie: JSESSIONID=xxxx（或 Authorization: Bearer xxxx）"></textarea>
       </label>
-      <label>{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
+      <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
         <textarea v-model="form.manual_targets" rows="3" :placeholder="isSiteMode ? 'https://target.example.com/' : 'http://target.example.com/'"></textarea>
       </label>
       <details :open="adv">
-        <summary @click="adv = !adv">高级：模型 / FOFA / 并发（留空用服务端默认）</summary>
+        <summary @click="adv = !adv">高级：模型{{ isFofaMode ? " / FOFA" : "" }} / 并发（留空用服务端默认）</summary>
         <div class="model-mode-switch" role="group" aria-label="任务模型来源">
           <button type="button" :class="{ active: form.use_global_pool }" :aria-pressed="form.use_global_pool"
             @click="form.use_global_pool = true">
@@ -210,9 +230,26 @@ onMounted(async () => {
             <option value="modern">modern（当前完整版）</option>
           </select>
         </label>
-        <label v-if="!isSiteMode">FOFA key <input v-model="form.fofa_key" type="password" /></label>
-        <label v-if="!isSiteMode">FOFA API 端点 <input v-model="form.fofa_base_url" placeholder="https://fofa.info" /></label>
-        <label v-if="!isSiteMode">FOFA 最大页数 <input v-model="form.max_pages" type="number" /></label>
+        <template v-if="isFofaMode">
+          <div class="model-mode-switch" role="group" aria-label="FOFA Key 来源">
+            <button type="button" :class="{ active: form.fofa_key_mode === 'global' }"
+              :aria-pressed="form.fofa_key_mode === 'global'" @click="form.fofa_key_mode = 'global'">
+              使用全局 FOFA Key 池
+            </button>
+            <button type="button" :class="{ active: form.fofa_key_mode === 'task' }"
+              :aria-pressed="form.fofa_key_mode === 'task'" @click="form.fofa_key_mode = 'task'">
+              任务专用 FOFA Key
+            </button>
+          </div>
+          <p class="model-mode-copy">任务专用 Key 不参与全局轮换。</p>
+          <label v-if="form.fofa_key_mode === 'task'">FOFA Key <input v-model="form.fofa_key" type="password" /></label>
+          <label>FOFA API 端点 <input v-model="form.fofa_base_url" placeholder="https://fofa.info" /></label>
+          <label>FOFA 最大页数 <input v-model="form.max_pages" type="number" /></label>
+        </template>
+        <template v-else-if="isAutoMode">
+          <label>{{ form.engine || "搜索引擎" }} Key <input v-model="form.fofa_key" type="password" /></label>
+          <label>{{ form.engine || "搜索引擎" }} API 端点 <input v-model="form.fofa_base_url" placeholder="https://api.example.com" /></label>
+        </template>
         <label>worker 并发 <input v-model="form.concurrency" type="number" /></label>
       </details>
       <label>SRC 规则（审核用，可留空，审核 agent 已内置{{ form.src_type === 'enterprise' ? '企业SRC' : 'edusrc' }}标准）

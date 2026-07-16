@@ -12,6 +12,8 @@ import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
 import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
 import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
 import QueuedTargetsPanel from "../components/task/QueuedTargetsPanel.vue";
+import { cooldownLabel } from "../fofaKeys.js";
+import { collectorViewModel, formatFofaCollectorEvent, mergeCollectorEvent } from "../collectorStatus.js";
 import {
   taskProgressSummary,
   taskViewForRole,
@@ -449,6 +451,7 @@ async function bootstrapTask() {
 // 实时事件：只展示稍重要的事件，过滤 HTTP/Shell/思考等高频低价值噪音。
 const IMPORTANT_KINDS = new Set([
   "collector_phase",
+  "fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked",
   "finding_submitted", "finding_duplicate", "finding_invalid",
   "worker_start", "worker_finish", "worker_cancelled", "worker_auto_finish",
   "target_done", "target_requeued", "timeout", "auto_deepen", "salvage",
@@ -488,8 +491,13 @@ function isImportantEvent(ev) {
 
 // 把任意事件格式化为一句人话（worker 动作事件本身没有 message）
 function fmtEvent(ev) {
-  if (ev.message) return ev.message;
   const d = ev;
+  const fofaText = formatFofaCollectorEvent(ev, {
+    cooldownLabel,
+    reasonLabel: rotationReasonLabel,
+  });
+  if (fofaText) return fofaText;
+  if (ev.message) return ev.message;
   switch (ev.kind) {
     case "worker_start": {
       const reconMode = siteReconModeLabel(d);
@@ -555,7 +563,7 @@ async function loadBoard(options = {}) {
   if (task.value) {
     if (b.task_status) task.value.status = b.task_status;
     if (b.stats) task.value.stats = b.stats;
-    if (b.fofa_config) task.value.fofa_config = b.fofa_config;
+    if (b.fofa_config !== undefined) task.value.fofa_config = { ...(b.fofa_config || {}) };
     if (b.model_config_data) task.value.model_config_data = b.model_config_data;
     if (b.llm_usage) task.value.llm_usage = b.llm_usage;
   }
@@ -583,7 +591,9 @@ function connectWs() {
     const ev = JSON.parse(e.data);
     if (ev.kind === "ping") return;
     if (!isImportantEvent(ev)) return;
-    if (ev.kind === "collector_phase") updateCollectorStatus(ev);
+    if (["collector_phase", "fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked"].includes(ev.kind)) {
+      updateCollectorStatus(ev);
+    }
     const text = fmtEvent(ev);
     if (!text) return;
     events.value.unshift({ ...ev, _text: text });
@@ -610,13 +620,7 @@ function connectWs() {
 
 function updateCollectorStatus(ev) {
   if (!task.value) return;
-  task.value.fofa_config = {
-    ...(task.value.fofa_config || {}),
-    collector_phase: ev.phase || "",
-    collector_phase_text: ev.message || "",
-    last_target_filter_total: Number(ev.survivors || 0),
-    last_target_filter_evaluated: Number(ev.filter_evaluated || 0),
-  };
+  task.value.fofa_config = mergeCollectorEvent(task.value.fofa_config || {}, ev);
 }
 
 function syncPollers() {
@@ -934,22 +938,9 @@ const totalTargets = computed(() => targetProgress.value.total);
 const resolvedTargets = computed(() => targetProgress.value.resolved);
 const progressPct = computed(() => targetProgress.value.percent);
 const collectorCfg = computed(() => task.value?.fofa_config || {});
-const collectorVisible = computed(() => {
-  // 过滤/入队完成后（phase=dispatch）自动隐藏，不再占位。
-  if (collectorCfg.value.collector_phase === "dispatch") return false;
-  return !!(collectorCfg.value.collector_phase || collectorCfg.value.collector_phase_text);
-});
-const collectorText = computed(() =>
-  collectorCfg.value.collector_phase_text || phaseLabel(collectorCfg.value.collector_phase) || "正在跑过滤器阶段"
-);
-const collectorMeta = computed(() => {
-  const total = Number(collectorCfg.value.last_target_filter_total || 0);
-  const done = Number(collectorCfg.value.last_target_filter_evaluated || 0);
-  if (total > 0) return `过滤器 ${done}/${total}`;
-  return phaseLabel(collectorCfg.value.collector_phase);
-});
+const collectorModel = computed(() => collectorViewModel(task.value || {}, stats.value, collectorCfg.value));
 const collectorPct = computed(() => {
-  const phase = collectorCfg.value.collector_phase || "";
+  const phase = collectorModel.value.phase || "";
   const total = Number(collectorCfg.value.last_target_filter_total || 0);
   const done = Number(collectorCfg.value.last_target_filter_evaluated || 0);
   if (phase === "prefilter") return 18;
@@ -957,7 +948,23 @@ const collectorPct = computed(() => {
   if (phase === "target_filter") return 62;
   if (phase === "enrich") return total > 0 ? Math.max(72, Math.min(88, Math.round((done / total) * 100))) : 78;
   if (phase === "dispatch") return 100;
-  return 25;
+  return collectorModel.value.indeterminate ? 25 : 0;
+});
+const collectorMeta = computed(() => {
+  const total = Number(collectorCfg.value.last_target_filter_total || 0);
+  const done = Number(collectorCfg.value.last_target_filter_evaluated || 0);
+  if (total > 0) return `过滤器 ${done}/${total}`;
+  return "";
+});
+const collectorCooldownText = computed(() => collectorModel.value.cooldownUntil
+  ? cooldownLabel(collectorModel.value.cooldownUntil)
+  : "");
+const collectorRotationText = computed(() => {
+  const rotation = collectorModel.value.rotation;
+  if (!rotation) return "";
+  const from = rotation.from_key_name || "当前 Key";
+  const to = rotation.to_key_name || "备用 Key";
+  return `${from} → ${to}${rotation.reason ? ` · ${rotationReasonLabel(rotation.reason)}` : ""}`;
 });
 function phaseLabel(phase) {
   return ({
@@ -967,6 +974,9 @@ function phaseLabel(phase) {
     enrich: "补充情报",
     dispatch: "入队完成",
   }[phase] || phase || "");
+}
+function rotationReasonLabel(reason) {
+  return ({ auth: "认证失败", rate_limit: "请求限流", daily_limit: "每日额度" }[reason] || "状态变化");
 }
 const runState = computed(() => {
   const s = task.value?.status || "unknown";
@@ -1156,8 +1166,8 @@ function siteReconModeLabel(item) {
       </div>
       <div class="mission-side">
         <div class="progress-ring">
-          <b>{{ progressPct }}%</b>
-          <span>处置进度</span>
+          <b>{{ collectorModel.indeterminate && collectorModel.progressMode === 'collecting' ? "—" : `${progressPct}%` }}</b>
+          <span>{{ collectorModel.progressMode === 'collecting' ? "搜集进度" : "处置进度" }}</span>
         </div>
         <div class="mission-actions" v-if="!readonly">
           <button @click="openEdit">编辑参数</button>
@@ -1173,7 +1183,9 @@ function siteReconModeLabel(item) {
         </div>
         <div v-else class="mission-actions readonly-hint">{{ authRoleRef === 'readonly' ? "只读模式" : "未认证" }}</div>
       </div>
-      <div class="mission-progress"><i :style="{ transform: `scaleX(${progressPct / 100})` }"></i></div>
+      <div class="mission-progress" :class="{ indeterminate: collectorModel.indeterminate && collectorModel.progressMode === 'collecting' }">
+        <i :style="{ transform: `scaleX(${progressPct / 100})` }"></i>
+      </div>
     </div>
 
     <!-- 单站协作态势：三阶段流水线（侦察→主题深挖→定向追打），体现同站多路线协同 -->
@@ -1229,12 +1241,27 @@ function siteReconModeLabel(item) {
       </div>
     </section>
 
-    <div v-if="collectorVisible" class="collector-stage">
+    <div v-if="collectorModel.visible" class="collector-stage" :class="`tone-${collectorModel.tone}`" aria-live="polite">
       <div class="collector-stage-head">
-        <b>{{ collectorText }}</b>
-        <span>{{ collectorMeta }}</span>
+        <div class="collector-stage-label">
+          <b>{{ collectorModel.label }}</b>
+          <small v-if="collectorModel.phase">阶段：{{ collectorModel.phaseKnown ? phaseLabel(collectorModel.phase) : "等待状态同步" }}</small>
+        </div>
+        <span class="collector-stage-meta">
+          <span v-if="collectorModel.keyReadonly">Legacy Key（只读，不可编辑，不参与池管理）</span>
+          <span v-else-if="collectorModel.lastKeyName">
+            {{ collectorModel.keySource === 'task_override' ? `${collectorModel.keySourceLabel}：` : "最近使用：" }}{{ collectorModel.lastKeyName }}
+          </span>
+          <span v-if="collectorModel.poolAvailable !== null && collectorModel.poolTotal !== null">可用 {{ collectorModel.poolAvailable }}/{{ collectorModel.poolTotal }}</span>
+          <span v-if="collectorMeta">{{ collectorMeta }}</span>
+        </span>
       </div>
-      <div class="collector-stage-bar">
+      <p v-if="collectorRotationText" class="collector-rotation">轮换：{{ collectorRotationText }}</p>
+      <p v-if="collectorModel.tone === 'waiting' && collectorCooldownText" class="collector-cooldown">{{ collectorCooldownText }}</p>
+      <p v-if="collectorModel.tone === 'blocked'" class="collector-blocked-help">
+        Key 池已阻断，搜集暂时停止。<button type="button" class="collector-settings-link" @click="router.push('/settings')">前往设置</button>
+      </p>
+      <div class="collector-stage-bar" :class="{ indeterminate: collectorModel.indeterminate }">
         <i :style="{ transform: `scaleX(${collectorPct / 100})` }"></i>
       </div>
     </div>
