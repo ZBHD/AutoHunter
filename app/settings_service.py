@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import FofaKeyConfig, LLMConfig, LLMProviderConfig
@@ -1918,9 +1918,26 @@ async def _persist_fofa_key_state(change: FofaKeyStateChange) -> bool:
             items[index] = updated
 
             fofa = dict(row.fofa or {})
-            active = _select_fofa_active_name(
-                str(change.active_key_name or "").strip(), items
+            requested_active = str(change.active_key_name or "").strip()
+            requested_key = _fofa_name_key(requested_active)
+            requested_item = next(
+                (
+                    item
+                    for item in items
+                    if _fofa_name_key(item.name) == requested_key
+                    and _fofa_key_eligible(item)
+                ),
+                None,
             )
+            if requested_item is not None:
+                active = requested_item.name
+            else:
+                # A malformed/stale router hint must not rotate away from the
+                # currently valid persisted active key. Only fall back to the
+                # first eligible key when the persisted active is unavailable.
+                active = _select_fofa_active_name(
+                    str(fofa.get("active_key_name") or ""), items
+                )
             if fofa.get("active_key_name") != active:
                 fofa["active_key_name"] = active
                 row.fofa = fofa
