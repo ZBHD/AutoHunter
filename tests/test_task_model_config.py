@@ -495,6 +495,56 @@ def test_patch_global_pool_clears_override_fields_but_keeps_prompt_version(task_
     assert "old-secret" not in response.text
 
 
+def test_patch_fofa_key_null_clears_task_override(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Clear FOFA key", "fofa_config": {"key": "task-fofa-secret"}},
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"fofa_config": {"key": None}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "key" not in asyncio.run(_stored_fofa_config(session_maker, created["id"]))
+
+
+def test_patch_fofa_key_omitted_preserves_task_override(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Keep omitted FOFA key", "fofa_config": {"key": "task-fofa-secret"}},
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"fofa_config": {"intent_mode": "intent"}},
+    )
+
+    assert response.status_code == 200, response.text
+    stored = asyncio.run(_stored_fofa_config(session_maker, created["id"]))
+    assert stored["key"] == "task-fofa-secret"
+
+
+def test_patch_fofa_key_blank_preserves_task_override(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Keep blank FOFA key", "fofa_config": {"key": "task-fofa-secret"}},
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"fofa_config": {"key": ""}},
+    )
+
+    assert response.status_code == 200, response.text
+    stored = asyncio.run(_stored_fofa_config(session_maker, created["id"]))
+    assert stored["key"] == "task-fofa-secret"
+
+
 @pytest.mark.parametrize("replacement", ["", "********"])
 def test_patch_dedicated_task_preserves_key_for_empty_or_masked_value(
     task_api, replacement

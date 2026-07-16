@@ -222,6 +222,7 @@ def _public_fofa_config(task: Task) -> dict:
         "intent_mode": eff["intent_mode"],
         "site_recon_mode": site_collab.recon_mode_for(task),
         "key_set": bool(eff["key"]),
+        "key_source": "task" if cfg.get("key") else "global",
         "current_query": cfg.get("current_query", ""),
         "cursor": cfg.get("cursor", 0),
         "collector_phase": cfg.get("collector_phase", ""),
@@ -518,8 +519,11 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
     if req.fofa_config is not None:
         patch = req.fofa_config.model_dump(exclude_unset=True)
         cfg = dict(task.fofa_config or {})
-        if "key" in patch and str(patch.get("key") or "").strip():
-            cfg["key"] = str(patch["key"]).strip()
+        if "key" in patch:
+            if patch["key"] is None:
+                cfg.pop("key", None)
+            elif str(patch["key"]).strip():
+                cfg["key"] = str(patch["key"]).strip()
         if "base_url" in patch and patch["base_url"] is not None:
             cfg["base_url"] = str(patch["base_url"]).strip()
         if "max_pages" in patch and patch["max_pages"] is not None:
