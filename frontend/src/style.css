@@ -1070,7 +1070,7 @@ main {
 .settings-health-check.stale .health-check-head b { color: var(--warn); }
 .health-check-stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin-top: 8px;
   padding: 7px 0;
   border-top: 1px solid var(--border-soft);
@@ -1539,6 +1539,83 @@ main {
   font-weight: 700;
 }
 .provider-test-result strong { font-weight: 700; }
+.provider-badge.active {
+  color: var(--info);
+  background: var(--info-bg);
+}
+.provider-badge.ok {
+  color: var(--ok);
+  background: var(--ok-bg);
+}
+.provider-badge.warn {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+.provider-badge.danger {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+.provider-badge.muted {
+  color: var(--muted);
+  background: var(--surface-2);
+}
+.fofa-key-row {
+  align-items: start;
+}
+.fofa-key-meta {
+  grid-template-columns: minmax(110px, 1fr) minmax(80px, .7fr) minmax(130px, 1.1fr);
+}
+.fofa-key-secret {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 5px;
+  color: var(--faint);
+  font-size: 10px;
+}
+.fofa-key-secret > code {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fofa-test-result {
+  line-height: 1.5;
+}
+.fofa-probe-details {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  margin-top: 5px;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+.fofa-probe-details > span {
+  flex: none;
+  padding: 2px 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  background: var(--surface-2);
+}
+.fofa-probe-details > code {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fofa-url-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
 .provider-actions {
   display: flex;
   align-items: center;
@@ -1827,6 +1904,15 @@ main {
   }
   .provider-meta {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .health-check-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .health-check-stats span:nth-child(odd) {
+    border-left: 0;
+  }
+  .fofa-key-meta > div:last-child {
+    grid-column: 1 / -1;
   }
   .provider-actions,
   .provider-readonly {

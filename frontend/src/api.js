@@ -262,6 +262,16 @@ export const api = {
     req("POST", `/api/settings/llm-providers/${encodeURIComponent(name)}/test`),
   orderLlmProviders: (names) =>
     req("PUT", "/api/settings/llm-providers/order", { names }),
+  listFofaKeys: () => req("GET", "/api/settings/fofa-keys"),
+  createFofaKey: (data) => req("POST", "/api/settings/fofa-keys", data),
+  updateFofaKey: (name, data) =>
+    req("PUT", `/api/settings/fofa-keys/${encodeURIComponent(name)}`, data),
+  deleteFofaKey: (name) =>
+    req("DELETE", `/api/settings/fofa-keys/${encodeURIComponent(name)}`),
+  testFofaKey: (name) =>
+    req("POST", `/api/settings/fofa-keys/${encodeURIComponent(name)}/test`),
+  orderFofaKeys: (names) =>
+    req("PUT", "/api/settings/fofa-keys/order", { names }),
   // 跨任务疑似漏洞池
   missedSignalStats: (opts = {}) => req("GET", `/api/missed-signals/stats${qs(opts)}`),
   missedSignals: (opts = {}) => req("GET", `/api/missed-signals${qs(opts)}`),
