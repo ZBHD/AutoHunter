@@ -14,6 +14,7 @@ from app.fofa.router import (
     FofaFailureKind,
     FofaKeyRouter,
     FofaKeyStateSnapshot,
+    FofaRequestAttempt,
     FofaPoolExhaustedError,
     fofa_credential_fingerprint,
 )
@@ -156,6 +157,124 @@ def test_transient_failure_does_not_rotate_and_is_reraised_safely() -> None:
     assert exc_info.value.kind == "transient"
     assert "secret-a" not in str(exc_info.value)
     assert router.keys[0].runtime_state == "ready"
+
+
+def test_sync_attempt_callback_reports_failed_then_success_without_secrets() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter([key("A", "secret-a"), key("B", "secret-b")], active_name="A")
+
+    def operation(secret: str, _base_url: str) -> str:
+        if secret == "secret-a":
+            raise FofaError("invalid key", kind="auth")
+        return "ok"
+
+    assert router.execute_sync(operation, on_attempt=attempts.append) == "ok"
+    assert attempts == [
+        FofaRequestAttempt(key_name="A", outcome="failed", failure_kind="auth"),
+        FofaRequestAttempt(key_name="B", outcome="success"),
+    ]
+    assert all("secret-" not in repr(item) for item in attempts)
+    assert all("fofa.example" not in repr(item) for item in attempts)
+
+
+def test_async_attempt_callback_reports_failed_then_success() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
+
+    async def operation(secret: str, _base_url: str) -> str:
+        if secret == "key-a":
+            raise FofaError("limited", kind="rate_limit")
+        return "ok"
+
+    async def scenario() -> str:
+        return await router.execute_async(operation, on_attempt=attempts.append)
+
+    assert asyncio.run(scenario()) == "ok"
+    assert attempts == [
+        FofaRequestAttempt(key_name="A", outcome="failed", failure_kind="rate_limit"),
+        FofaRequestAttempt(key_name="B", outcome="success"),
+    ]
+
+
+def test_attempt_callback_reports_transient_before_error_and_does_not_rotate() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter([key("A", "secret-a"), key("B", "secret-b")], active_name="A")
+
+    with pytest.raises(FofaError) as exc_info:
+        router.execute_sync(
+            lambda *_: (_ for _ in ()).throw(FofaError("network", kind="transient")),
+            on_attempt=attempts.append,
+        )
+
+    assert exc_info.value.kind == "transient"
+    assert attempts == [
+        FofaRequestAttempt(key_name="A", outcome="failed", failure_kind="transient"),
+    ]
+
+
+def test_async_attempt_callback_reports_transient_before_error_and_does_not_rotate() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter([key("A", "key-a"), key("B", "key-b")], active_name="A")
+
+    async def operation(_secret: str, _base_url: str) -> str:
+        raise FofaError("network", kind="transient")
+
+    async def scenario() -> None:
+        with pytest.raises(FofaError) as exc_info:
+            await router.execute_async(operation, on_attempt=attempts.append)
+        assert exc_info.value.kind == "transient"
+
+    asyncio.run(scenario())
+    assert attempts == [
+        FofaRequestAttempt(key_name="A", outcome="failed", failure_kind="transient"),
+    ]
+
+
+def test_execute_without_attempt_callback_keeps_legacy_calls() -> None:
+    router = FofaKeyRouter([key("A", "key-a")])
+    assert router.execute_sync(lambda *_: "sync") == "sync"
+
+    async def scenario() -> str:
+        return await router.execute_async(lambda *_: _async_value("async"))
+
+    assert asyncio.run(scenario()) == "async"
+
+
+def test_request_attempt_is_immutable() -> None:
+    attempt = FofaRequestAttempt(key_name="A", outcome="success")
+    with pytest.raises((AttributeError, TypeError)):
+        attempt.key_name = "B"  # type: ignore[misc]
+
+
+def test_request_attempt_is_exported_from_public_fofa_module() -> None:
+    from app.fofa import FofaRequestAttempt as PublicFofaRequestAttempt
+
+    assert PublicFofaRequestAttempt is FofaRequestAttempt
+
+
+def test_attempt_callback_errors_are_isolated_from_router_result(caplog) -> None:
+    router = FofaKeyRouter([key("A", "key-a")])
+
+    def on_attempt(_attempt: FofaRequestAttempt) -> None:
+        raise RuntimeError("callback failed")
+
+    with caplog.at_level("ERROR"):
+        assert router.execute_sync(lambda *_: "ok", on_attempt=on_attempt) == "ok"
+    assert "FOFA 请求尝试回调失败" in caplog.text
+
+
+def test_preblocked_entries_do_not_emit_attempt_callbacks() -> None:
+    attempts: list[FofaRequestAttempt] = []
+    router = FofaKeyRouter(
+        [
+            key("disabled", "key-d", enabled=False),
+            key("auth", "key-a", runtime_state="auth_invalid"),
+        ]
+    )
+
+    with pytest.raises(FofaPoolExhaustedError):
+        router.execute_sync(lambda *_: pytest.fail("no eligible key"), on_attempt=attempts.append)
+    assert attempts == []
 
 
 def test_earliest_retry_and_all_blocked_pool_state() -> None:

@@ -65,6 +65,15 @@ class FofaKeyStateSnapshot:
 
 
 @dataclass(frozen=True)
+class FofaRequestAttempt:
+    """Credential-free metadata for one key candidate request."""
+
+    key_name: str
+    outcome: str
+    failure_kind: str = ""
+
+
+@dataclass(frozen=True)
 class FofaPoolFailure:
     name: str
     kind: str
@@ -160,11 +169,34 @@ class FofaKeyRouter(Generic[T]):
     def key_states(self) -> list[FofaKeyStateSnapshot]:
         return self.state_snapshot
 
-    def execute_sync(self, operation: Callable[[str, str], T]) -> T:
-        return self._execute_sync_ring(operation)
+    def execute_sync(
+        self,
+        operation: Callable[[str, str], T],
+        *,
+        on_attempt: Callable[[FofaRequestAttempt], None] | None = None,
+    ) -> T:
+        return self._execute_sync_ring(operation, on_attempt=on_attempt)
 
-    async def execute_async(self, operation: Callable[[str, str], Awaitable[T]]) -> T:
-        return await self._execute_async_ring(operation)
+    async def execute_async(
+        self,
+        operation: Callable[[str, str], Awaitable[T]],
+        *,
+        on_attempt: Callable[[FofaRequestAttempt], None] | None = None,
+    ) -> T:
+        return await self._execute_async_ring(operation, on_attempt=on_attempt)
+
+    @staticmethod
+    def _notify_attempt(
+        callback: Callable[[FofaRequestAttempt], None] | None,
+        attempt: FofaRequestAttempt,
+        redact: Callable[[object], str],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(attempt)
+        except Exception as exc:  # attempt callbacks never affect routing
+            logger.error("FOFA 请求尝试回调失败：%s", redact(exc))
 
     def _snapshot_entry(self, entry: _Entry) -> FofaKeyStateSnapshot:
         item = entry.config
@@ -522,7 +554,12 @@ class FofaKeyRouter(Generic[T]):
                         result = item.cooldown_until
             return result
 
-    def _execute_sync_ring(self, operation: Callable[[str, str], T]) -> T:
+    def _execute_sync_ring(
+        self,
+        operation: Callable[[str, str], T],
+        *,
+        on_attempt: Callable[[FofaRequestAttempt], None] | None = None,
+    ) -> T:
         candidates, _initial_retry, blocked = self._candidate_snapshot()
         failures: list[FofaPoolFailure] = list(blocked)
         for candidate in candidates:
@@ -535,6 +572,11 @@ class FofaKeyRouter(Generic[T]):
                 have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
+                attempt = FofaRequestAttempt(
+                    key_name=candidate.name,
+                    outcome="failed",
+                    failure_kind=kind.value,
+                )
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
                     transient_error = self._safe_error(error, kind)
@@ -542,6 +584,7 @@ class FofaKeyRouter(Generic[T]):
                     retry_after = error.retry_after if isinstance(error, FofaError) else None
                     self._mark_failure(candidate, kind, retry_after)
                     pool_failure = self._pool_failure(candidate, error, kind)
+                self._notify_attempt(on_attempt, attempt, self._redact)
             if transient_error is not None:
                 raise transient_error from None
             if pool_failure is not None:
@@ -549,10 +592,20 @@ class FofaKeyRouter(Generic[T]):
                 continue
             if have_result:
                 self._mark_success(candidate)
+                self._notify_attempt(
+                    on_attempt,
+                    FofaRequestAttempt(key_name=candidate.name, outcome="success"),
+                    self._redact,
+                )
                 return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 
-    async def _execute_async_ring(self, operation: Callable[[str, str], Awaitable[T]]) -> T:
+    async def _execute_async_ring(
+        self,
+        operation: Callable[[str, str], Awaitable[T]],
+        *,
+        on_attempt: Callable[[FofaRequestAttempt], None] | None = None,
+    ) -> T:
         candidates, _initial_retry, blocked = self._candidate_snapshot()
         failures: list[FofaPoolFailure] = list(blocked)
         for candidate in candidates:
@@ -565,6 +618,11 @@ class FofaKeyRouter(Generic[T]):
                 have_result = True
             except Exception as error:
                 kind = self._failure_kind(error.kind if isinstance(error, FofaError) else "transient")
+                attempt = FofaRequestAttempt(
+                    key_name=candidate.name,
+                    outcome="failed",
+                    failure_kind=kind.value,
+                )
                 if kind is FofaFailureKind.TRANSIENT:
                     self._mark_failure(candidate, kind, None)
                     transient_error = self._safe_error(error, kind)
@@ -572,6 +630,7 @@ class FofaKeyRouter(Generic[T]):
                     retry_after = error.retry_after if isinstance(error, FofaError) else None
                     self._mark_failure(candidate, kind, retry_after)
                     pool_failure = self._pool_failure(candidate, error, kind)
+                self._notify_attempt(on_attempt, attempt, self._redact)
             if transient_error is not None:
                 raise transient_error from None
             if pool_failure is not None:
@@ -579,6 +638,11 @@ class FofaKeyRouter(Generic[T]):
                 continue
             if have_result:
                 self._mark_success(candidate)
+                self._notify_attempt(
+                    on_attempt,
+                    FofaRequestAttempt(key_name=candidate.name, outcome="success"),
+                    self._redact,
+                )
                 return result  # type: ignore[return-value]
         raise FofaPoolExhaustedError(failures, self._next_retry_at())
 
@@ -588,6 +652,7 @@ __all__ = [
     "FofaKeyRouter",
     "FofaKeyStateChange",
     "FofaKeyStateSnapshot",
+    "FofaRequestAttempt",
     "FofaPoolExhaustedError",
     "FofaPoolFailure",
     "fofa_credential_fingerprint",
