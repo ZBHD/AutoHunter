@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   collectorViewModel,
+  formatFofaCollectorEvent,
   isAutoCollectionTask,
   mergeCollectorEvent,
 } from "../src/collectorStatus.js";
@@ -114,4 +115,35 @@ test("unknown collector state is neutral and does not animate", () => {
   assert.equal(model.tone, "neutral");
   assert.equal(model.label, "搜集状态更新中");
   assert.equal(model.indeterminate, false);
+});
+
+test("historical FOFA events without payload preserve their stored message", () => {
+  assert.equal(
+    formatFofaCollectorEvent({ kind: "fofa_key_rotated", message: "凭据已切换" }),
+    "凭据已切换",
+  );
+  assert.equal(
+    formatFofaCollectorEvent({ kind: "fofa_pool_waiting", message: "凭据池正在等待" }),
+    "凭据池正在等待",
+  );
+});
+
+test("live FOFA events use structured rotation and cooldown details", () => {
+  assert.equal(
+    formatFofaCollectorEvent(
+      { kind: "fofa_key_rotated", message: "短消息", from_key_name: "Primary", to_key_name: "Backup", reason: "rate_limit" },
+      { reasonLabel: () => "请求限流" },
+    ),
+    "FOFA Key 已切换：Primary → Backup（请求限流）",
+  );
+  assert.equal(
+    formatFofaCollectorEvent(
+      { kind: "fofa_pool_waiting", message: "短消息", cooldown_remaining: 42 },
+    ),
+    "FOFA Key 池冷却中，还剩 42 秒",
+  );
+  assert.equal(
+    formatFofaCollectorEvent({ kind: "fofa_pool_blocked", message: "内部短消息" }),
+    "FOFA Key 池已阻断，搜集已暂停",
+  );
 });

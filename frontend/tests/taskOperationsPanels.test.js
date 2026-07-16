@@ -249,9 +249,8 @@ test("task board renders the collector state machine and FOFA rotation events", 
   assert.ok(fmtStart >= 0 && fmtEnd > fmtStart);
   const formatter = board.slice(fmtStart, fmtEnd);
   const fallback = formatter.indexOf("if (ev.message) return ev.message");
-  for (const kind of ["fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked"]) {
-    assert.ok(formatter.indexOf(`case \"${kind}\"`) < fallback, `${kind} must use its dedicated formatter first`);
-  }
+  const structuredFormatter = formatter.indexOf("formatFofaCollectorEvent");
+  assert.ok(structuredFormatter >= 0 && structuredFormatter < fallback, "structured FOFA formatter must run before message fallback");
 });
 
 test("collector status styles cover static failure states and reduced motion", () => {

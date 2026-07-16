@@ -20,6 +20,39 @@ function isRecord(value) {
 }
 
 /**
+ * Format structured FOFA activity without breaking historical events whose
+ * payload was not persisted. Returning null delegates those events to the
+ * caller's normal message formatter.
+ */
+export function formatFofaCollectorEvent(event = {}, options = {}) {
+  const kind = String(event.kind || event.event_kind || "");
+  const message = event.message || null;
+  if (kind === "fofa_key_rotated") {
+    if (!event.from_key_name || !event.to_key_name) return message;
+    const reason = event.reason
+      ? (typeof options.reasonLabel === "function" ? options.reasonLabel(event.reason) : event.reason)
+      : "";
+    return `FOFA Key 已切换：${event.from_key_name} → ${event.to_key_name}${reason ? `（${reason}）` : ""}`;
+  }
+  if (kind === "fofa_pool_waiting") {
+    if (event.next_retry_at) {
+      const cooldown = typeof options.cooldownLabel === "function"
+        ? options.cooldownLabel(event.next_retry_at)
+        : event.next_retry_at;
+      return `FOFA Key 池冷却中，${cooldown}`;
+    }
+    const remaining = Number(event.cooldown_remaining);
+    if (event.cooldown_remaining !== undefined && event.cooldown_remaining !== null
+        && event.cooldown_remaining !== "" && Number.isFinite(remaining)) {
+      return `FOFA Key 池冷却中，还剩 ${Math.max(0, Math.ceil(remaining))} 秒`;
+    }
+    return message;
+  }
+  if (kind === "fofa_pool_blocked") return "FOFA Key 池已阻断，搜集已暂停";
+  return null;
+}
+
+/**
  * Apply only fields carried by a collector event. Runtime snapshots are
  * intentionally sparse, so absent counters must never be interpreted as 0.
  */

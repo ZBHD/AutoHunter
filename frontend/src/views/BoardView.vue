@@ -12,7 +12,7 @@ import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
 import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
 import QueuedTargetsPanel from "../components/task/QueuedTargetsPanel.vue";
 import { cooldownLabel } from "../fofaKeys.js";
-import { collectorViewModel, mergeCollectorEvent } from "../collectorStatus.js";
+import { collectorViewModel, formatFofaCollectorEvent, mergeCollectorEvent } from "../collectorStatus.js";
 import {
   taskProgressSummary,
   taskViewForRole,
@@ -491,22 +491,11 @@ function isImportantEvent(ev) {
 // 把任意事件格式化为一句人话（worker 动作事件本身没有 message）
 function fmtEvent(ev) {
   const d = ev;
-  // Credential-pool events carry a structured payload; format that payload
-  // before honoring the generic message field so useful rotation context is
-  // not discarded by the server's short status text.
-  switch (ev.kind) {
-    case "fofa_key_rotated": {
-      const from = d.from_key_name || "当前 Key";
-      const to = d.to_key_name || "备用 Key";
-      return `FOFA Key 已切换：${from} → ${to}${d.reason ? `（${rotationReasonLabel(d.reason)}）` : ""}`;
-    }
-    case "fofa_pool_waiting":
-      return `FOFA Key 池冷却中${d.next_retry_at ? `，${cooldownLabel(d.next_retry_at)}` : "，稍后重试"}`;
-    case "fofa_pool_blocked":
-      return `FOFA Key 池已阻断${d.message ? `：${d.message}` : "，搜集已暂停"}`;
-    default:
-      break;
-  }
+  const fofaText = formatFofaCollectorEvent(ev, {
+    cooldownLabel,
+    reasonLabel: rotationReasonLabel,
+  });
+  if (fofaText) return fofaText;
   if (ev.message) return ev.message;
   switch (ev.kind) {
     case "worker_start": {
