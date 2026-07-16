@@ -11,13 +11,21 @@ from app.security import auth_enabled, resolve_role, token_from_headers
 router = APIRouter(tags=["stream"])
 
 
+_OBSERVER_FOFA_MESSAGES = {
+    "fofa_key_rotated": "FOFA 凭据已切换到备用 Key",
+    "fofa_pool_waiting": "FOFA 凭据池暂不可用，等待冷却后重试",
+    "fofa_pool_blocked": "FOFA 凭据池已阻断，搜集已暂停",
+}
+
+
 def _observer_event(event: dict) -> dict:
     """观摩模式 WebSocket 脱敏：只保留事件基本轮廓，不透出 URL/命令/漏洞标题/凭证等 payload。"""
+    kind = event.get("kind", "")
     return {
         "agent": event.get("agent", ""),
-        "kind": event.get("kind", ""),
+        "kind": kind,
         "level": event.get("level", "info"),
-        "message": event.get("message", ""),
+        "message": _OBSERVER_FOFA_MESSAGES.get(kind, event.get("message", "")),
         "ts": event.get("ts"),
         "site_route": event.get("site_route", ""),
         "site_recon_mode": event.get("site_recon_mode", ""),

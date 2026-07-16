@@ -183,6 +183,28 @@ def test_observer_stream_preserves_only_non_sensitive_site_mode_metadata() -> No
     assert "token" not in projected
 
 
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("fofa_key_rotated", "FOFA 凭据已切换到备用 Key"),
+        ("fofa_pool_waiting", "FOFA 凭据池暂不可用，等待冷却后重试"),
+        ("fofa_pool_blocked", "FOFA 凭据池已阻断，搜集已暂停"),
+    ],
+)
+def test_observer_stream_uses_generic_fofa_status_messages(kind, message) -> None:
+    projected = _observer_event({
+        "agent": "collector",
+        "kind": kind,
+        "message": "已从 Primary Secret Key 切换到 Backup Secret Key",
+        "from_key_name": "Primary Secret Key",
+        "to_key_name": "Backup Secret Key",
+    })
+
+    assert projected["message"] == message
+    assert "Primary Secret Key" not in projected["message"]
+    assert "Backup Secret Key" not in projected["message"]
+
+
 def _worker_for_route(source: str, recon_mode: str = "light") -> Worker:
     worker = Worker.__new__(Worker)
     worker.target_meta = {
