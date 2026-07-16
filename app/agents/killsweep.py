@@ -19,9 +19,7 @@ import re
 import secrets
 import threading
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
-
-import httpx
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 from app.agents.history import compact_messages
 from app.agents.prompts import is_enterprise_src, killsweep_system_prompt
@@ -31,6 +29,9 @@ from app.missed_signals import detect_tool_signals
 from app.raw_evidence import detach_capture
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import killsweep_tool_schemas
+from app.fofa import endpoints as fofa_endpoints
+from app.fofa.client import FofaError, _FOFA_ALLOWED_HOSTS, classify_fofa_failure, extract_fofa_error, extract_fofa_response_failure
+from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
 
 _FOFA_BASE = "https://fofa.info"
 # 通杀分析只做产品指纹、FOFA 圈定、抽样验证，必须有限轮数，避免模型递归空转。
@@ -435,47 +436,64 @@ def _normalize_affected_table(rows: Any, vuln_type: str) -> list[dict[str, Any]]
 
 def _fofa_search_sync(key: str, query: str, edu_only: bool = False,
                       size: int = 20, base_url: str | None = None,
-                      executor: ToolExecutor | None = None) -> dict[str, Any]:
+                      executor: ToolExecutor | None = None,
+                      router: FofaKeyRouter | None = None) -> dict[str, Any]:
     """同步 FOFA 查询，返回 {size, sample:[{host,title,org}], query}。"""
-    if not key:
+    if router is None and not key:
         return {"size": 0, "sample": [], "query": query, "error": "缺少 FOFA key"}
     q = f"{query} && {_EDU_FILTER}" if edu_only else query
-    base = (base_url or _FOFA_BASE).rstrip("/")
     params = {
-        "key": key, "qbase64": _qbase64(q),
+        "qbase64": _qbase64(q),
         "fields": "host,title,org", "page": "1", "size": str(size), "full": "false",
     }
-    capture = None
+    if router is None and key:
+        from app.config import FofaKeyConfig
+        router = FofaKeyRouter([FofaKeyConfig(name="Legacy", key=key, base_url=(base_url or _FOFA_BASE))], active_name="Legacy")
+    if router is None:
+        return {"size": 0, "sample": [], "query": q, "error": "缺少 FOFA key"}
+
+    def operation(routed_key: str, routed_base: str):
+        result = fofa_endpoints.request_sync(
+            routed_key,
+            routed_base,
+            purpose="search",
+            params=params,
+            timeout=30,
+            allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+        )
+        if result.category == "network":
+            raise FofaError("FOFA 网络请求失败", kind="transient")
+        response = result.response
+        if response is None:
+            raise FofaError("FOFA 返回为空", kind="transient")
+        if not 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
+            text = extract_fofa_response_failure(response)
+            kind, code, retry_after = classify_fofa_failure(text, status=getattr(response, "status_code", None))
+            raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+        try:
+            data = response.json()
+        except Exception:
+            raise FofaError("FOFA 返回非 JSON", kind="transient") from None
+        if not isinstance(data, dict):
+            raise FofaError("FOFA 返回格式异常", kind="transient")
+        if data.get("error"):
+            text, _ = extract_fofa_error(data, "FOFA 错误")
+            kind, code, retry_after = classify_fofa_failure(text)
+            raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+        return data
+
     try:
-        if executor is not None:
-            raw = executor.http_request(
-                url=f"{base}/api/v1/search/all?{urlencode(params)}",
-                method="GET",
-                timeout=30,
-            )
-            capture = raw.get("_capture")
-            if not raw.get("ok"):
-                return {
-                    "size": 0, "sample": [], "query": q,
-                    "error": raw.get("error") or "FOFA 调用失败",
-                    **({"_capture": capture} if capture else {}),
-                }
-            data = json.loads(raw.get("body") or "{}")
-        else:
-            with httpx.Client(timeout=30) as client:
-                resp = client.get(f"{base}/api/v1/search/all", params=params)
-                data = resp.json()
-            capture = None
-    except Exception as e:
-        result = {"size": 0, "sample": [], "query": q, "error": f"FOFA 调用失败: {e}"}
-        if capture:
-            result["_capture"] = capture
-        return result
-    if data.get("error"):
-        result = {"size": 0, "sample": [], "query": q, "error": data.get("errmsg", "FOFA 错误")}
-        if capture:
-            result["_capture"] = capture
-        return result
+        data = router.execute_sync(operation)
+    except FofaPoolExhaustedError as exc:
+        retry_at = exc.next_retry_at.isoformat().replace("+00:00", "Z") if exc.next_retry_at else None
+        return {"size": 0, "sample": [], "query": q, "error": "FOFA 凭据池暂不可用",
+                "kind": "pool_exhausted", **({"next_retry_at": retry_at} if retry_at else {})}
+    except FofaError as exc:
+        return {"size": 0, "sample": [], "query": q, "error": "FOFA 请求失败",
+                "kind": str(exc.kind or "transient"),
+                **({"next_retry_after": exc.retry_after} if exc.retry_after is not None else {})}
+    except Exception:
+        return {"size": 0, "sample": [], "query": q, "error": "FOFA 调用失败", "kind": "transient"}
     sample = []
     for row in data.get("results", [])[:size]:
         if isinstance(row, list):
@@ -483,8 +501,6 @@ def _fofa_search_sync(key: str, query: str, edu_only: bool = False,
                            "title": row[1] if len(row) > 1 else "",
                            "org": row[2] if len(row) > 2 else ""})
     result = {"size": data.get("size", 0), "sample": sample, "query": q}
-    if capture:
-        result["_capture"] = capture
     return result
 
 
@@ -500,16 +516,18 @@ class KillsweepHunter:
     def __init__(
         self,
         finding: dict,
-        fofa_key: str,
-        llm: LLMRouter,
+        fofa_key: str = "",
+        llm: LLMRouter | None = None,
         on_event: Optional[Callable[[str, dict], None]] = None,
         src_type: str = "edusrc",
         cancel_event: Optional[threading.Event] = None,
         fofa_base_url: str = "",
+        fofa_router: FofaKeyRouter | None = None,
     ):
         self.finding = finding
         self.fofa_key = fofa_key
         self.fofa_base_url = fofa_base_url
+        self.fofa_router = fofa_router
         self.llm = llm
         self.cancel_event = cancel_event or threading.Event()
         self.src_type = src_type
@@ -521,6 +539,7 @@ class KillsweepHunter:
             enterprise=self._enterprise,
             capture_full=True,
             scope_target=target_url,
+            fofa_router=fofa_router,
         )
         self._tools = killsweep_tool_schemas(enterprise=self._enterprise)
         self.on_event = on_event or (lambda kind, data: None)
@@ -609,6 +628,7 @@ class KillsweepHunter:
             result = _fofa_search_sync(
                 self.fofa_key, q, edu_only=edu,
                 base_url=self.fofa_base_url, executor=self.executor,
+                router=self.fofa_router,
             )
             return self._emit_tool_result(name, result, arguments=args)
         if name == "http_request":

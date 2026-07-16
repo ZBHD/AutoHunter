@@ -48,6 +48,15 @@ from app.tools.src_toolkit import (
     parse_src_output,
 )
 from app.tools.waf_advisor import suggest_waf_bypass as _suggest_waf_bypass
+from app.fofa import endpoints as fofa_endpoints
+from app.fofa.client import (
+    FofaError,
+    _FOFA_ALLOWED_HOSTS,
+    classify_fofa_failure,
+    extract_fofa_error,
+    extract_fofa_response_failure,
+)
+from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
 
 _FOFA_BASE = "https://fofa.info"
 # FOFA 只读查询硬上限：worker 用它确认归属/探攻击面，不是测绘，给小额度即可。
@@ -209,6 +218,7 @@ class ToolExecutor:
         enterprise: bool = False,
         fofa_key: str = "",
         fofa_base_url: str = "",
+        fofa_router: FofaKeyRouter | None = None,
         capture_full: bool = False,
         scope_target: str = "",
     ):
@@ -219,6 +229,15 @@ class ToolExecutor:
         self.enterprise = enterprise
         self.fofa_key = fofa_key or ""
         self.fofa_base_url = (fofa_base_url or _FOFA_BASE).rstrip("/")
+        if fofa_router is not None:
+            self.fofa_router = fofa_router
+        elif self.fofa_key:
+            from app.config import FofaKeyConfig
+            self.fofa_router = FofaKeyRouter([
+                FofaKeyConfig(name="Legacy", key=self.fofa_key, base_url=self.fofa_base_url)
+            ], active_name="Legacy")
+        else:
+            self.fofa_router = None
         self.capture_full = bool(capture_full)
         # 每个目标独立工作目录
         safe_name = "".join(c if c.isalnum() else "_" for c in target)[:60]
@@ -1073,7 +1092,7 @@ class ToolExecutor:
         用途：① 确认目标归属（org/备案/证书）填准 owner；② 看同 IP/同域还开了
         哪些端口/服务，发现隐藏攻击面。只读查询，不对目标产生任何请求。
         """
-        if not self.fofa_key:
+        if self.fofa_router is None:
             return {"ok": False, "error": "未配置 FOFA key，无法查询。",
                     "guidance": "跳过测绘，直接用 http_request 验证归属（看证书/页脚/备案）。"}
         q = (query or "").strip()
@@ -1083,22 +1102,73 @@ class ToolExecutor:
         safe_size = max(1, min(int(size or 10), _FOFA_LOOKUP_MAX_SIZE))
         import base64 as _b64
         params = {
-            "key": self.fofa_key,
             "qbase64": _b64.b64encode(q.encode("utf-8")).decode("ascii"),
             "fields": "host,ip,port,title,domain,org,protocol",
             "page": "1", "size": str(safe_size), "full": "false",
         }
+
+        def operation(key: str, base_url: str):
+            result = fofa_endpoints.request_sync(
+                key,
+                base_url,
+                purpose="search",
+                params=params,
+                timeout=25,
+                allow_extra_hosts=_FOFA_ALLOWED_HOSTS,
+            )
+            if result.category == "network":
+                message = str(result.error or "网络错误")
+                raise FofaError(message, kind="transient")
+            response = result.response
+            if response is None:
+                raise FofaError("FOFA 返回为空", kind="transient")
+            category = str(result.category or "")
+            if category in {"auth", "rate_limit", "daily_limit"}:
+                text = extract_fofa_response_failure(response)
+                kind, code, retry_after = classify_fofa_failure(
+                    text, status=getattr(response, "status_code", None)
+                )
+                raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+            if not 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
+                text = extract_fofa_response_failure(response)
+                kind, code, retry_after = classify_fofa_failure(
+                    text, status=getattr(response, "status_code", None)
+                )
+                raise FofaError(text, kind=kind, code=code, retry_after=retry_after)
+            try:
+                data = response.json()
+            except Exception:
+                raise FofaError("FOFA 返回非 JSON", kind="transient") from None
+            if not isinstance(data, dict):
+                raise FofaError("FOFA 返回格式异常", kind="transient")
+            if data.get("error"):
+                message, _display = extract_fofa_error(data, "FOFA 错误")
+                kind, code, retry_after = classify_fofa_failure(message)
+                raise FofaError(message, kind=kind, code=code, retry_after=retry_after)
+            return data
+
         try:
-            with httpx.Client(timeout=25) as client:
-                resp = client.get(f"{self.fofa_base_url}/api/v1/search/all", params=params)
-                data = resp.json()
-        except Exception as e:
-            return {"ok": False, "error": f"FOFA 调用失败: {type(e).__name__}: {e}",
+            data = self.fofa_router.execute_sync(operation)
+        except FofaPoolExhaustedError as exc:
+            retry_at = exc.next_retry_at.isoformat().replace("+00:00", "Z") if exc.next_retry_at else None
+            return {
+                "ok": False,
+                "kind": "pool_exhausted",
+                "error": "FOFA 凭据池暂不可用",
+                **({"next_retry_at": retry_at} if retry_at else {}),
+                "guidance": "FOFA 暂不可用，稍后重试。",
+            }
+        except FofaError as exc:
+            return {
+                "ok": False,
+                "kind": str(exc.kind or "transient"),
+                "error": "FOFA 请求失败",
+                **({"next_retry_after": exc.retry_after} if exc.retry_after is not None else {}),
+                "guidance": "FOFA 不可用，改用 http_request 直接验证归属。",
+            }
+        except Exception:
+            return {"ok": False, "kind": "transient", "error": "FOFA 调用失败",
                     "guidance": "FOFA 不可用，改用 http_request 直接验证归属。"}
-        if not isinstance(data, dict):
-            return {"ok": False, "error": "FOFA 返回格式异常"}
-        if data.get("error"):
-            return {"ok": False, "error": f"FOFA 错误: {data.get('errmsg', '')}"[:300]}
         def _cell(row: list, i: int) -> str:
             # FOFA 字段可能为 null/非字符串，统一转成安全字符串，杜绝 None[:n] 崩溃。
             return str(row[i]) if len(row) > i and row[i] is not None else ""

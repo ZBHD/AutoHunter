@@ -879,12 +879,17 @@ async def start_task(task_id: str, session: AsyncSession = Depends(get_session))
         raise HTTPException(404, "任务不存在")
     task.status = "running"
     task.search_enabled = True
-    # 重启即清空 FOFA 账号失败计数与错误标记：用户通常已换/续了 key，
-    # 否则旧计数 ≥ 阈值会导致刚启动又被自动暂停。
-    if task.fofa_config and task.fofa_config.get("fofa_auth_fail_count"):
+    # 重启只清理任务级 Router 运行态与等待标记；全局 SystemSettings FOFA
+    # Key 池的 sticky/cooldown 状态由共享 Router 持续维护。
+    if task.fofa_config:
         fc = dict(task.fofa_config)
-        fc["fofa_auth_fail_count"] = 0
-        fc.pop("last_fofa_error", None)
+        for field in ("runtime_state", "failure_kind", "failure_count", "cooldown_until"):
+            fc.pop(field, None)
+        for field in (
+            "fofa_next_retry_at", "fofa_pool_blocked", "fofa_pool_summary",
+            "fofa_auth_fail_count", "last_fofa_error", "rate_limit_until",
+        ):
+            fc.pop(field, None)
         task.fofa_config = fc
     await session.commit()
     await manager.ensure_running(task_id)

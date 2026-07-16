@@ -19,6 +19,8 @@ from app.fofa.router import FofaKeyStateChange, fofa_credential_fingerprint
 
 @pytest.fixture
 def fofa_key_api(tmp_path, monkeypatch):
+    previous_cache = settings_service._cache
+    previous_router_cache = settings_service._fofa_router_cache.copy()
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fofa-keys.db'}")
     session_maker = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
@@ -38,19 +40,24 @@ def fofa_key_api(tmp_path, monkeypatch):
     app.include_router(settings_api.router)
     app.dependency_overrides[get_session] = override_session
     monkeypatch.setattr(settings_service, "SessionLocal", session_maker)
-    settings_service._cache = {
+    monkeypatch.setattr(settings_service, "_cache", {
         "llm": {},
         "llm_providers": [],
         "fofa": {},
         "fofa_keys": [],
         "engines": {},
         "defaults": {},
-    }
+    })
+    settings_service._fofa_router_cache.clear()
 
-    with TestClient(app) as client:
-        yield client, session_maker
-
-    asyncio.run(engine.dispose())
+    try:
+        with TestClient(app) as client:
+            yield client, session_maker
+    finally:
+        settings_service._fofa_router_cache.clear()
+        settings_service._fofa_router_cache.update(previous_router_cache)
+        settings_service._cache = previous_cache
+        asyncio.run(engine.dispose())
 
 
 async def _raw_row(session_maker) -> SystemSettings | None:

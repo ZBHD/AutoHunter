@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 from weakref import ReferenceType, WeakKeyDictionary, ref
@@ -32,7 +33,7 @@ from app.fofa.client import (
     extract_fofa_response_failure,
     redact_fofa_secrets,
 )
-from app.fofa.router import FofaKeyStateChange, fofa_credential_fingerprint
+from app.fofa.router import FofaKeyRouter, FofaKeyStateChange, fofa_credential_fingerprint
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
 from app.llm.router import LLMRouter
 
@@ -53,6 +54,10 @@ _provider_mutation_locks: WeakKeyDictionary[
     asyncio.AbstractEventLoop, ReferenceType[asyncio.Lock]
 ] = WeakKeyDictionary()
 _provider_fingerprint_secret = os.urandom(32)
+
+# Global FOFA routers retain sticky selection and runtime state between tasks.
+# The cache is replaced when the stable credential configuration changes.
+_fofa_router_cache: "OrderedDict[object, FofaKeyRouter]" = OrderedDict()
 
 _TASK_PROVIDER_FIELDS = frozenset({"base_url", "api_key", "model", "temperature", "protocol"})
 
@@ -395,6 +400,84 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
             enabled=fofa.get("enabled") is not False,
         )
     ]
+
+
+def _fofa_router_fingerprint(keys: list[FofaKeyConfig]) -> str:
+    """Stable pool identity; runtime failure state is deliberately excluded."""
+    stable = [
+        {
+            "name": item.name,
+            "key": item.key,
+            "base_url": item.base_url,
+            "enabled": item.enabled,
+        }
+        for item in keys
+    ]
+    return _settings_fingerprint(stable)
+
+
+def _task_fofa_router_key(task: Task) -> FofaKeyConfig | None:
+    cfg = dict(task.fofa_config or {})
+    key = str(cfg.get("key") or "").strip()
+    if not key:
+        return None
+    base_url = str(cfg.get("base_url") or "").strip() or _resolve_legacy_fofa_base_url()
+    state_values = {
+        "runtime_state": cfg.get("runtime_state", "ready"),
+        "failure_kind": cfg.get("failure_kind", ""),
+        "failure_count": cfg.get("failure_count", 0),
+        "cooldown_until": cfg.get("cooldown_until"),
+    }
+    try:
+        return FofaKeyConfig(
+            name="Task override",
+            key=key,
+            base_url=base_url,
+            **state_values,
+        )
+    except (TypeError, ValueError, ValidationError):
+        # A malformed runtime marker should not prevent a task from running;
+        # preserve the credential and reset only invalid runtime state.
+        return FofaKeyConfig(name="Task override", key=key, base_url=base_url)
+
+
+def fofa_router_for_task(task: Task | None = None) -> FofaKeyRouter:
+    """Build/reuse the process-wide FOFA router for a task.
+
+    Task overrides are intentionally isolated so their state cannot poison the
+    global pool. Global routers are cached by credential identity only, keeping
+    sticky selection and failure cooldowns shared by all workers.
+    """
+    override = _task_fofa_router_key(task) if task is not None else None
+    if override is not None:
+        return FofaKeyRouter([override], active_name=override.name)
+
+    keys = resolve_fofa_keys()
+    fingerprint = _fofa_router_fingerprint(keys)
+    try:
+        loop_token: object = asyncio.get_running_loop()
+    except RuntimeError:
+        loop_token = "sync"
+    cache_key = (fingerprint, loop_token)
+    router = _fofa_router_cache.get(cache_key)
+    if router is not None:
+        _fofa_router_cache.move_to_end(cache_key)
+        return router
+
+    callback = None
+    try:
+        callback = _fofa_state_callback(asyncio.get_running_loop())
+    except RuntimeError:
+        # Callers normally construct routers on the orchestrator event loop;
+        # synchronous settings reads still receive a functional router.
+        callback = None
+    active_name = str(((_cache.get("fofa") or {}).get("active_key_name")) or "")
+    router = FofaKeyRouter(keys, active_name=active_name, on_state_change=callback)
+    # There is one active global configuration at a time. Dropping stale
+    # entries prevents old credentials and callbacks from accumulating.
+    _fofa_router_cache.clear()
+    _fofa_router_cache[cache_key] = router
+    return router
 
 
 # ── 引擎相关解析函数 ──────────────────────────────────────────

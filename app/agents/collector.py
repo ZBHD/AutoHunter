@@ -16,6 +16,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from sqlalchemy import func, select
@@ -29,6 +30,8 @@ from app.db.models import Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
 from app.tools.leakcreds import query_leaked_creds
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
+from app.fofa.client import FofaError
+from app.fofa.router import FofaKeyRouter, FofaPoolExhaustedError
 from app.settings_service import llm_router_for_task_optional, resolve_engine_config, resolve_skip_score_threshold
 
 _EDUSRC_ORG_FILTER = 'org="China Education and Research Network Center"'
@@ -413,6 +416,7 @@ async def _fofa_collect(
     seen: set[str],
     cluster_state: dict[str, dict],
     progress: ProgressReporter | None = None,
+    fofa_router: FofaKeyRouter | None = None,
 ) -> int:
     async def report(phase: str, text: str, **payload) -> None:
         if progress:
@@ -426,7 +430,7 @@ async def _fofa_collect(
         return 0
 
     key = defaults["key"]
-    if not key:
+    if engine_name != "fofa" and not key:
         return 0
     max_pages = int(defaults["max_pages"])
     size = int(defaults["page_size"])
@@ -451,7 +455,7 @@ async def _fofa_collect(
 
     # 频率限制冷却检查：如果还在冷却期内，直接跳过本轮
     rate_limit_until = float(cfg.get("rate_limit_until", 0))
-    if rate_limit_until > time.monotonic():
+    if engine_name != "fofa" and rate_limit_until > time.monotonic():
         remain = rate_limit_until - time.monotonic()
         cfg["collector_phase"] = "fofa_error"
         await report(
@@ -462,9 +466,87 @@ async def _fofa_collect(
         task.fofa_config = {**cfg}
         return 0
 
+    # All FOFA runtime calls share the process-wide router. Its operation gets
+    # the credential and endpoint as an atomic pair, keeping one page request
+    # from mixing keys or advancing the cursor twice.
+    if engine_name == "fofa":
+        retry_marker = str(cfg.get("fofa_next_retry_at") or "").strip()
+        if retry_marker:
+            try:
+                retry_at = datetime.fromisoformat(retry_marker.replace("Z", "+00:00"))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                if retry_at > datetime.now(timezone.utc):
+                    # Keep this cooldown silent: the orchestrator will revisit
+                    # the task after the marker expires.
+                    task.fofa_config = {**cfg}
+                    return 0
+            except ValueError:
+                cfg.pop("fofa_next_retry_at", None)
+            else:
+                cfg.pop("fofa_next_retry_at", None)
+        if fofa_router is None:
+            from app.settings_service import fofa_router_for_task
+            fofa_router = fofa_router_for_task(task)
+        try:
+            res = await fofa_router.execute_async(
+                lambda routed_key, routed_base: engine.search(
+                    routed_key,
+                    cur_query,
+                    page=next_cursor,
+                    page_size=size,
+                    base_url=routed_base,
+                )
+            )
+        except FofaPoolExhaustedError as exc:
+            retry_at = exc.next_retry_at
+            if retry_at is not None:
+                retry_iso = retry_at.isoformat().replace("+00:00", "Z")
+                cfg["fofa_next_retry_at"] = retry_iso
+                cfg.pop("fofa_pool_blocked", None)
+                cfg["fofa_pool_summary"] = "FOFA 凭据池暂不可用，等待冷却后重试"
+                cfg["collector_phase"] = "fofa_cooldown"
+                task.fofa_config = {**cfg}
+                await report(
+                    "fofa_cooldown",
+                    "FOFA 凭据池处于冷却期，跳过本轮",
+                    fofa_error="pool_cooldown",
+                    cursor=cursor,
+                    next_retry_at=retry_iso,
+                )
+            else:
+                cfg["fofa_pool_blocked"] = True
+                cfg["fofa_pool_summary"] = "FOFA 凭据池暂无可用 Key"
+                cfg.pop("fofa_next_retry_at", None)
+                cfg["collector_phase"] = "fofa_pool_blocked"
+                task.fofa_config = {**cfg}
+                await report(
+                    "fofa_pool_blocked",
+                    "FOFA 凭据池暂无可用 Key，已暂停本轮",
+                    fofa_error="pool_blocked",
+                    cursor=cursor,
+                )
+            return 0
+        except FofaError as exc:
+            # Transient errors deliberately stop this page without trying a
+            # second key; the router preserves the active candidate for retry.
+            cfg["collector_phase"] = "fofa_error"
+            cfg["fofa_pool_summary"] = "FOFA 请求暂时失败，游标保持不变"
+            task.fofa_config = {**cfg}
+            await report(
+                "fofa_error",
+                "FOFA 请求暂时失败，游标保持不变",
+                fofa_error=str(exc.kind or "transient"),
+                cursor=cursor,
+            )
+            return 0
+        cfg.pop("fofa_next_retry_at", None)
+        cfg.pop("fofa_pool_blocked", None)
+        cfg.pop("fofa_pool_summary", None)
     try:
-        res = await engine.search(key, cur_query, page=next_cursor, page_size=size,
-                                  base_url=base_url)
+        if engine_name != "fofa":
+            res = await engine.search(key, cur_query, page=next_cursor, page_size=size,
+                                      base_url=base_url)
     except QuakeRateLimitError as e:
         # Quake 专用限流异常
         err = f"{e}"[:300]
@@ -530,10 +612,11 @@ async def _fofa_collect(
         task.fofa_config = {**cfg}
         return 0
     cursor = next_cursor
-    cfg["fofa_auth_fail_count"] = 0
-    cfg["rate_limit_count"] = 0  # 成功请求重置限流计数
-    cfg.pop("rate_limit_until", None)
-    cfg.pop("last_fofa_error", None)
+    if engine_name != "fofa":
+        cfg["fofa_auth_fail_count"] = 0
+        cfg["rate_limit_count"] = 0  # 成功请求重置限流计数
+        cfg.pop("rate_limit_until", None)
+        cfg.pop("last_fofa_error", None)
 
     # host 归属兜底过滤：即使 FOFA 语法因运算符优先级或 LLM 演化丢锚点而放宽范围，
     # 也在入库前按用户指定的根域名白名单二次过滤，丢弃一切范围外的无关资产。

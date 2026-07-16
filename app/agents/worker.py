@@ -34,6 +34,7 @@ from app.raw_evidence import detach_capture
 from app.tools.executor import ToolExecutor
 from app.tools.schemas import worker_tool_schemas
 from app.tools.src_toolkit import SRC_TOOL_NAMES
+from app.fofa.router import FofaKeyRouter
 
 
 _BROAD_NMAP_RE = re.compile(r"\bnmap\b[\s\S]*(?:-p\s*(?:-|1-10000|1-65535|0-65535)|--top-ports\s+\d{3,})", re.IGNORECASE)
@@ -62,6 +63,7 @@ class Worker:
         src_type: str = "edusrc",
         fofa_key: str = "",
         fofa_base_url: str = "",
+        fofa_router: FofaKeyRouter | None = None,
         prompt_version: str | None = None,
     ):
         self.target = target
@@ -73,6 +75,7 @@ class Worker:
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
+            fofa_router=fofa_router,
             capture_full=True, scope_target=target,
         )
         self.findings: list[Finding] = []
