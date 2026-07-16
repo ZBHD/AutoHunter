@@ -6,6 +6,9 @@ __pycache__/
 venv/
 data/
 work/
+backups/
+.deploy-backups/
+.tmp/
 *.db
 *.sqlite
 *.log
