@@ -99,10 +99,35 @@ def test_public_runtime_summary_marks_task_override_without_global_active_key() 
     assert result["pool_total"] == 1
 
 
+def test_global_pool_key_named_task_override_keeps_global_source() -> None:
+    router = FofaKeyRouter(
+        [FofaKeyConfig(name="Task override", key="secret")],
+        active_name="Task override",
+    )
+
+    result = public_runtime_summary(SimpleNamespace(fofa_config={}), router, now=NOW)
+
+    assert result["key_source"] == "global_pool"
+    assert result["active_key_name"] == "Task override"
+
+
+def test_global_pool_key_named_legacy_key_keeps_global_source() -> None:
+    router = FofaKeyRouter(
+        [FofaKeyConfig(name="Legacy Key", key="secret")],
+        active_name="Legacy Key",
+    )
+
+    result = public_runtime_summary(SimpleNamespace(fofa_config={}), router, now=NOW)
+
+    assert result["key_source"] == "global_pool"
+    assert result["active_key_name"] == "Legacy Key"
+
+
 def test_public_runtime_summary_marks_legacy_even_when_key_is_missing() -> None:
     router = FofaKeyRouter(
         [FofaKeyConfig(name="Legacy Key", key="")],
         active_name="Legacy Key",
+        legacy_fallback=True,
     )
 
     result = public_runtime_summary(SimpleNamespace(fofa_config={}), router, now=NOW)

@@ -59,10 +59,9 @@ def public_runtime_summary(
     else:
         pool_state = "blocked"
 
-    names = {item.name for item in snapshots}
-    if "Task override" in names:
+    if str(cfg.get("key") or "").strip():
         source = "task_override"
-    elif "Legacy Key" in names:
+    elif router.legacy_fallback:
         source = "legacy"
     else:
         source = "global_pool"

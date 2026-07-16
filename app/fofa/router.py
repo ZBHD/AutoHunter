@@ -109,6 +109,7 @@ class FofaKeyRouter(Generic[T]):
         keys: list[FofaKeyConfig],
         *,
         active_name: str = "",
+        legacy_fallback: bool = False,
         on_state_change: Callable[[FofaKeyStateChange], None] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
@@ -126,6 +127,7 @@ class FofaKeyRouter(Generic[T]):
                 )
             )
         self._active_name = str(active_name or "")
+        self._legacy_fallback = bool(legacy_fallback)
         self._active_revision = 0
         self._state_revision = 0
         self._on_state_change = on_state_change
@@ -139,6 +141,10 @@ class FofaKeyRouter(Generic[T]):
     def active_name(self) -> str:
         with self._lock:
             return self._active_name
+
+    @property
+    def legacy_fallback(self) -> bool:
+        return self._legacy_fallback
 
     @property
     def keys(self) -> list[FofaKeyStateSnapshot]:

@@ -161,6 +161,7 @@ def test_empty_fofa_pool_uses_legacy_key(monkeypatch) -> None:
     keys = settings_service.resolve_fofa_keys()
 
     assert [(item.name, item.key) for item in keys] == [("Legacy Key", "legacy-secret")]
+    assert settings_service.fofa_router_for_task().legacy_fallback is True
 
 
 def test_fofa_pool_preserves_per_key_base_urls() -> None:
