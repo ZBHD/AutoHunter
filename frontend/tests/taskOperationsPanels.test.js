@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 const board = readFileSync(new URL("../src/views/BoardView.vue", import.meta.url), "utf8");
 const api = readFileSync(new URL("../src/api.js", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+const operationsStyle = readFileSync(new URL("../src/styles/operations.css", import.meta.url), "utf8");
 const scanned = readFileSync(
   new URL("../src/components/task/ScannedTargetsPanel.vue", import.meta.url),
   "utf8",
@@ -68,6 +69,21 @@ test("review queue supports multi-select Markdown export and download status tab
   assert.match(boardView, /复审队列[\s\S]*未下载/);
   assert.match(boardView, /downloadMarkdownReports/);
   assert.doesNotMatch(boardView, /source\.map\(\(finding\) => buildReportMd/);
+});
+
+test("review and submit rows reserve a shared right-side metadata/action column", () => {
+  assert.match(boardView, /class="review-result-open"[\s\S]*class="review-result-side"/);
+  assert.match(boardView, /class="submit-result-side"[\s\S]*class="score"/);
+  assert.match(operationsStyle, /\.review-result-open\{[\s\S]*grid-template-columns:minmax\(0,1fr\) auto/);
+  assert.match(operationsStyle, /\.review-result-side,[\s\S]*\.submit-result-side,[\s\S]*justify-content:flex-end/);
+});
+
+test("raw findings expose severity-specific text color classes", () => {
+  assert.match(findings, /class="raw-severity" :class="\[.*effectiveSeverity/);
+  assert.match(findings, /\.raw-severity\.严重/);
+  assert.match(findings, /\.raw-severity\.高危/);
+  assert.match(findings, /\.raw-severity\.中危/);
+  assert.match(findings, /\.raw-severity\.低危/);
 });
 
 test("AI 未采纳 reuses selection and independent Markdown download controls", () => {

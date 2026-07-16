@@ -1407,8 +1407,10 @@ function siteReconModeLabel(item) {
           <div class="rr-title">{{ f.title }}</div>
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
           </div>
-          <span class="score">{{ f.review?.score ?? "-" }}</span>
-          <span class="review-download-mark">{{ f.downloaded ? "已下载" : "未下载" }}</span>
+          <div class="review-result-side">
+            <span class="score">{{ f.review?.score ?? "-" }}</span>
+            <span class="review-download-mark">{{ f.downloaded ? "已下载" : "未下载" }}</span>
+          </div>
         </button>
       </div>
     </div>
@@ -1427,13 +1429,13 @@ function siteReconModeLabel(item) {
       </div>
       <div v-if="!submitItems.length" class="empty">还没有通过复审的漏洞</div>
       <div v-else-if="!filteredSubmit.length" class="empty">没有匹配当前关键词的待提交漏洞</div>
-      <div v-for="f in filteredSubmit" :key="f.id" class="result-row" :class="{ submitted: f.review?.submitted }" @click="openSubmit(f.id)">
+      <div v-for="f in filteredSubmit" :key="f.id" class="result-row submit-result-row" :class="{ submitted: f.review?.submitted }" @click="openSubmit(f.id)">
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
         <div class="rr-main">
           <div class="rr-title">{{ f.title }} <span v-if="f.review?.submitted" class="tag-done">已提交</span></div>
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
         </div>
-        <span class="score">{{ f.review?.score ?? "-" }}</span>
+        <div class="submit-result-side"><span class="score">{{ f.review?.score ?? "-" }}</span></div>
       </div>
       <button v-if="submitHasMore" class="load-more" @click="loadMoreSubmit" :disabled="submitLoading">
         {{ submitLoading ? "加载中..." : "加载更多已提交/待提交" }}
@@ -1455,7 +1457,7 @@ function siteReconModeLabel(item) {
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
           <div v-if="f.review?.user_notes" class="meta rr-note">驳回备注：{{ f.review.user_notes }}</div>
         </div>
-        <span class="score">{{ f.review?.score ?? "-" }}</span>
+        <div class="result-side"><span class="score">{{ f.review?.score ?? "-" }}</span></div>
       </div>
     </div>
 
@@ -1502,7 +1504,7 @@ function siteReconModeLabel(item) {
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
           <div v-if="f.ignore_reasons?.length" class="meta rr-note">AI 理由：{{ f.ignore_reasons.join("；") }}</div>
           </div>
-          <div class="rr-side" @click.stop>
+          <div class="result-side" @click.stop>
           <span class="score">{{ f.review?.score ?? "-" }}</span>
           <span class="review-download-mark">{{ f.downloaded ? "已下载" : "未下载" }}</span>
           <button v-if="!readonly" class="mini-action" type="button" @click="restoreArchived(f.id)">恢复到复审</button>
