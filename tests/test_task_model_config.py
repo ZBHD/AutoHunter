@@ -545,6 +545,31 @@ def test_patch_fofa_key_blank_preserves_task_override(task_api) -> None:
     assert stored["key"] == "task-fofa-secret"
 
 
+def test_patch_engine_key_wins_over_fofa_clear_in_same_request(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Switch engine key",
+            "engine": "fofa",
+            "fofa_config": {"key": "old-fofa-secret"},
+        },
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "engine": "quake",
+            "engine_config": {"key": "new-engine-secret"},
+            "fofa_config": {"key": None},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    stored = asyncio.run(_stored_fofa_config(session_maker, created["id"]))
+    assert stored["key"] == "new-engine-secret"
+
+
 @pytest.mark.parametrize("replacement", ["", "********"])
 def test_patch_dedicated_task_preserves_key_for_empty_or_masked_value(
     task_api, replacement

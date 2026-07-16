@@ -507,15 +507,6 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
             task.model_config_json, patch
         )
 
-    if req.engine_config is not None:
-        ec_patch = req.engine_config.model_dump(exclude_unset=True)
-        ec_cfg = dict(task.fofa_config or {})
-        if "key" in ec_patch and str(ec_patch.get("key") or "").strip():
-            ec_cfg["key"] = str(ec_patch["key"]).strip()
-        if "base_url" in ec_patch and ec_patch["base_url"] is not None:
-            ec_cfg["base_url"] = ec_patch["base_url"]
-        task.fofa_config = ec_cfg
-
     if req.fofa_config is not None:
         patch = req.fofa_config.model_dump(exclude_unset=True)
         cfg = dict(task.fofa_config or {})
@@ -543,6 +534,17 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
             cfg["cursor"] = 0
             cfg["history"] = []
         task.fofa_config = cfg
+
+    # Apply the engine-specific patch last so a new engine key wins over a
+    # simultaneous FOFA override clear during an engine switch.
+    if req.engine_config is not None:
+        ec_patch = req.engine_config.model_dump(exclude_unset=True)
+        ec_cfg = dict(task.fofa_config or {})
+        if "key" in ec_patch and str(ec_patch.get("key") or "").strip():
+            ec_cfg["key"] = str(ec_patch["key"]).strip()
+        if "base_url" in ec_patch and ec_patch["base_url"] is not None:
+            ec_cfg["base_url"] = ec_patch["base_url"]
+        task.fofa_config = ec_cfg
 
     if (
         previous_target_source != "site"
