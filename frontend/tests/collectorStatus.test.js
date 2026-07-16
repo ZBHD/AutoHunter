@@ -126,6 +126,10 @@ test("historical FOFA events without payload preserve their stored message", () 
     formatFofaCollectorEvent({ kind: "fofa_pool_waiting", message: "凭据池正在等待" }),
     "凭据池正在等待",
   );
+  assert.equal(
+    formatFofaCollectorEvent({ kind: "fofa_pool_blocked", message: "搜集凭据暂不可用" }),
+    "搜集凭据暂不可用",
+  );
 });
 
 test("live FOFA events use structured rotation and cooldown details", () => {
@@ -143,7 +147,7 @@ test("live FOFA events use structured rotation and cooldown details", () => {
     "FOFA Key 池冷却中，还剩 42 秒",
   );
   assert.equal(
-    formatFofaCollectorEvent({ kind: "fofa_pool_blocked", message: "内部短消息" }),
+    formatFofaCollectorEvent({ kind: "fofa_pool_blocked" }),
     "FOFA Key 池已阻断，搜集已暂停",
   );
 });

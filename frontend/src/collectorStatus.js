@@ -48,7 +48,7 @@ export function formatFofaCollectorEvent(event = {}, options = {}) {
     }
     return message;
   }
-  if (kind === "fofa_pool_blocked") return "FOFA Key 池已阻断，搜集已暂停";
+  if (kind === "fofa_pool_blocked") return message || "FOFA Key 池已阻断，搜集已暂停";
   return null;
 }
 
