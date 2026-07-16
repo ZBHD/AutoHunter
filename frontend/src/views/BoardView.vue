@@ -490,21 +490,30 @@ function isImportantEvent(ev) {
 
 // 把任意事件格式化为一句人话（worker 动作事件本身没有 message）
 function fmtEvent(ev) {
-  if (ev.message) return ev.message;
   const d = ev;
+  // Credential-pool events carry a structured payload; format that payload
+  // before honoring the generic message field so useful rotation context is
+  // not discarded by the server's short status text.
+  switch (ev.kind) {
+    case "fofa_key_rotated": {
+      const from = d.from_key_name || "当前 Key";
+      const to = d.to_key_name || "备用 Key";
+      return `FOFA Key 已切换：${from} → ${to}${d.reason ? `（${rotationReasonLabel(d.reason)}）` : ""}`;
+    }
+    case "fofa_pool_waiting":
+      return `FOFA Key 池冷却中${d.next_retry_at ? `，${cooldownLabel(d.next_retry_at)}` : "，稍后重试"}`;
+    case "fofa_pool_blocked":
+      return `FOFA Key 池已阻断${d.message ? `：${d.message}` : "，搜集已暂停"}`;
+    default:
+      break;
+  }
+  if (ev.message) return ev.message;
   switch (ev.kind) {
     case "worker_start": {
       const reconMode = siteReconModeLabel(d);
       return `开始挖掘 ${d.target || ""}${reconMode ? `（${reconMode}）` : ""}${d.mode === "deepen" ? "（定向深挖）" : ""}`;
     }
     case "collector_phase": return d.message || phaseLabel(d.phase) || "正在跑过滤器阶段";
-    case "fofa_key_rotated": {
-      const from = d.from_key_name || "当前 Key";
-      const to = d.to_key_name || "备用 Key";
-      return `FOFA Key 已切换：${from} → ${to}${d.reason ? `（${rotationReasonLabel(d.reason)}）` : ""}`;
-    }
-    case "fofa_pool_waiting": return `FOFA Key 池冷却中${d.next_retry_at ? `，${cooldownLabel(d.next_retry_at)}` : "，稍后重试"}`;
-    case "fofa_pool_blocked": return d.message || "FOFA Key 池已阻断，搜集已暂停";
     case "finding_submitted": return `🎯 发现漏洞 [${d.severity || ""}] ${d.title || ""}`;
     case "duplicate_checked": return d.duplicate ? `查重重复：${d.title || ""}` : null;
     case "finding_duplicate": return `重复漏洞已拦截：${d.title || ""}`;
@@ -1249,7 +1258,8 @@ function siteReconModeLabel(item) {
           <small v-if="collectorModel.phase">阶段：{{ collectorModel.phaseKnown ? phaseLabel(collectorModel.phase) : "等待状态同步" }}</small>
         </div>
         <span class="collector-stage-meta">
-          <span v-if="collectorModel.lastKeyName">
+          <span v-if="collectorModel.keyReadonly">Legacy Key（只读，不可编辑，不参与池管理）</span>
+          <span v-else-if="collectorModel.lastKeyName">
             {{ collectorModel.keySource === 'task_override' ? `${collectorModel.keySourceLabel}：` : "最近使用：" }}{{ collectorModel.lastKeyName }}
           </span>
           <span v-if="collectorModel.poolAvailable !== null && collectorModel.poolTotal !== null">可用 {{ collectorModel.poolAvailable }}/{{ collectorModel.poolTotal }}</span>

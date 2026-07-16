@@ -126,7 +126,9 @@ export function collectorViewModel(task = {}, stats = {}, cfg = {}, now = Date.n
     label,
     phase,
     phaseKnown,
-    lastKeyName: isFofa ? String(cfg.last_key_name || "") : "",
+    lastKeyName: isFofa
+      ? String(cfg.last_key_name || (keySource === "legacy" ? "Legacy Key" : ""))
+      : "",
     rotation: isFofa && isRecord(cfg.last_rotation) ? cfg.last_rotation : null,
     cooldownUntil,
     cooldownExpired,
@@ -134,10 +136,11 @@ export function collectorViewModel(task = {}, stats = {}, cfg = {}, now = Date.n
     isFofa,
     keySource,
     keySourceLabel: isFofa ? keySourceLabel(keySource) : "",
-    poolAvailable: isFofa && keySource !== "task_override"
+    keyReadonly: isFofa && keySource === "legacy",
+    poolAvailable: isFofa && !["task_override", "legacy"].includes(keySource)
       && Object.hasOwn(cfg, "pool_available") && Number.isFinite(Number(cfg.pool_available))
       ? Number(cfg.pool_available) : null,
-    poolTotal: isFofa && keySource !== "task_override"
+    poolTotal: isFofa && !["task_override", "legacy"].includes(keySource)
       && Object.hasOwn(cfg, "pool_total") && Number.isFinite(Number(cfg.pool_total))
       ? Number(cfg.pool_total) : null,
     settingsPath: blocked ? "/settings" : "",

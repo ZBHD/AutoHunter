@@ -244,6 +244,14 @@ test("task board renders the collector state machine and FOFA rotation events", 
   assert.match(board, /collectorModel\.keySourceLabel/);
   assert.match(board, /router\.push\(['"]\/settings['"]\)/);
   assert.match(board, /aria-live="polite"/);
+  const fmtStart = board.indexOf("function fmtEvent(ev)");
+  const fmtEnd = board.indexOf("\nfunction phaseStateText", fmtStart);
+  assert.ok(fmtStart >= 0 && fmtEnd > fmtStart);
+  const formatter = board.slice(fmtStart, fmtEnd);
+  const fallback = formatter.indexOf("if (ev.message) return ev.message");
+  for (const kind of ["fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked"]) {
+    assert.ok(formatter.indexOf(`case \"${kind}\"`) < fallback, `${kind} must use its dedicated formatter first`);
+  }
 });
 
 test("collector status styles cover static failure states and reduced motion", () => {
@@ -254,4 +262,6 @@ test("collector status styles cover static failure states and reduced motion", (
   assert.match(style, /\.collector-stage\.tone-neutral/);
   assert.match(style, /@media \(prefers-reduced-motion:\s*reduce\)/);
   assert.match(style, /\.collector-stage-meta\s*>\s*span\s*\{\s*white-space:\s*normal/);
+  assert.match(board, /Legacy Key/);
+  assert.match(board, /不参与池管理/);
 });

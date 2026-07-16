@@ -93,6 +93,18 @@ test("task override labels the key as task-only instead of global pool", () => {
   assert.equal(model.poolAvailable, null);
 });
 
+test("legacy fallback is shown as a read-only key outside pool management", () => {
+  const model = collectorViewModel(
+    { status: "running", target_source: "fofa", search_enabled: true },
+    { queued: 0 },
+    { engine: "fofa", key_source: "legacy", pool_available: 0, pool_total: 0, collector_phase: "querying" },
+  );
+  assert.equal(model.lastKeyName, "Legacy Key");
+  assert.equal(model.keySourceLabel, "Legacy Key");
+  assert.equal(model.keyReadonly, true);
+  assert.equal(model.poolAvailable, null);
+});
+
 test("unknown collector state is neutral and does not animate", () => {
   const model = collectorViewModel(
     { status: "running", target_source: "both", search_enabled: true },
