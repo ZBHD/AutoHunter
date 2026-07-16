@@ -1,3 +1,5 @@
+import { vulnerabilityTypeLabel } from "./vulnerabilityTypes.js";
+
 // 把 finding（含 review + 用户编辑覆盖）拼成标准 Markdown 报告
 const CONF = { confirmed: "确认", likely: "疑似", uncertain: "不确定" };
 const LEVEL_MAP = { "严重": "grave", "高危": "high", "中危": "medium", "低危": "low" };
@@ -119,7 +121,7 @@ ${rv.user_notes ? `\n## 人工复审备注\n\n${rv.user_notes}` : ""}
 | --- | --- |
 | **漏洞等级** | ${sev}（${rv.score ?? "-"} / 10） |
 | **信度** | ${conf} |
-| **漏洞类型** | \`${f.vuln_type}\` |
+| **漏洞类型** | \`${vulnerabilityTypeLabel(f.vuln_type)}\` |
 | **归属单位** | ${owner} |
 | **目标 URL** | ${f.target_url} |
 

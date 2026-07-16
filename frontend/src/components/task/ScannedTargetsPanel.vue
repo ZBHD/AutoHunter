@@ -1,6 +1,7 @@
 <script setup>
 import { ref, watch } from "vue";
 import { api } from "../../api.js";
+import { vulnerabilityTypeLabel } from "../../vulnerabilityTypes.js";
 import { normalizePage } from "../../listQuery.js";
 import { isCurrentTargetDetail } from "../../taskViews.js";
 
@@ -157,7 +158,7 @@ watch(() => props.taskId, () => {
               <button v-for="finding in detail.findings" :key="finding.id" type="button" @click="emit('open-finding', finding.id)">
                 <span>{{ finding.severity_claimed || "-" }}</span>
                 <b>{{ finding.title }}</b>
-                <small>{{ finding.vuln_type }}</small>
+                <small>{{ vulnerabilityTypeLabel(finding.vuln_type) }}</small>
               </button>
             </div>
           </template>

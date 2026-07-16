@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, canWrite } from "../api.js";
+import { vulnerabilityTypeLabel } from "../vulnerabilityTypes.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -82,8 +83,8 @@ function primaryText(row) {
 
 function secondaryText(row) {
   const p = row.payload || {};
-  if (row.kind === "endpoint" && p.vuln_type) return p.vuln_type;
-  if (row.kind === "fingerprint" && p.vuln_type) return p.vuln_type;
+  if (row.kind === "endpoint" && p.vuln_type) return vulnerabilityTypeLabel(p.vuln_type);
+  if (row.kind === "fingerprint" && p.vuln_type) return vulnerabilityTypeLabel(p.vuln_type);
   return row.summary || "";
 }
 

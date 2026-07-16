@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { api } from "../../api.js";
 import { normalizePage } from "../../listQuery.js";
 import { buildDownloadReportMd, effectiveSeverity } from "../../report.js";
+import { vulnerabilityTypeLabel } from "../../vulnerabilityTypes.js";
 import { downloadMarkdownReports, saveMarkdownFile } from "../../downloads.js";
 
 const props = defineProps({ taskId: { type: String, required: true } });
@@ -246,7 +247,7 @@ watch(downloadStatus, () => load(true));
         </label>
         <span class="raw-severity" :class="['severity-text', effectiveSeverity(finding)]">{{ effectiveSeverity(finding) || finding.severity_claimed || "-" }}</span>
         <button type="button" class="raw-row-open" @click="emit('open-finding', finding.id)">
-          <span class="raw-main"><b>{{ finding.title }}</b><small>{{ finding.vuln_type }} · {{ finding.target_url }}</small></span>
+          <span class="raw-main"><b>{{ finding.title }}</b><small>{{ vulnerabilityTypeLabel(finding.vuln_type) }} · {{ finding.target_url }}</small></span>
           <span class="raw-time">{{ finding.downloaded ? "已下载" : "未下载" }} · {{ finding.created_at?.slice(0, 19).replace("T", " ") || "-" }}</span>
         </button>
       </article>

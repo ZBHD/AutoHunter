@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { api, wsUrl, authRoleRef, authReadyRef, loadAuthRole } from "../api.js";
 import { copyText } from "../clipboard.js";
 import { buildDownloadReportMd, effectiveSeverity, buildReportMd, buildEdusrcToolReport } from "../report.js";
+import { vulnerabilityTypeLabel } from "../vulnerabilityTypes.js";
 import { downloadMarkdownReports, saveMarkdownFile } from "../downloads.js";
 import ReportDrawer from "../components/ReportDrawer.vue";
 import TaskEditModal from "../components/TaskEditModal.vue";
@@ -1405,7 +1406,7 @@ function siteReconModeLabel(item) {
         <button type="button" class="review-result-open" @click="openReview(f.id)">
           <div class="rr-main">
           <div class="rr-title">{{ f.title }}</div>
-          <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
+          <div class="meta">{{ vulnerabilityTypeLabel(f.vuln_type) }} · {{ f.target_url }}</div>
           </div>
           <div class="review-result-side">
             <span class="score">{{ f.review?.score ?? "-" }}</span>
@@ -1433,7 +1434,7 @@ function siteReconModeLabel(item) {
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
         <div class="rr-main">
           <div class="rr-title">{{ f.title }} <span v-if="f.review?.submitted" class="tag-done">已提交</span></div>
-          <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
+          <div class="meta">{{ vulnerabilityTypeLabel(f.vuln_type) }} · {{ f.target_url }}</div>
         </div>
         <div class="submit-result-side"><span class="score">{{ f.review?.score ?? "-" }}</span></div>
       </div>
@@ -1454,7 +1455,7 @@ function siteReconModeLabel(item) {
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
         <div class="rr-main">
           <div class="rr-title">{{ f.title }}</div>
-          <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
+          <div class="meta">{{ vulnerabilityTypeLabel(f.vuln_type) }} · {{ f.target_url }}</div>
           <div v-if="f.review?.user_notes" class="meta rr-note">驳回备注：{{ f.review.user_notes }}</div>
         </div>
         <div class="result-side"><span class="score">{{ f.review?.score ?? "-" }}</span></div>
@@ -1501,7 +1502,7 @@ function siteReconModeLabel(item) {
             <span class="arch-tag" :class="f.archive_reason">{{ f.archive_reason_text }}</span>
             {{ f.title }}
           </div>
-          <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
+          <div class="meta">{{ vulnerabilityTypeLabel(f.vuln_type) }} · {{ f.target_url }}</div>
           <div v-if="f.ignore_reasons?.length" class="meta rr-note">AI 理由：{{ f.ignore_reasons.join("；") }}</div>
           </div>
           <div class="result-side" @click.stop>

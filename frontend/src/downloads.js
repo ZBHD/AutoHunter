@@ -1,3 +1,5 @@
+import { vulnerabilityTypeLabel } from "./vulnerabilityTypes.js";
+
 const INVALID_FILENAME = /[<>:"/\\|?*\u0000-\u001f：]+/g;
 
 function filenamePart(value) {
@@ -13,7 +15,7 @@ function filenamePart(value) {
 export function markdownReportFilename(finding = {}, index = 0) {
   const editedOwner = finding.review?.user_edits?.owner;
   const unit = filenamePart(finding.edu_school || finding.owner || editedOwner) || "待确认单位";
-  const type = filenamePart(finding.vuln_type) || "未分类漏洞";
+  const type = filenamePart(vulnerabilityTypeLabel(finding.vuln_type));
   const stem = `${unit}-${type}`;
   return `${stem}.md`;
 }

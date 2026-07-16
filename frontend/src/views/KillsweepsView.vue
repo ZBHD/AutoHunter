@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { api, canWrite } from "../api.js";
+import { vulnerabilityTypeLabel } from "../vulnerabilityTypes.js";
 import {
   KILLSWEEP_PAGE_SIZE,
   canReanalyzeKillsweep,
@@ -352,7 +353,7 @@ onBeforeUnmount(() => {
           </span>
           <span class="row-content">
             <b>{{ item.product_name || "产品待识别" }}</b>
-            <small>{{ item.origin_title || item.vuln_type || "源漏洞待补充" }}</small>
+            <small>{{ item.origin_title || vulnerabilityTypeLabel(item.vuln_type) }}</small>
             <em v-if="item.failure_message">{{ item.failure_message }}</em>
             <em v-else>{{ item.task_name || item.task_id }} · {{ item.fofa_query || "FOFA 语法待生成" }}</em>
           </span>
@@ -376,7 +377,7 @@ onBeforeUnmount(() => {
                 {{ killsweepPresentation(displayState(selected)).label }}
               </span>
               <h3>{{ selected.product_name || "产品待识别" }}</h3>
-              <p>{{ selected.origin_title || selected.vuln_type }}</p>
+              <p>{{ selected.origin_title || vulnerabilityTypeLabel(selected.vuln_type) }}</p>
             </div>
             <div class="detail-head-actions">
               <button type="button" class="compact-action" @click="openTask(selected)">进任务</button>

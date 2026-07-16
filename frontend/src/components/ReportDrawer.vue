@@ -5,6 +5,7 @@ import DOMPurify from "dompurify";
 import { api, canWrite, isReadonly } from "../api.js";
 import { copyText } from "../clipboard.js";
 import { buildEdusrcToolReport, buildReportMd, effectiveSeverity } from "../report.js";
+import { vulnerabilityTypeLabel } from "../vulnerabilityTypes.js";
 
 const props = defineProps({ findingId: String, mode: String, srcType: String }); // mode: view | review
 const emit = defineEmits(["close", "updated", "toast"]);
@@ -253,7 +254,7 @@ async function askAssistant(preset = "") {
         </section>
 
         <section class="report-facts">
-          <div><span>漏洞类型</span><b>{{ f.vuln_type }}</b></div>
+          <div><span>漏洞类型</span><b>{{ vulnerabilityTypeLabel(f.vuln_type) }}</b></div>
           <div><span>归属单位</span><b>{{ f.edu_school || f.owner || "待确认" }}</b></div>
           <div><span>信度</span><b>{{ confidenceText }}</b></div>
           <div><span>复现步骤</span><b>{{ stepCount }}</b></div>

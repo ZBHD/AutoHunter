@@ -59,10 +59,10 @@ test("task view helpers only preserve supported task panels", () => {
 
 test("report filenames use the unit and vulnerability type", () => {
   assert.equal(
-    markdownReportFilename({ edu_school: "深圳 / 大学", owner: "备用单位", vuln_type: "越权：读取用户" }, 0),
-    "深圳-大学-越权-读取用户.md",
+    markdownReportFilename({ edu_school: "深圳 / 大学", owner: "备用单位", vuln_type: "unauthorized_access" }, 0),
+    "深圳-大学-未授权访问.md",
   );
-  assert.equal(markdownReportFilename({ owner: "备用单位", vuln_type: "xss" }, 2), "备用单位-xss.md");
+  assert.equal(markdownReportFilename({ owner: "备用单位", vuln_type: "xss" }, 2), "备用单位-跨站脚本.md");
   assert.equal(markdownReportFilename({ title: "", vuln_type: "" }, 2), "待确认单位-未分类漏洞.md");
 });
 
@@ -92,6 +92,7 @@ test("download Markdown omits AI review and EduSRC import sections", () => {
   const md = buildDownloadReportMd(finding);
   assert.match(md, /## 漏洞描述/);
   assert.match(md, /## 证据链/);
+  assert.match(md, /\| \*\*漏洞类型\*\* \| `跨站脚本` \|/);
   assert.doesNotMatch(md, /## AI 审核结论/);
   assert.doesNotMatch(md, /## EDUSRC 自动填充 JSON/);
 });

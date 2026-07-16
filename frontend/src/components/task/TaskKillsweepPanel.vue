@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { api, authRoleRef, canWrite } from "../../api.js";
+import { vulnerabilityTypeLabel } from "../../vulnerabilityTypes.js";
 import {
   KILLSWEEP_PAGE_SIZE,
   canReanalyzeKillsweep,
@@ -310,7 +311,7 @@ onBeforeUnmount(() => {
           </span>
           <span class="row-content">
             <b>{{ item.product_name || "产品待识别" }}</b>
-            <small>{{ item.origin_title || item.vuln_type || "源漏洞待补充" }}</small>
+            <small>{{ item.origin_title || vulnerabilityTypeLabel(item.vuln_type) }}</small>
             <em v-if="item.failure_message">{{ item.failure_message }}</em>
             <em v-else>{{ item.fofa_query || "FOFA 语法待生成" }}</em>
           </span>
@@ -334,7 +335,7 @@ onBeforeUnmount(() => {
                 {{ killsweepPresentation(selected.status).label }}
               </span>
               <h3>{{ selected.product_name || "产品待识别" }}</h3>
-              <p>{{ selected.origin_title || selected.vuln_type || "源漏洞待补充" }}</p>
+              <p>{{ selected.origin_title || vulnerabilityTypeLabel(selected.vuln_type) }}</p>
             </div>
           </header>
 
