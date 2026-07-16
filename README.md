@@ -243,9 +243,33 @@ body="管理" && org="China Education and Research Network Center"
 | `fingerprint_waf`（wafw00f） | `{"url":"https://host/"}` | 出现 403、406、429、挑战页或响应差异时，识别 WAF、CDN 或安全网关 | 只做当前 URL 的防护指纹，不代表已绕过，也不自动生成漏洞结论；后续请求保持低频并保存基线 |
 | `scan_web_ports`（Nmap） | `{"host":"host","ports":[443,8443]}` | 当前目标存在明确的 Web、API 或管理端口线索时，确认少量端口和服务版本 | 仅当前单主机，最多 20 个明确端口；固定 TCP connect、轻量版本识别和主机超时，不做全端口或网段扫描 |
 
+##### 分阶段工作流与事件
+
+Worker 按 `recon → locate → verify → evidence` 推进，而不是把所有工具一次性暴露给模型：
+
+- `recon`：建立 HTTP、技术栈和防护基线，只做当前目标的有界侦察。
+- `locate`：根据站点路线调用端点、目录、参数、JS 或 API 文档工具，形成按优先级排序的候选。
+- `verify`：隐藏宽泛发现工具，使用 `http_request`、会话和响应对比逐条结算高价值候选。
+- `evidence`：提交 Finding 时的短暂取证阶段；提交后仍有待验证线索就回到 `verify`，否则回到 `locate`。
+
+SRC CLI 输出是**候选地图而不是漏洞**。CLI 命中会先规范化为带来源、优先级和验证动作的 Lead，再交给 HTTP 单请求复核；403 只能证明入口存在，超时或网络错误会进入有限重试，只有同一次真实请求/响应能证明可控性和实际影响时才可提交 Finding。CLI 和 HTTP 遇到跳转时只允许同主机重定向，跨主机 `Location` 仅记录而不跟随。
+
+实时看板会收到两个有界事件：`tool_src_cli_started` 表示工具、轮次和当前阶段已经确定；`tool_src_cli_result` 表示进程与解析状态、候选数量和脱敏后的最高优先级线索已经返回。完整 stdout、Header、Cookie、query 值和 capture 路径只进入私有证据存储，不进入公开事件。Worker 收尾时只持久化各状态计数、脱敏交接线索和最多 3 个样本。
+
+| 场景 | 首选链路 | 结束条件 |
+| --- | --- | --- |
+| SPA/API | `probe_http → crawl_endpoints → analyze_javascript → http_request` | 高价值端点已逐条复核并结算 |
+| 后台/目录 | `probe_http → discover_content → http_request` | 命中已排除软 404 和统一跳转 |
+| 隐藏参数 | `discover_parameters → http_request 基线/候选 → compare_http_responses` | 参数差异已结算，证据或阴性结果明确 |
+| API 文档 | `http_request → analyze_api_schema → http_request` | 高风险读写接口的鉴权与对象边界已复核 |
+| 登录/越权 | `http_request → analyze_auth_material → session_set → compare_http_responses` | 不同身份或对象的真实响应差异已结算 |
+| 企业 SRC | `crawl_endpoints → discover_parameters → http_request` | 只使用有界侦察、单请求和本地解析器完成取证 |
+
 #### 企业与非企业模式矩阵
 
 “有界侦察工具”用于梳理当前目标的资产、端点和参数；“自动化漏洞扫描器”会批量生成漏洞探测请求。企业 SRC 只开放前者和单请求取证，二者不可混用。
+
+任务启动后会锁定 SRC 模式；如需在 EduSRC 与企业 SRC 之间切换，先暂停任务再修改，避免运行中的 Worker 使用不同策略。
 
 | 能力 | 非企业模式（EduSRC 等） | 企业 SRC | 共同要求 |
 |------|-------------------------|----------|----------|

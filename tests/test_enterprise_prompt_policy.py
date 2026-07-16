@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from app.agents import escalate as escalate_module
 from app.agents import killsweep as killsweep_module
@@ -36,6 +37,22 @@ def test_enterprise_killsweep_prompt_disallows_automated_scanners() -> None:
 
     assert "禁止任何自动化漏洞扫描器" in prompt
     assert "单请求" in prompt
+
+
+def test_readme_documents_staged_src_handoff_and_scenarios() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    for marker in (
+        "recon → locate → verify → evidence",
+        "tool_src_cli_started",
+        "tool_src_cli_result",
+        "候选地图而不是漏洞",
+        "同主机重定向",
+        "| 场景 | 首选链路 | 结束条件 |",
+        "企业 SRC",
+        "严禁使用",
+    ):
+        assert marker in readme
 
 
 def test_enterprise_tool_schemas_hide_automated_vulnerability_scanners() -> None:
