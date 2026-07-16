@@ -296,13 +296,13 @@ Reviewer 打回和 accepted 后的扩大危害使用同一份等级策略。Work
 | `LLM_BASE_URL` | 默认 DeepSeek | OpenAI 兼容接口地址（需含 `/v1`） | 默认 `https://api.deepseek.com/v1` |
 | `LLM_MODEL` | 默认 deepseek-chat | 模型名 | 按模型商填 |
 | `LLM_PROTOCOL` | 默认 openai_chat | legacy 回退协议：`openai_chat` / `anthropic_messages` / `openai_responses` | 按模型商接口填 |
-| `FOFA_KEY` | ⭐ 推荐 | 资产测绘，用于自动搜集目标 | [FOFA 个人中心](https://fofa.info/) |
-| `FOFA_BASE_URL` | 可选，默认官方地址 | 自定义 FOFA API 端点（私有部署/镜像/代理网关） | 默认 `https://fofa.info` |
+| `FOFA_KEY` | ⭐ 推荐 | 单 Key 兼容回退，用于自动搜集目标 | [FOFA 个人中心](https://fofa.info/) |
+| `FOFA_BASE_URL` | 可选，默认官方地址 | 单 Key 兼容回退的 FOFA API 端点 | 默认 `https://fofa.info` |
 | `AUTOHUNTER_API_TOKEN` | ⭐ 强烈建议 | 控制台全权限访问令牌，**不设则任何人可访问** | `install.sh` 自动生成，或自填随机串 |
 | `AUTOHUNTER_HOST_PORT` | 默认 18800 | 对外访问端口 | 按需 |
 
 > 其余全部参数（Worker 预算、并发、超时、WAF 等）都有合理默认值，见 `.env.example` 内注释，按需微调即可。
-> 也支持**不填 `.env`、直接在控制台「设置」页配置 LLM Provider/FOFA Key**。Provider 池会持久化到数据库。
+> 也支持**不填 `.env`、直接在控制台「设置」页配置 LLM Provider/FOFA Key**。两个池都会持久化到数据库；数据库 FOFA Key 池非空后，`FOFA_KEY` / `FOFA_BASE_URL` 只作为历史兼容回退。
 
 ### 多 LLM Provider 池
 
@@ -321,6 +321,14 @@ Reviewer 打回和 accepted 后的扩大危害使用同一份等级策略。Work
 3. 数据库池为空时，兼容回退到旧的数据库单模型设置和 `LLM_*` 环境变量。
 
 数据库池只要非空，即使其中所有 Provider 都被禁用，也不会偷偷回退到旧环境变量。此时应在设置页修复并重新启用 Provider，或删除全部 Provider 后恢复 legacy 回退。API 和界面只返回脱敏 Key；编辑时留空或保留脱敏占位不会覆盖已保存的真实 Key。
+
+### 多 FOFA Key 池
+
+控制台「设置 → FOFA Key 池」支持同时维护多个 Key。每一项都有独立的名称、启停状态和 FOFA URL，支持官方地址、第三方根地址以及完整接口地址（例如 `http://fofapi.services/api.php`）。根地址会自动解析为标准接口；填写 `/api.php` 或其他完整路径时按原地址调用，必要时才回退同源标准路径。
+
+列表中的「当前使用」表示运行时首选 Key；排序决定正常调用时的轮换顺序。单项「检测」和侧栏「一键检测」会展示检测延迟、分类、实际解析 URL、端点模式和 HTTP 状态码。`auth_invalid`、`rate_limited`、`daily_cooldown`、`daily_suspended` 会分别显示为 Key 无效、限流冷却、额度冷却和今日暂停；临时网络故障、5xx 或路径错误不会把 Key 误判为失效，冷却结束后 Router 会自动恢复。旧 `.env` 或旧数据库单 Key 会以只读的「兼容回退」项显示，新增数据库 Key 后即可迁移到池管理。
+
+FOFA 配置优先级为：`任务级 fofa_config.key` > `非空全局 fofa_keys 池` > `旧 fofa.key` > `engines.fofa.key` > `FOFA_KEY`。Collector、Worker 工具调用和 Killsweep 共用同一组 Key + URL 轮换状态；池中某项临时故障时按规则冷却或切换，健康检测恢复后继续使用。
 
 ---
 
