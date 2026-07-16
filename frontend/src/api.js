@@ -236,13 +236,15 @@ export const api = {
     req("DELETE", `/api/tasks/${taskId}/queue-targets/${targetId}`),
   rawFindings: (id, opts = {}) =>
     req("GET", `/api/tasks/${id}/findings${qs({ compact: true, ...opts })}`),
+  markFindingsDownloaded: (taskId, findingIds) =>
+    req("POST", `/api/tasks/${taskId}/findings/mark-downloaded`, { finding_ids: findingIds }),
   hardTargets: (status, q, opts = {}) => req("GET", `/api/tasks/hard-targets${qs({ status, q, ...opts })}`),
   start: (id) => req("POST", `/api/tasks/${id}/start`),
   pause: (id) => req("POST", `/api/tasks/${id}/pause`),
   stopSearch: (id) => req("POST", `/api/tasks/${id}/stop-search`),
   stop: (id) => req("POST", `/api/tasks/${id}/stop`),
   results: (id, conf, q) => req("GET", `/api/tasks/${id}/results${qs({ confidence: conf, q })}`),
-  reviewQueue: (id, q) => req("GET", `/api/tasks/${id}/review-queue${qs({ q })}`),
+  reviewQueue: (id, q, opts = {}) => req("GET", `/api/tasks/${id}/review-queue${qs({ q, ...opts })}`),
   submitList: (id, submitted, q, opts = {}) =>
     req("GET", `/api/tasks/${id}/submit-list${qs({ submitted, q, ...opts })}`),
   rejectedList: (id, q) => req("GET", `/api/tasks/${id}/rejected${qs({ q })}`),

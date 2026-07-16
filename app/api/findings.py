@@ -107,6 +107,8 @@ def _finding_dict(f: Finding, r: Review | None, *, compact: bool = False) -> dic
         "owner": f.owner,
         "status": f.status,
         "created_at": to_cst_iso(f.created_at),
+        "downloaded": f.markdown_downloaded_at is not None,
+        "markdown_downloaded_at": to_cst_iso(f.markdown_downloaded_at),
         "review": None if not r else {
             "verdict": r.verdict,
             "confidence": r.confidence,
@@ -180,6 +182,7 @@ async def _resolve_edu_school_async(target_url: str | None) -> str | None:
 @router.get("/tasks/{task_id}/findings")
 async def list_findings(task_id: str, status: Optional[str] = None,
                         search: Optional[str] = Query(None, alias="q"),
+                        download_status: Optional[str] = Query(None),
                         exclude_status: Optional[str] = "superseded",
                         compact: bool = False,
                         limit: Optional[int] = Query(None, ge=1, le=200),
@@ -195,6 +198,12 @@ async def list_findings(task_id: str, status: Optional[str] = None,
         q = q.where(Finding.status == status)
     if exclude_status:
         q = q.where(Finding.status != exclude_status)
+    if download_status == "downloaded":
+        q = q.where(Finding.markdown_downloaded_at.is_not(None))
+    elif download_status == "pending":
+        q = q.where(Finding.markdown_downloaded_at.is_(None))
+    elif download_status:
+        raise HTTPException(400, "download_status 必须是 downloaded 或 pending")
     if search:
         pattern = f"%{search.strip()}%"
         q = q.where(or_(
@@ -222,6 +231,28 @@ async def list_findings(task_id: str, status: Optional[str] = None,
             "has_more": offset + len(out) < total,
         }
     return out
+
+
+class MarkDownloadedRequest(BaseModel):
+    finding_ids: list[str]
+
+
+@router.post("/tasks/{task_id}/findings/mark-downloaded")
+async def mark_findings_downloaded(task_id: str, req: MarkDownloadedRequest,
+                                    session: AsyncSession = Depends(get_session)):
+    """将当前任务中成功生成 Markdown 的 Finding 标记为已下载。"""
+    ids = list(dict.fromkeys(str(item).strip() for item in req.finding_ids if str(item).strip()))
+    if not ids:
+        return {"marked_ids": []}
+    rows = (await session.execute(
+        select(Finding).where(Finding.task_id == task_id, Finding.id.in_(ids))
+    )).scalars().all()
+    now = _now()
+    for row in rows:
+        row.markdown_downloaded_at = now
+    await session.commit()
+    marked = {row.id for row in rows}
+    return {"marked_ids": [finding_id for finding_id in ids if finding_id in marked]}
 
 
 @router.get("/tasks/{task_id}/results")
@@ -272,11 +303,18 @@ async def get_finding(finding_id: str, session: AsyncSession = Depends(get_sessi
 
 @router.get("/tasks/{task_id}/review-queue")
 async def user_review_queue(task_id: str, search: Optional[str] = Query(None, alias="q"),
+                            download_status: Optional[str] = Query(None),
                             session: AsyncSession = Depends(get_session)):
     """用户复审队列：AI accepted 且用户尚未处理（pending）的漏洞。"""
     q = select(Finding, Review).join(Review, Review.finding_id == Finding.id).where(
         Finding.task_id == task_id, Review.verdict == "accepted", Review.user_status == "pending"
     ).order_by(Review.score.desc())
+    if download_status == "downloaded":
+        q = q.where(Finding.markdown_downloaded_at.is_not(None))
+    elif download_status == "pending":
+        q = q.where(Finding.markdown_downloaded_at.is_(None))
+    elif download_status:
+        raise HTTPException(400, "download_status 必须是 downloaded 或 pending")
     rows = (await session.execute(q)).all()
     out = [_finding_dict(f, r) for f, r in rows]
     return [d for d in out if _matches_query(d, search)]

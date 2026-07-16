@@ -65,6 +65,7 @@ _MIGRATIONS = [
     ("findings", "owner", "VARCHAR(300) DEFAULT ''"),
     ("findings", "kill_chain", "JSON"),
     ("findings", "assistant_messages", "JSON DEFAULT '[]'"),
+    ("findings", "markdown_downloaded_at", "DATETIME"),
     ("killsweeps", "affected_table", "JSON DEFAULT '[]'"),
     ("system_settings", "engines", "JSON DEFAULT '{}'"),
     ("system_settings", "llm_providers", "JSON DEFAULT '[]'"),

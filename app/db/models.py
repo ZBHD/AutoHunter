@@ -148,6 +148,8 @@ class Finding(Base):
     kill_chain: Mapped[list] = mapped_column(JSON, default=list)  # 攻击链路：[{method, detail}, ...]
     # 报告助手对话历史：[{role:'user'|'assistant', content:'...'}]，按 finding 持久化
     assistant_messages: Mapped[list] = mapped_column(JSON, default=list)
+    # Markdown 报告成功下载时间；为空表示尚未下载。
+    markdown_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     self_check: Mapped[dict] = mapped_column(JSON, default=dict)
     dedup_key: Mapped[str] = mapped_column(String(128), default="", index=True)  # 漏洞级去重
     # pending_review / reviewed

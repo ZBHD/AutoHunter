@@ -33,6 +33,10 @@ const events = ref([]);
 const liveWorkers = ref([]);       // 在跑 worker 活态
 const siteCollab = ref(null);      // 单站协作态势（三阶段路线流水线，仅 site 任务）
 const queue = ref([]);             // 复审队列
+const reviewSelectedIds = ref(new Set());
+const reviewDownloadStatus = ref("");
+const reviewDownloadScope = ref("filtered");
+const reviewDownloadWorking = ref(false);
 const submitItems = ref([]);       // 待提交
 const rejectedItems = ref([]);     // 已驳回
 const archivedItems = ref([]);     // AI 未采纳归档（ignored/deepen，可救回）
@@ -125,9 +129,65 @@ async function loadTask(options = {}) {
 async function loadQueue() {
   if (authRoleRef.value === "observer") return;
   const id = props.id;
-  const rows = await api.reviewQueue(id);
+  const rows = await api.reviewQueue(id, undefined, { download_status: reviewDownloadStatus.value });
   if (id === props.id && authRoleRef.value !== "observer") {
     queue.value = rows.map(withSearchCache);
+    const available = new Set(rows.map((finding) => finding.id));
+    reviewSelectedIds.value = new Set(
+      [...reviewSelectedIds.value].filter((findingId) => available.has(findingId)),
+    );
+    if (!reviewSelectedIds.value.size && reviewDownloadScope.value === "selected") {
+      reviewDownloadScope.value = "filtered";
+    }
+  }
+}
+
+function toggleReviewSelection(id) {
+  const next = new Set(reviewSelectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  reviewSelectedIds.value = next;
+  if (next.size) reviewDownloadScope.value = "selected";
+}
+
+function toggleReviewVisibleSelection() {
+  const next = new Set(reviewSelectedIds.value);
+  if (reviewAllVisibleSelected.value) reviewVisibleIds.value.forEach((id) => next.delete(id));
+  else reviewVisibleIds.value.forEach((id) => next.add(id));
+  reviewSelectedIds.value = next;
+  reviewDownloadScope.value = next.size ? "selected" : "filtered";
+}
+
+function clearReviewSelection() {
+  reviewSelectedIds.value = new Set();
+  reviewDownloadScope.value = "filtered";
+}
+
+async function exportReviewMarkdown() {
+  if (reviewDownloadWorking.value) return;
+  const source = reviewDownloadScope.value === "selected"
+    ? queue.value.filter((finding) => reviewSelectedIds.value.has(finding.id))
+    : reviewDownloadScope.value === "filtered" ? filteredQueue.value : queue.value;
+  if (!source.length) return;
+  reviewDownloadWorking.value = true;
+  try {
+    const md = source.map((finding) => buildReportMd(finding)).join("\n\n---\n\n");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = `autohunter-${props.id.slice(0, 8)}-review.md`;
+    anchor.click();
+    URL.revokeObjectURL(anchor.href);
+    await api.markFindingsDownloaded(props.id, source.map((finding) => finding.id));
+    const next = new Set(reviewSelectedIds.value);
+    source.forEach((finding) => next.delete(finding.id));
+    reviewSelectedIds.value = next;
+    await loadQueue();
+    toast(`已导出 ${source.length} 份 Markdown 报告`);
+  } catch (error) {
+    toast(`导出失败：${error?.message || error}`);
+  } finally {
+    reviewDownloadWorking.value = false;
   }
 }
 async function loadSubmit(opts = {}) {
@@ -526,6 +586,11 @@ watch(tab, (t) => {
   loadTabData(t);
 });
 
+watch(reviewDownloadStatus, () => {
+  clearReviewSelection();
+  if (tab.value === "review") loadQueue();
+});
+
 watch(() => route.query.view, (value) => {
   const requested = ["scanned", "findings"].includes(String(value || "")) ? String(value) : "board";
   const next = taskViewForRole(requested, authRoleRef.value);
@@ -892,6 +957,12 @@ function matchSearch(item) {
   return tokens.every((t) => text.includes(t));
 }
 const filteredQueue = computed(() => queue.value.filter(matchSearch));
+const reviewSelectedCount = computed(() => reviewSelectedIds.value.size);
+const reviewVisibleIds = computed(() => filteredQueue.value.map((finding) => finding.id));
+const reviewAllVisibleSelected = computed(() => (
+  reviewVisibleIds.value.length > 0
+  && reviewVisibleIds.value.every((id) => reviewSelectedIds.value.has(id))
+));
 const filteredSubmit = computed(() => submitItems.value.filter(matchSearch));
 const filteredRejected = computed(() => rejectedItems.value.filter(matchSearch));
 const filteredArchived = computed(() => archivedItems.value.filter(matchSearch));
@@ -1207,16 +1278,44 @@ function siteReconModeLabel(item) {
 
     <!-- 复审队列 -->
     <div v-if="authRoleRef !== 'observer'" v-show="tab === 'review'" class="list-panel">
-      <div class="list-head"><span>复审队列</span><small>AI 采纳后等待人工裁决</small></div>
+      <div class="list-head review-list-head">
+        <div><span>复审队列</span><small>AI 采纳后等待人工裁决</small></div>
+        <div class="review-actions">
+          <span v-if="reviewSelectedCount">已选 {{ reviewSelectedCount }} 项</span>
+          <button type="button" @click="toggleReviewVisibleSelection" :disabled="!filteredQueue.length">
+            {{ reviewAllVisibleSelected ? "取消全选" : "全选当前结果" }}
+          </button>
+          <button v-if="reviewSelectedCount" type="button" class="ghost" @click="clearReviewSelection">清空选择</button>
+        </div>
+      </div>
+      <div class="review-download-bar">
+        <div class="review-status-tabs" role="tablist" aria-label="复审队列下载状态">
+          <button type="button" role="tab" :aria-selected="reviewDownloadStatus === ''" :class="{ active: reviewDownloadStatus === '' }" @click="reviewDownloadStatus = ''">全部</button>
+          <button type="button" role="tab" :aria-selected="reviewDownloadStatus === 'pending'" :class="{ active: reviewDownloadStatus === 'pending' }" @click="reviewDownloadStatus = 'pending'">未下载</button>
+          <button type="button" role="tab" :aria-selected="reviewDownloadStatus === 'downloaded'" :class="{ active: reviewDownloadStatus === 'downloaded' }" @click="reviewDownloadStatus = 'downloaded'">已下载</button>
+        </div>
+        <label><input v-model="reviewDownloadScope" type="radio" value="selected" :disabled="!reviewSelectedCount" /> 已选项</label>
+        <label><input v-model="reviewDownloadScope" type="radio" value="filtered" /> 当前筛选结果</label>
+        <label><input v-model="reviewDownloadScope" type="radio" value="all" /> 全部复审队列</label>
+        <button type="button" class="primary" :disabled="reviewDownloadWorking || !(reviewDownloadScope === 'selected' ? reviewSelectedCount : reviewDownloadScope === 'filtered' ? filteredQueue.length : queue.length)" @click="exportReviewMarkdown">
+          {{ reviewDownloadWorking ? "导出中…" : "批量下载 Markdown" }}
+        </button>
+      </div>
       <div v-if="!queue.length" class="empty">没有待复审的漏洞（AI 采纳后会进这里）</div>
       <div v-else-if="!filteredQueue.length" class="empty">没有匹配当前关键词的复审漏洞</div>
-      <div v-for="f in filteredQueue" :key="f.id" class="result-row" @click="openReview(f.id)">
+      <div v-for="f in filteredQueue" :key="f.id" class="result-row review-result-row" :class="{ selected: reviewSelectedIds.has(f.id) }">
+        <label class="review-check" @click.stop>
+          <input type="checkbox" :checked="reviewSelectedIds.has(f.id)" :aria-label="`选择 ${f.title}`" @change="toggleReviewSelection(f.id)" />
+        </label>
         <span class="sev-pill" :class="effectiveSeverity(f)">{{ effectiveSeverity(f) }}</span>
-        <div class="rr-main">
+        <button type="button" class="review-result-open" @click="openReview(f.id)">
+          <div class="rr-main">
           <div class="rr-title">{{ f.title }}</div>
           <div class="meta">{{ f.vuln_type }} · {{ f.target_url }}</div>
-        </div>
-        <span class="score">{{ f.review?.score ?? "-" }}</span>
+          </div>
+          <span class="score">{{ f.review?.score ?? "-" }}</span>
+          <span class="review-download-mark">{{ f.downloaded ? "已下载" : "未下载" }}</span>
+        </button>
       </div>
     </div>
 

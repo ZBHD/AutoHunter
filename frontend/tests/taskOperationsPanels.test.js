@@ -13,6 +13,7 @@ const findings = readFileSync(
   new URL("../src/components/task/RawFindingsPanel.vue", import.meta.url),
   "utf8",
 );
+const boardView = readFileSync(new URL("../src/views/BoardView.vue", import.meta.url), "utf8");
 
 test("task metrics are semantic navigation buttons with persistent views", () => {
   assert.match(board, /class="metric-card metric-action[^"]*"/);
@@ -45,6 +46,26 @@ test("raw findings use server pagination and explicit all or filtered downloads"
   assert.match(findings, /downloadMarkdownReports/);
   assert.match(findings, /api\.finding/);
   assert.match(findings, /open-finding/);
+});
+
+test("raw findings support cross-page selection and download status filters", () => {
+  assert.match(findings, /selectedIds/);
+  assert.match(findings, /downloadStatus/);
+  assert.match(findings, /download_status/);
+  assert.match(findings, /value="selected"/);
+  assert.match(findings, /downloadStatus === 'downloaded'/);
+  assert.match(findings, /downloadStatus === 'pending'/);
+  assert.match(findings, /markFindingsDownloaded/);
+  assert.match(api, /markFindingsDownloaded/);
+});
+
+test("review queue supports multi-select Markdown export and download status tabs", () => {
+  assert.match(boardView, /reviewSelectedIds/);
+  assert.match(boardView, /reviewDownloadStatus/);
+  assert.match(boardView, /reviewDownloadScope/);
+  assert.match(boardView, /markFindingsDownloaded/);
+  assert.match(boardView, /复审队列[\s\S]*已下载/);
+  assert.match(boardView, /复审队列[\s\S]*未下载/);
 });
 
 test("task board exposes the stop-search control contract", () => {
