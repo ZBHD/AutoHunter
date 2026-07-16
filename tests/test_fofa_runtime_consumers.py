@@ -163,6 +163,7 @@ def test_collector_auth_rotation_keeps_cursor(monkeypatch):
         )
         assert task.fofa_config["cursor"] == 1
         assert task.fofa_config["last_key_name"] == "B"
+        assert task.fofa_config["pool_state"] == "ready"
         assert task.fofa_config["last_rotation"] == {
             "from_key_name": "A",
             "to_key_name": "B",
@@ -236,6 +237,7 @@ def test_collector_clean_success_records_key_without_rotation(monkeypatch):
         assert calls == [("key-a", 1)]
         assert task.fofa_config["cursor"] == 1
         assert task.fofa_config["last_key_name"] == "A"
+        assert task.fofa_config["pool_state"] == "ready"
         assert "last_rotation" not in task.fofa_config
         assert not any(
             item["payload"].get("event_kind") == "fofa_key_rotated"
@@ -283,6 +285,7 @@ def test_collector_pool_cooldown_marker_skips_second_network(monkeypatch):
             fofa_router=CoolingRouter(),
         )
         assert task.fofa_config.get("fofa_next_retry_at")
+        assert task.fofa_config["pool_state"] == "cooling"
         waiting = next(
             item for item in progress_events
             if item["payload"].get("event_kind") == "fofa_pool_waiting"
@@ -366,6 +369,7 @@ def test_collector_terminal_pool_marker_is_safe(monkeypatch):
             fofa_router=TerminalRouter(),
         )
         assert task.fofa_config.get("fofa_pool_blocked") is True
+        assert task.fofa_config["pool_state"] == "blocked"
         blocked = next(
             item for item in progress_events
             if item["payload"].get("event_kind") == "fofa_pool_blocked"

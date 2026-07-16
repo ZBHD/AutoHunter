@@ -21,6 +21,22 @@ def _iso(value: datetime | None) -> str | None:
     return _as_utc(value).isoformat().replace("+00:00", "Z")
 
 
+def _parse_persisted_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        try:
+            return _as_utc(value)
+        except ValueError:
+            return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return _as_utc(parsed)
+    except (TypeError, ValueError):
+        return None
+
+
 def _public_rotation(value: object) -> dict[str, str] | None:
     if not isinstance(value, dict) or value.get("reason") not in _ROTATION_REASONS:
         return None
@@ -71,6 +87,23 @@ def public_runtime_summary(
         for item in cooling
         if item.cooldown_until is not None
     ]
+    # A task override router is rebuilt per request, so its persisted runtime
+    # markers are authoritative until the next successful request clears them.
+    if source == "task_override":
+        if cfg.get("fofa_pool_blocked") is True:
+            pool_state = "blocked"
+            available = []
+            cooling = []
+            retry_values = []
+        else:
+            persisted_retry = _parse_persisted_time(
+                cfg.get("fofa_next_retry_at") or cfg.get("cooldown_until")
+            )
+            if persisted_retry is not None and persisted_retry > current:
+                pool_state = "cooling"
+                available = []
+                cooling = []
+                retry_values = [persisted_retry]
     result = {
         "key_source": source,
         "active_key_name": (

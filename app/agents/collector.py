@@ -507,6 +507,7 @@ async def _fofa_collect(
                 cfg["fofa_next_retry_at"] = retry_iso
                 cfg.pop("fofa_pool_blocked", None)
                 cfg["fofa_pool_summary"] = "FOFA 凭据池暂不可用，等待冷却后重试"
+                cfg["pool_state"] = "cooling"
                 cfg["collector_phase"] = "fofa_cooldown"
                 task.fofa_config = {**cfg}
                 await report(
@@ -520,6 +521,7 @@ async def _fofa_collect(
             else:
                 cfg["fofa_pool_blocked"] = True
                 cfg["fofa_pool_summary"] = "FOFA 凭据池暂无可用 Key"
+                cfg["pool_state"] = "blocked"
                 cfg.pop("fofa_next_retry_at", None)
                 cfg["collector_phase"] = "fofa_pool_blocked"
                 task.fofa_config = {**cfg}
@@ -534,6 +536,7 @@ async def _fofa_collect(
         except FofaError as exc:
             # Transient errors deliberately stop this page without trying a
             # second key; the router preserves the active candidate for retry.
+            cfg["pool_state"] = "ready"
             cfg["collector_phase"] = "fofa_error"
             cfg["fofa_pool_summary"] = "FOFA 请求暂时失败，游标保持不变"
             task.fofa_config = {**cfg}
@@ -549,6 +552,7 @@ async def _fofa_collect(
             None,
         )
         if success_attempt is not None:
+            cfg["pool_state"] = "ready"
             success_name = str(getattr(success_attempt, "key_name", "") or "")
             if success_name:
                 cfg["last_key_name"] = success_name

@@ -294,6 +294,17 @@ def test_start_task_initializes_other_auto_engines_but_not_manual_or_site(
                     target_source="both",
                     engine="quake",
                     status="created",
+                    fofa_config={
+                        "collector_phase": "fofa_cooldown",
+                        "collector_phase_text": "旧搜集状态",
+                        "collector_phase_payload": {"event_kind": "fofa_pool_waiting"},
+                        "fofa_pool_summary": "旧池状态",
+                        "fofa_next_retry_at": "2026-07-17T00:20:00Z",
+                        "fofa_pool_blocked": True,
+                        "pool_state": "blocked",
+                        "last_key_name": "Old Key",
+                        "last_rotation": {"reason": "auth"},
+                    },
                 ),
                 Task(
                     id="task-manual",
@@ -301,6 +312,17 @@ def test_start_task_initializes_other_auto_engines_but_not_manual_or_site(
                     target_source="manual",
                     engine="fofa",
                     status="created",
+                    fofa_config={
+                        "collector_phase": "fofa_cooldown",
+                        "collector_phase_text": "旧搜集状态",
+                        "collector_phase_payload": {"event_kind": "fofa_pool_waiting"},
+                        "fofa_pool_summary": "旧池状态",
+                        "fofa_next_retry_at": "2026-07-17T00:20:00Z",
+                        "fofa_pool_blocked": True,
+                        "pool_state": "blocked",
+                        "last_key_name": "Old Key",
+                        "last_rotation": {"reason": "auth"},
+                    },
                 ),
                 Task(
                     id="task-site",
@@ -308,6 +330,17 @@ def test_start_task_initializes_other_auto_engines_but_not_manual_or_site(
                     target_source="site",
                     engine="fofa",
                     status="created",
+                    fofa_config={
+                        "collector_phase": "fofa_cooldown",
+                        "collector_phase_text": "旧搜集状态",
+                        "collector_phase_payload": {"event_kind": "fofa_pool_waiting"},
+                        "fofa_pool_summary": "旧池状态",
+                        "fofa_next_retry_at": "2026-07-17T00:20:00Z",
+                        "fofa_pool_blocked": True,
+                        "pool_state": "blocked",
+                        "last_key_name": "Old Key",
+                        "last_rotation": {"reason": "auth"},
+                    },
                 ),
             ])
             await session.commit()
@@ -337,14 +370,100 @@ def test_start_task_initializes_other_auto_engines_but_not_manual_or_site(
         quake.json()["fofa_config"]["collector_phase_text"]
         == "正在初始化 quake 搜集引擎"
     )
+    for field in (
+        "fofa_pool_summary", "fofa_next_retry_at", "fofa_pool_blocked",
+        "pool_state",
+    ):
+        assert field not in quake.json()["fofa_config"]
     assert manual.status_code == 200
-    assert "collector_phase" not in manual.json()["fofa_config"] or not manual.json()[
-        "fofa_config"
-    ]["collector_phase"]
+    assert_stale_runtime_cleared(manual.json()["fofa_config"])
     assert site.status_code == 200
-    assert "collector_phase" not in site.json()["fofa_config"] or not site.json()[
-        "fofa_config"
-    ]["collector_phase"]
+    assert_stale_runtime_cleared(site.json()["fofa_config"])
+
+    async def persisted_configs() -> dict[str, dict]:
+        async with operations_api._session_maker() as session:
+            tasks = {
+                task.id: dict(task.fofa_config or {})
+                for task in await session.scalars(
+                    select(Task).where(Task.id.in_(
+                        ["task-quake", "task-manual", "task-site"]
+                    ))
+                )
+            }
+            return tasks
+
+    configs = asyncio.run(persisted_configs())
+    for config in configs.values():
+        for field in (
+            "fofa_pool_summary", "fofa_next_retry_at", "fofa_pool_blocked",
+            "pool_state",
+        ):
+            assert field not in config
+        assert config["last_key_name"] == "Old Key"
+        assert config["last_rotation"] == {"reason": "auth"}
+    for task_id in ("task-manual", "task-site"):
+        for field in ("collector_phase", "collector_phase_text", "collector_phase_payload"):
+            assert field not in configs[task_id]
+
+
+def assert_stale_runtime_cleared(config: dict) -> None:
+    assert not config.get("collector_phase")
+    assert not config.get("collector_phase_text")
+    assert not config.get("collector_phase_payload")
+    for field in (
+        "fofa_pool_summary", "fofa_next_retry_at", "fofa_pool_blocked", "pool_state",
+    ):
+        assert field not in config
+
+
+@pytest.mark.parametrize(
+    ("pool_state", "collector_phase"),
+    [("cooling", "fofa_cooldown"), ("blocked", "fofa_pool_blocked")],
+)
+def test_observer_board_preserves_generic_pool_state_without_router(
+    operations_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    pool_state: str,
+    collector_phase: str,
+) -> None:
+    monkeypatch.setenv("AUTOHUNTER_OBSERVER_TOKEN", "observer-token")
+
+    async def set_runtime_config() -> None:
+        async with operations_api._session_maker() as session:
+            task = await session.get(Task, "task-ops")
+            task.fofa_config = {
+                "pool_state": pool_state,
+                "collector_phase": collector_phase,
+                "collector_phase_text": "正在使用 Primary Secret Key",
+                "last_key_name": "Primary Secret Key",
+                "fofa_pool_summary": "内部池摘要不应返回",
+                "fofa_pool_blocked": pool_state == "blocked",
+            }
+            await session.commit()
+
+    asyncio.run(set_runtime_config())
+    monkeypatch.setattr(
+        tasks_api,
+        "fofa_router_for_task",
+        lambda _task: (_ for _ in ()).throw(
+            AssertionError("observer board 不得访问 FOFA Router")
+        ),
+        raising=False,
+    )
+
+    response = operations_api.get(
+        "/api/tasks/task-ops/board",
+        headers={"x-autohunter-token": "observer-token"},
+    )
+
+    assert response.status_code == 200
+    config = response.json()["fofa_config"]
+    assert config["pool_state"] == pool_state
+    assert config["collector_phase"] == collector_phase
+    assert config["collector_phase_text"] == ""
+    assert "Primary Secret Key" not in response.text
+    assert "fofa_pool_summary" not in config
+    assert "last_key_name" not in config
 
 
 def test_task_response_merges_credential_free_fofa_runtime_summary(

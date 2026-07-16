@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.config import FofaKeyConfig
 from app.fofa.router import FofaKeyRouter
 from app.fofa.runtime import public_runtime_summary
@@ -97,6 +99,38 @@ def test_public_runtime_summary_marks_task_override_without_global_active_key() 
     assert result["active_key_name"] == ""
     assert result["last_key_name"] == "Task override"
     assert result["pool_total"] == 1
+
+
+@pytest.mark.parametrize("marker", ["fofa_next_retry_at", "cooldown_until"])
+def test_public_runtime_summary_task_override_prefers_persisted_cooling_marker(marker: str) -> None:
+    router = FofaKeyRouter([FofaKeyConfig(name="Task override", key="secret")])
+    task = SimpleNamespace(
+        fofa_config={
+            "key": "secret",
+            marker: "2026-07-17T00:20:00Z",
+        }
+    )
+
+    result = public_runtime_summary(task, router, now=NOW)
+
+    assert result["pool_state"] == "cooling"
+    assert result["pool_available"] == 0
+    assert result["pool_total"] == 1
+    assert result["cooldown_until"] == "2026-07-17T00:20:00Z"
+    assert "secret" not in repr(result)
+
+
+def test_public_runtime_summary_task_override_prefers_persisted_blocked_marker() -> None:
+    router = FofaKeyRouter([FofaKeyConfig(name="Task override", key="secret")])
+    task = SimpleNamespace(fofa_config={"key": "secret", "fofa_pool_blocked": True})
+
+    result = public_runtime_summary(task, router, now=NOW)
+
+    assert result["pool_state"] == "blocked"
+    assert result["pool_available"] == 0
+    assert result["pool_total"] == 1
+    assert result["cooldown_until"] is None
+    assert "secret" not in repr(result)
 
 
 def test_global_pool_key_named_task_override_keeps_global_source() -> None:

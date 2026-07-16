@@ -927,6 +927,8 @@ async def start_task(task_id: str, session: AsyncSession = Depends(get_session))
         for field in (
             "fofa_next_retry_at", "fofa_pool_blocked", "fofa_pool_summary",
             "fofa_auth_fail_count", "last_fofa_error", "rate_limit_until",
+            "pool_state", "collector_phase", "collector_phase_text",
+            "collector_phase_payload",
         ):
             fc.pop(field, None)
         task.fofa_config = fc
