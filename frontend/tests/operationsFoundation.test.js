@@ -57,12 +57,13 @@ test("task view helpers only preserve supported task panels", () => {
   assert.deepEqual(taskViewQuery("board"), {});
 });
 
-test("report filenames are independent, deterministic Markdown names", () => {
+test("report filenames use the unit and vulnerability type", () => {
   assert.equal(
-    markdownReportFilename({ id: 42, title: "后台 / 越权：读取用户" }, 0),
-    "42-后台-越权-读取用户.md",
+    markdownReportFilename({ edu_school: "深圳 / 大学", owner: "备用单位", vuln_type: "越权：读取用户" }, 0),
+    "深圳-大学-越权-读取用户.md",
   );
-  assert.equal(markdownReportFilename({ title: "" }, 2), "report-3.md");
+  assert.equal(markdownReportFilename({ owner: "备用单位", vuln_type: "xss" }, 2), "备用单位-xss.md");
+  assert.equal(markdownReportFilename({ title: "", vuln_type: "" }, 2), "待确认单位-未分类漏洞.md");
 });
 
 test("raw report severity falls back to the finding claim before review", () => {
@@ -115,9 +116,9 @@ test("Markdown downloads run sequentially and keep one file per report", async (
   });
 
   assert.deepEqual(calls, [
-    { filename: "1-First.md", content: "# First", finding: findings[0] },
+    { filename: "待确认单位-未分类漏洞.md", content: "# First", finding: findings[0] },
     "pause",
-    { filename: "2-Second.md", content: "# Second", finding: findings[1] },
+    { filename: "待确认单位-未分类漏洞.md", content: "# Second", finding: findings[1] },
   ]);
   assert.equal(result.downloaded, 2);
 });

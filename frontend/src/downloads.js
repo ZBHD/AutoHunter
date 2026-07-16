@@ -11,9 +11,10 @@ function filenamePart(value) {
 }
 
 export function markdownReportFilename(finding = {}, index = 0) {
-  const title = filenamePart(finding.title);
-  const id = filenamePart(finding.id);
-  const stem = [id, title].filter(Boolean).join("-") || `report-${index + 1}`;
+  const editedOwner = finding.review?.user_edits?.owner;
+  const unit = filenamePart(finding.edu_school || finding.owner || editedOwner) || "待确认单位";
+  const type = filenamePart(finding.vuln_type) || "未分类漏洞";
+  const stem = `${unit}-${type}`;
   return `${stem}.md`;
 }
 
