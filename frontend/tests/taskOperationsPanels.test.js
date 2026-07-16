@@ -231,3 +231,27 @@ test("task refresh handlers capture the control epoch and reject in-flight backg
     assert.ok(guardPos >= 0 && applyPos > guardPos, `${name} must guard before applying its response`);
   }
 });
+
+test("task board renders the collector state machine and FOFA rotation events", () => {
+  assert.match(board, /collectorViewModel/);
+  assert.match(board, /mergeCollectorEvent/);
+  assert.match(board, /fofa_key_rotated/);
+  assert.match(board, /fofa_pool_waiting/);
+  assert.match(board, /fofa_pool_blocked/);
+  assert.match(board, /搜集进度/);
+  assert.match(board, /处置进度/);
+  assert.match(board, /最近使用/);
+  assert.match(board, /collectorModel\.keySourceLabel/);
+  assert.match(board, /router\.push\(['"]\/settings['"]\)/);
+  assert.match(board, /aria-live="polite"/);
+});
+
+test("collector status styles cover static failure states and reduced motion", () => {
+  assert.match(style, /\.mission-progress\.indeterminate/);
+  assert.match(style, /\.collector-stage\.tone-active/);
+  assert.match(style, /\.collector-stage\.tone-waiting/);
+  assert.match(style, /\.collector-stage\.tone-blocked/);
+  assert.match(style, /\.collector-stage\.tone-neutral/);
+  assert.match(style, /@media \(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(style, /\.collector-stage-meta\s*>\s*span\s*\{\s*white-space:\s*normal/);
+});
