@@ -86,6 +86,12 @@ test("raw findings expose severity-specific text color classes", () => {
   assert.match(findings, /\.raw-severity\.低危/);
 });
 
+test("severity pills center their text inside the colored background", () => {
+  assert.match(style, /\.sev-pill\s*\{[\s\S]*display:\s*inline-flex/);
+  assert.match(style, /\.sev-pill\s*\{[\s\S]*justify-content:\s*center/);
+  assert.match(style, /\.sev-pill\s*\{[\s\S]*text-align:\s*center/);
+});
+
 test("AI 未采纳 reuses selection and independent Markdown download controls", () => {
   assert.match(boardView, /archivedSelectedIds/);
   assert.match(boardView, /archivedDownloadStatus/);
