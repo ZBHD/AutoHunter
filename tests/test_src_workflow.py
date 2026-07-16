@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
 from app.agents import worker as worker_module
+from app.agents.history import bounded_tool_content
+from app.db.models import Base, Target, Task, TaskEvent
 from app.llm.protocols import LLMResponse, ToolCall
 
 
@@ -227,3 +233,206 @@ def test_finish_stops_later_tool_calls_in_same_llm_round(monkeypatch) -> None:
 
     assert result.verdict.value == "no_vuln"
     assert _WorkflowExecutor.src_calls == 0
+
+
+def test_src_history_keeps_head_tail_priority_and_failure_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(worker_module.worker_config, "output_truncate", 4000)
+    monkeypatch.setattr(worker_module.worker_config, "llm_tool_output_truncate", 4000)
+
+    def item(url: str, priority: int) -> dict:
+        return _candidate(url, priority=priority)
+
+    result = {
+        "ok": False,
+        "process_ok": False,
+        "parse_ok": True,
+        "failure_kind": "timeout",
+        "tool": "crawl_endpoints",
+        "output": "raw-output-should-not-dominate" * 1000,
+        "summary": {
+            "count": 99,
+            "omitted": 90,
+            "partial": True,
+            "remaining_unknown": True,
+            "head_candidates": [item("https://app.test/head-sentinel", 4)],
+            "tail_candidates": [item("https://app.test/tail-sentinel", 6)],
+            "priority_candidates": [item("https://app.test/priority-sentinel", 10)],
+            "parse_errors": ["one", "two"],
+            "next_actions": ["verify priority"],
+        },
+    }
+
+    content = bounded_tool_content(result, "crawl_endpoints")
+
+    assert "head-sentinel" in content
+    assert "tail-sentinel" in content
+    assert "priority-sentinel" in content
+    assert '"failure_kind":"timeout"' in content
+    assert '"remaining_unknown":true' in content
+    assert "raw-output-should-not-dominate" not in content
+
+
+def test_worker_emits_redacted_src_cli_lifecycle_and_finish_summary(monkeypatch) -> None:
+    class QueryExecutor(_WorkflowExecutor):
+        def run_src_tool(self, _name, _args):
+            return _src_result(_candidate("https://app.test/admin?token=secret-value"))
+
+    monkeypatch.setattr(worker_module, "ToolExecutor", QueryExecutor)
+    events: list[tuple[str, dict]] = []
+    worker = worker_module.Worker(
+        "https://app.test",
+        llm=_ScriptedWorkflowLLM(),
+        on_event=lambda kind, data: events.append((kind, data)),
+    )
+
+    result = worker.run()
+
+    started = next(data for kind, data in events if kind == "tool_src_cli_started")
+    completed = next(data for kind, data in events if kind == "tool_src_cli_result")
+    finished = next(data for kind, data in events if kind == "worker_finish")
+    serialized = json.dumps([started, completed, finished], ensure_ascii=False)
+    assert started == {"round": 1, "tool": "crawl_endpoints", "stage": "recon"}
+    assert completed["count"] == 1
+    assert completed["top_lead"].endswith("?token=")
+    assert completed["stage"] == "verify"
+    assert finished["lead_summary"]["counts"] == {"verified": 1}
+    assert result.lead_summary["counts"] == {"verified": 1}
+    for secret in ("secret-value", "_capture", "channels", "headers", "output"):
+        assert secret not in serialized
+
+
+def test_src_private_preview_keeps_bounded_summary_without_capture_descriptor() -> None:
+    result = _src_result()
+    result["_capture"] = {
+        "id": "private-capture",
+        "directory": "C:/private/path",
+        "channels": [{"path": "C:/private/path/output.bin"}],
+    }
+
+    preview = worker_module.Worker._private_tool_preview(result)
+
+    assert preview["process_ok"] is True
+    assert preview["parse_ok"] is True
+    assert preview["failure_kind"] == ""
+    assert preview["summary"]["count"] == 1
+    assert "_capture" not in preview
+    assert "private-capture" not in repr(preview)
+
+
+def test_public_src_projection_contains_status_and_bounded_candidates_only() -> None:
+    from app.orchestrator import public_worker_event
+
+    payload = {
+        "tool": "crawl_endpoints",
+        "url": "https://app.test/admin?token=secret-value",
+        "capture": {
+            "id": "private-capture",
+            "directory": "C:/private/path",
+            "channels": [{"path": "C:/private/path/output.bin"}],
+        },
+        "preview": {
+            "ok": False,
+            "process_ok": False,
+            "parse_ok": True,
+            "failure_kind": "timeout",
+            "output": "raw-secret-output",
+            "response_headers": {"Cookie": "secret-cookie"},
+            "summary": {
+                "count": 3,
+                "remaining_unknown": True,
+                "tail_candidates": [_candidate("https://app.test/tail?token=")],
+            },
+        },
+    }
+
+    projected = public_worker_event("tool_capture_private", payload)
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert projected["process_ok"] is False
+    assert projected["parse_ok"] is True
+    assert projected["failure_kind"] == "timeout"
+    assert projected["summary"]["count"] == 3
+    for secret in ("secret-value", "secret-cookie", "raw-secret-output", "private-capture", "output.bin"):
+        assert secret not in serialized
+
+
+def test_src_lead_summary_projection_is_bounded_and_scrubs_query_values() -> None:
+    from app.orchestrator import _public_src_lead_summary
+
+    projected = _public_src_lead_summary({
+        "counts": {"verified": 4, "pending": 2, "unexpected": 999},
+        "deepen_lead": "Verify GET https://app.test/admin?token=secret-value&next=one",
+        "samples": [
+            "https://app.test/a?cookie=secret-cookie",
+            "https://app.test/b?x=1",
+            "https://app.test/c?key=secret-key",
+            "https://app.test/d?extra=drop",
+        ],
+        "capture": "private-capture",
+    })
+
+    assert projected["counts"] == {"verified": 4, "pending": 2}
+    assert projected["deepen_lead"].endswith("?token=&next=")
+    assert len(projected["samples"]) == 3
+    serialized = json.dumps(projected, ensure_ascii=False)
+    for secret in ("secret-value", "secret-cookie", "secret-key", "private-capture"):
+        assert secret not in serialized
+
+
+def test_worker_src_lead_summary_persists_as_bounded_event(tmp_path, monkeypatch) -> None:
+    from app import orchestrator
+
+    async def scenario() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'src-summary.db'}")
+        sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions() as session:
+            session.add(Task(id="task-src-summary", name="SRC summary", status="paused"))
+            session.add(Target(
+                id="target-src-summary",
+                task_id="task-src-summary",
+                url="https://app.test",
+                host="app.test",
+                status="scanning",
+                assigned_worker="worker-1",
+            ))
+            await session.commit()
+
+        monkeypatch.setattr(orchestrator, "SessionLocal", sessions)
+        runner = orchestrator.TaskRunner("task-src-summary")
+        await runner._persist_worker_result(
+            "task-src-summary",
+            "target-src-summary",
+            {
+                "verdict": "no_vuln",
+                "findings": [],
+                "summary": "候选已收敛",
+                "lead_summary": {
+                    "counts": {"verified": 2, "skipped": 1, "ignored": "drop"},
+                    "deepen_lead": "Verify GET https://app.test/admin?token=secret-value",
+                    "samples": [
+                        "https://app.test/a?token=secret-value",
+                        "https://app.test/b?sid=secret-cookie",
+                        "https://app.test/c?key=secret-key",
+                        "https://app.test/d?drop=4",
+                    ],
+                    "capture": "private-capture",
+                },
+            },
+        )
+
+        async with sessions() as session:
+            event = await session.scalar(select(TaskEvent).where(
+                TaskEvent.task_id == "task-src-summary",
+                TaskEvent.kind == "worker_src_lead_summary",
+            ))
+            assert event is not None
+            assert event.payload["counts"] == {"verified": 2, "skipped": 1}
+            assert len(event.payload["samples"]) == 3
+            serialized = json.dumps(event.payload, ensure_ascii=False)
+            for secret in ("secret-value", "secret-cookie", "secret-key", "private-capture"):
+                assert secret not in serialized
+        await engine.dispose()
+
+    asyncio.run(scenario())

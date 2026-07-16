@@ -319,6 +319,28 @@ class Worker:
         self._lead_summary_finalized = True
         return self._lead_summary
 
+    def _emit_src_cli_result(
+        self,
+        tool: str,
+        result: dict[str, Any],
+        round_no: int,
+    ) -> None:
+        summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+        actionable = self._actionable_leads()
+        top_lead = actionable[0].value if actionable else ""
+        self._emit(
+            "tool_src_cli_result",
+            round=round_no,
+            tool=tool,
+            stage=self._workflow_stage,
+            count=int(summary.get("count") or 0),
+            process_ok=bool(result.get("process_ok")),
+            parse_ok=bool(result.get("parse_ok")),
+            failure_kind=str(result.get("failure_kind") or "")[:60],
+            remaining_unknown=bool(summary.get("remaining_unknown")),
+            top_lead=top_lead[:160],
+        )
+
     def _emit(self, kind: str, **data: Any) -> None:
         self.on_event(kind, data)
 
@@ -572,6 +594,7 @@ class Worker:
                             source_tool=name,
                             round_no=rounds,
                         )
+                        self._emit_src_cli_result(name, result, rounds)
                     elif name == "http_request":
                         self._resolve_http_leads(result, args, rounds)
                     elif name == "compare_http_responses":
@@ -720,6 +743,7 @@ class Worker:
             "body_truncated", "raw_request", "error", "return_code", "output",
             "stdout", "stderr", "timed_out", "cancelled", "session_applied",
             "session_cookies_updated",
+            "summary", "process_ok", "parse_ok", "failure_kind",
         }
 
         def bounded(value: Any, limit: int = 4000) -> Any:
@@ -858,7 +882,12 @@ class Worker:
 
         if name in SRC_TOOL_NAMES:
             self._mark_tool_used(name, rnd)
-            self._emit("tool_src_cli", round=rnd, tool=name)
+            self._emit(
+                "tool_src_cli_started",
+                round=rnd,
+                tool=name,
+                stage=self._workflow_stage,
+            )
             return self.executor.run_src_tool(name, args)
 
         if name == "run_shell":
@@ -1044,7 +1073,8 @@ class Worker:
             self._finished["lead_summary"] = lead_summary
             self._emit("worker_finish", verdict=self._finished["verdict"],
                        summary=self._finished["summary"][:300],
-                       deepen_lead=self._finished["deepen_lead"][:300])
+                       deepen_lead=self._finished["deepen_lead"][:300],
+                       lead_summary=lead_summary)
             return {"ok": True, "message": "已记录结束。"}
 
         return {"ok": False, "error": f"未知工具: {name}"}

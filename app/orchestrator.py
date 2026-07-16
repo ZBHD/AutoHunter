@@ -16,7 +16,7 @@ import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunparse
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -81,8 +81,95 @@ from app.missed_signals import (
 )
 from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import import_capture
+from app.tools.src_toolkit import SRC_TOOL_NAMES
 
 logger = logging.getLogger("autohunter.orchestrator")
+
+
+def _public_src_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if not parsed.netloc:
+            path, _, query = text.partition("?")
+            return path[:240] + (f"?{urlencode([(name, '') for name, _ in parse_qsl(query, keep_blank_values=True)])}" if query else "")
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        query = urlencode([(name, "") for name, _ in parse_qsl(parsed.query, keep_blank_values=True)])
+        return urlunparse((parsed.scheme.lower(), host, parsed.path, "", query, ""))[:500]
+    except (TypeError, ValueError):
+        return text.split("?", 1)[0][:240]
+
+
+def _public_src_summary(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    summary = {
+        key: value[key]
+        for key in ("count", "omitted", "partial", "remaining_unknown")
+        if key in value and isinstance(value[key], (bool, int, float))
+    }
+    fields = ("kind", "method", "parameter", "location", "status_code", "confidence", "priority")
+    for name in ("head_candidates", "tail_candidates", "priority_candidates"):
+        candidates = value.get(name)
+        if not isinstance(candidates, list):
+            continue
+        summary[name] = []
+        for candidate in candidates[:3]:
+            if not isinstance(candidate, dict):
+                continue
+            item = {
+                key: candidate[key]
+                for key in fields
+                if key in candidate and isinstance(candidate[key], (str, int, float, type(None)))
+            }
+            if "endpoint_key" in candidate:
+                item["endpoint_key"] = _public_src_url(candidate["endpoint_key"])
+            if "value" in candidate:
+                item["value"] = _public_src_url(candidate["value"])
+            summary[name].append(item)
+    if isinstance(value.get("parse_errors"), list):
+        summary["parse_error_count"] = len(value["parse_errors"])
+    if isinstance(value.get("next_actions"), list):
+        summary["next_actions"] = [str(item)[:180] for item in value["next_actions"][:3]]
+    return summary
+
+
+def _public_src_text(value: object, limit: int = 300) -> str:
+    """Bound SRC handoff text and remove query values before persistence/publication."""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    # Lead text may contain a full URL (or a URL embedded in an instruction).
+    # Keep parameter names for the next worker while dropping all values.
+    text = re.sub(r"([?&][^=\s&]+)=([^&\s]*)", r"\1=", text)
+    return text[:limit]
+
+
+def _public_src_lead_summary(value: object) -> dict:
+    """Project the finite worker lead summary for the task event stream."""
+    if not isinstance(value, dict):
+        return {"counts": {}, "deepen_lead": "", "samples": []}
+    allowed_statuses = {"pending", "verified", "failed", "inconclusive", "skipped"}
+    raw_counts = value.get("counts")
+    counts = {
+        str(key)[:32]: int(item)
+        for key, item in (raw_counts.items() if isinstance(raw_counts, dict) else [])
+        if str(key) in allowed_statuses
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+    }
+    raw_samples = value.get("samples")
+    samples = [
+        _public_src_text(item, 240)
+        for item in (raw_samples if isinstance(raw_samples, (list, tuple)) else [])[:3]
+        if str(item or "").strip()
+    ]
+    return {
+        "counts": counts,
+        "deepen_lead": _public_src_text(value.get("deepen_lead")),
+        "samples": samples,
+    }
 
 
 def public_worker_event(kind: str, data: dict) -> dict:
@@ -90,9 +177,21 @@ def public_worker_event(kind: str, data: dict) -> dict:
     if kind != "tool_capture_private":
         return dict(data or {})
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    tool = str(data.get("tool") or "")[:40]
+    if tool in SRC_TOOL_NAMES:
+        return {
+            "kind": "tool_result",
+            "tool": tool,
+            "url": _public_src_url(data.get("url") or preview.get("url")),
+            "ok": preview.get("ok"),
+            "process_ok": preview.get("process_ok"),
+            "parse_ok": preview.get("parse_ok"),
+            "failure_kind": str(preview.get("failure_kind") or "")[:60],
+            "summary": _public_src_summary(preview.get("summary")),
+        }
     return {
         "kind": "tool_result",
-        "tool": str(data.get("tool") or "")[:40],
+        "tool": tool,
         "method": str(data.get("method") or "")[:16],
         "url": str(data.get("url") or "")[:1000],
         "ok": preview.get("ok"),
@@ -612,6 +711,9 @@ class TaskRunner:
                     "mode": item.get("mode"),
                     "site_route": item.get("site_route"),
                     "site_recon_mode": item.get("site_recon_mode"),
+                    "workflow_stage": item.get("workflow_stage"),
+                    "src_candidates": item.get("src_candidates"),
+                    "src_top_lead": item.get("src_top_lead"),
                     "started_at": item.get("started_at"),
                     "last_activity_at": item.get("last_activity_at"),
                     "findings": item.get("findings"),
@@ -1838,6 +1940,8 @@ class TaskRunner:
         self._live[target_id] = {
             "target_id": target_id, "host": host, "url": url,
             "round": 0, "action": "启动中…", "findings": 0,
+            "workflow_stage": "recon", "src_candidates": 0,
+            "src_top_lead": "", "src_lead_summary": {},
             "started_at": _now_iso(),
             "last_activity_at": _now_iso(),
         }
@@ -1854,6 +1958,29 @@ class TaskRunner:
                 st["round"] = data["round"]
             if kind == "tool_http":
                 st["action"] = f"HTTP {data.get('method','GET')} {data.get('url','')}"
+            elif kind == "tool_src_cli_started":
+                stage = str(data.get("stage") or "")
+                if stage in {"recon", "locate", "verify", "evidence"}:
+                    st["workflow_stage"] = stage
+                st["src_last_tool"] = str(data.get("tool") or "")[:40]
+                st["action"] = f"SRC 工具执行中: {st['src_last_tool']}"
+            elif kind == "tool_src_cli_result":
+                stage = str(data.get("stage") or "")
+                if stage in {"recon", "locate", "verify", "evidence"}:
+                    st["workflow_stage"] = stage
+                try:
+                    st["src_candidates"] = max(0, int(data.get("count") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    st["src_candidates"] = 0
+                st["src_top_lead"] = _public_src_text(data.get("top_lead"), 160)
+                st["src_process_ok"] = bool(data.get("process_ok"))
+                st["src_parse_ok"] = bool(data.get("parse_ok"))
+                st["src_failure_kind"] = str(data.get("failure_kind") or "")[:60]
+                st["action"] = (
+                    f"SRC 候选 {st['src_candidates']} 条"
+                    if not st["src_failure_kind"]
+                    else f"SRC 工具结果: {st['src_failure_kind']}"
+                )
             elif kind == "tool_shell":
                 st["action"] = f"$ {data.get('command','')}"
             elif kind == "tool_shell_blocked":
@@ -1883,6 +2010,7 @@ class TaskRunner:
             elif kind == "intel_reported":
                 st["action"] = f"记录情报: {data.get('intel_kind','')}"
             elif kind == "worker_finish":
+                st["src_lead_summary"] = _public_src_lead_summary(data.get("lead_summary"))
                 st["action"] = f"收尾: {data.get('verdict','')}"
             elif kind == "worker_start":
                 if "site_route" in data:
@@ -2042,6 +2170,7 @@ class TaskRunner:
                     pass
                 if deepen_context:
                     self._live[target_id]["mode"] = "deepen"
+                    self._live[target_id]["workflow_stage"] = "verify"
                     self._live[target_id]["action"] = "🔁 定向深挖启动中…"
                 duplicate_history = await self._build_duplicate_history(session, task_id, tgt)
                 await session.commit()
@@ -2642,6 +2771,22 @@ class TaskRunner:
             error_text = result.get("error") or ""
             summary_text = result.get("summary") or ""
             runtime = result.get("_runtime") if isinstance(result.get("_runtime"), dict) else {}
+            raw_lead_summary = result.get("lead_summary")
+            if isinstance(raw_lead_summary, dict):
+                lead_summary = _public_src_lead_summary(raw_lead_summary)
+                total = sum(lead_summary["counts"].values())
+                session.add(TaskEvent(
+                    task_id=task_id,
+                    agent="worker",
+                    kind="worker_src_lead_summary",
+                    level="info",
+                    message=f"SRC 线索结算：{total} 条候选",
+                    payload={
+                        "target_id": target_id,
+                        "host": dedup.normalize_host(tgt.url or tgt.host),
+                        **lead_summary,
+                    },
+                ))
             # A runtime payload with an explicit (possibly empty) signal id is
             # the worker lease.  Older callers without runtime metadata keep
             # the legacy fallback to the target context.

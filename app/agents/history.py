@@ -73,6 +73,64 @@ def _compress_shell(data: dict) -> dict:
     return keep
 
 
+def _compress_src(data: dict) -> dict:
+    summary = data.get("summary")
+    if not isinstance(summary, dict):
+        return _compress_shell(data)
+    keep = _pick_fields(
+        data,
+        (
+            "ok",
+            "tool",
+            "process_ok",
+            "parse_ok",
+            "failure_kind",
+            "return_code",
+            "timed_out",
+            "cancelled",
+        ),
+        160,
+    )
+    compact_summary = _pick_fields(
+        summary,
+        ("count", "omitted", "partial", "remaining_unknown"),
+        160,
+    )
+    candidate_fields = (
+        "kind",
+        "endpoint_key",
+        "value",
+        "method",
+        "parameter",
+        "location",
+        "status_code",
+        "confidence",
+        "priority",
+        "reason",
+    )
+    for field in ("head_candidates", "tail_candidates", "priority_candidates"):
+        values = summary.get(field)
+        if isinstance(values, list):
+            compact_summary[field] = [
+                _pick_fields(item, candidate_fields, 180)
+                for item in values[:3]
+                if isinstance(item, dict)
+            ]
+    errors = summary.get("parse_errors")
+    if isinstance(errors, list):
+        compact_summary["parse_error_count"] = len(errors)
+        compact_summary["parse_errors"] = [_short(item, 160) for item in errors[:3]]
+    actions = summary.get("next_actions")
+    if isinstance(actions, list):
+        compact_summary["next_actions"] = [_short(item, 180) for item in actions[:3]]
+    keep["summary"] = compact_summary
+    for key in ("error", "guidance"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            keep[key] = value[:200]
+    return keep
+
+
 def _short(value: Any, limit: int = 160) -> str:
     text = str(value or "").replace("\n", " ").strip()
     return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
@@ -239,12 +297,12 @@ def summarize_tool_content(raw: str, tool: str) -> str:
     elif tool == "analyze_auth_material":
         keep = _compress_auth_analysis(data)
     elif tool in SRC_TOOL_NAMES:
-        keep = _compress_shell(data)
+        keep = _compress_src(data)
     else:
         keep = _compress_generic(data)
 
     summary = json.dumps(keep, ensure_ascii=False, separators=(",", ":"))
-    limit = 2400 if tool in {
+    limit = 3200 if tool in SRC_TOOL_NAMES else 2400 if tool in {
         "analyze_javascript", "analyze_api_schema", "extract_http_surface",
         "compare_http_responses", "analyze_auth_material",
     } else 720
