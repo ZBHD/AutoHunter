@@ -158,6 +158,8 @@ test("provider panel exposes health synchronization and emits CRUD invalidation"
 
   assert.match(source, /defineEmits\(\["change",\s*"mutated"\]\)/);
   assert.match(source, /defineExpose\(\{\s*applyHealthCheck\s*\}\)/);
+  assert.match(source, /recommended_protocol/);
+  assert.match(source, /diagnostic/);
   assert.match(source, /emit\("mutated"\)/);
 });
 

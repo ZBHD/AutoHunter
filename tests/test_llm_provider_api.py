@@ -542,6 +542,9 @@ def test_settings_health_check_tests_all_and_disables_failures_atomically(
             "latency_ms": 12,
             "model": "model-a",
             "protocol": "openai_chat",
+            "category": "ok",
+            "recommended_protocol": "",
+            "diagnostic": "",
             "error": "",
             "enabled": True,
             "auto_disabled": False,
@@ -553,6 +556,9 @@ def test_settings_health_check_tests_all_and_disables_failures_atomically(
             "latency_ms": 21,
             "model": "model-b",
             "protocol": "openai_chat",
+            "category": "transient",
+            "recommended_protocol": "",
+            "diagnostic": "",
             "error": "rejected <masked>",
             "enabled": False,
             "auto_disabled": True,
@@ -564,6 +570,9 @@ def test_settings_health_check_tests_all_and_disables_failures_atomically(
             "latency_ms": 12,
             "model": "model-c",
             "protocol": "openai_chat",
+            "category": "ok",
+            "recommended_protocol": "",
+            "diagnostic": "",
             "error": "",
             "enabled": False,
             "auto_disabled": False,
@@ -804,6 +813,67 @@ def test_probe_sanitizes_arbitrary_saved_key_and_runs_chat_off_loop(monkeypatch,
     assert secret not in repr(result)
     assert encoded_secret not in repr(result)
     assert secret not in caplog.text
+
+
+def test_probe_llm_provider_sends_minimal_tool_schema(monkeypatch) -> None:
+    provider = LLMProviderConfig(**provider_payload("Probe", "probe-secret"))
+    calls = []
+
+    class FakeClient:
+        _client = None
+
+        def __init__(self, _provider):
+            pass
+
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(settings_service, "LLMClient", FakeClient)
+
+    result = asyncio.run(settings_service.probe_llm_provider(provider))
+
+    assert result["ok"] is True
+    assert calls[0]["tools"][0]["type"] == "function"
+    assert calls[0]["tools"][0]["function"]["name"] == "noop"
+    assert calls[0]["tool_choice"] == "none"
+    assert calls[0]["max_tokens"] == 16
+
+
+def test_probe_llm_provider_recommends_compatible_protocol_without_saving(monkeypatch) -> None:
+    provider = LLMProviderConfig(**provider_payload("Probe", "probe-secret"))
+    protocols = []
+
+    class FakeClient:
+        _client = None
+
+        def __init__(self, current):
+            protocols.append(current.protocol)
+            self.protocol = current.protocol
+
+        def chat(self, **_kwargs):
+            if self.protocol == "openai_chat":
+                from app.llm.client import LLMError
+
+                raise LLMError(
+                    "protocol",
+                    "协议不兼容",
+                    detail="unknown variant custom",
+                    status=400,
+                )
+            return object()
+
+    monkeypatch.setattr(settings_service, "LLMClient", FakeClient)
+
+    result = asyncio.run(settings_service.probe_llm_provider(provider))
+
+    assert result["ok"] is False
+    assert result["category"] == "protocol"
+    assert result["protocol"] == "openai_chat"
+    assert result["recommended_protocol"] == "anthropic_messages"
+    assert "unknown variant" in result["diagnostic"]
+    assert protocols == ["openai_chat", "anthropic_messages"]
+    assert provider.protocol == "openai_chat"
 
 
 def test_invalid_stored_pool_returns_safe_recovery_error(provider_api) -> None:

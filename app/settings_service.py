@@ -35,6 +35,7 @@ from app.fofa.client import (
 )
 from app.fofa.router import FofaKeyRouter, FofaKeyStateChange, fofa_credential_fingerprint
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
+from app.llm.protocols import ADAPTER_REGISTRY
 from app.llm.router import LLMRouter
 
 SETTINGS_ID = "global"
@@ -1284,38 +1285,108 @@ def _redact_provider_error(text_value: str, provider: LLMProviderConfig) -> str:
 
 async def probe_llm_provider(provider: LLMProviderConfig) -> dict[str, Any]:
     started = time.perf_counter()
-    client = None
+    clients = []
     error = ""
+    diagnostic = ""
+    category = "transient"
+    recommended_protocol = ""
     ok = False
-    try:
-        client = LLMClient(provider)
+    probe_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "description": "Validate tool-call protocol compatibility.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    async def run_probe(client: LLMClient) -> None:
         await asyncio.to_thread(
             client.chat,
             messages=[{"role": "user", "content": "Reply with OK."}],
+            tools=probe_tools,
             tool_choice="none",
-            max_tokens=8,
+            max_tokens=16,
         )
+
+    try:
+        client = LLMClient(provider)
+        clients.append(client)
+        await run_probe(client)
         ok = True
+        category = "ok"
     except Exception as exc:
         if isinstance(exc, LLMError) and exc.args:
             error = _redact_provider_error(str(exc.args[0]), provider)
+            diagnostic = _redact_provider_error(exc.diagnostic(), provider)
+            category = str(exc.kind or "transient")
         elif not provider.api_key:
             error = "未配置 LLM API Key"
+            category = "auth"
         else:
             error = "LLM Provider 不可用，请检查 Key、端点、模型、协议或网络"
+            diagnostic = _redact_provider_error(str(exc), provider)
+
+        if category == "protocol":
+            candidate = next(
+                (
+                    protocol
+                    for protocol in (
+                        "openai_chat",
+                        "anthropic_messages",
+                        "openai_responses",
+                    )
+                    if protocol != provider.protocol and protocol in ADAPTER_REGISTRY
+                ),
+                "",
+            )
+            if candidate:
+                fallback_provider = LLMProviderConfig.model_validate(
+                    {**provider.model_dump(), "protocol": candidate}
+                )
+                try:
+                    fallback_client = LLMClient(fallback_provider)
+                    clients.append(fallback_client)
+                    await run_probe(fallback_client)
+                    recommended_protocol = candidate
+                except Exception as fallback_exc:
+                    fallback_detail = (
+                        fallback_exc.diagnostic()
+                        if isinstance(fallback_exc, LLMError)
+                        else str(fallback_exc)
+                    )
+                    fallback_detail = _redact_provider_error(
+                        fallback_detail, fallback_provider
+                    )
+                    if fallback_detail:
+                        diagnostic = (
+                            f"{diagnostic}；备用协议 {candidate}: {fallback_detail}"
+                            if diagnostic
+                            else f"备用协议 {candidate}: {fallback_detail}"
+                        )
     finally:
-        http_client = getattr(client, "_client", None)
-        close = getattr(http_client, "close", None)
-        if callable(close):
-            try:
-                await asyncio.to_thread(close)
-            except Exception:
-                pass
+        for probe_client in clients:
+            http_client = getattr(probe_client, "_client", None)
+            close = getattr(http_client, "close", None)
+            if callable(close):
+                try:
+                    await asyncio.to_thread(close)
+                except Exception:
+                    pass
     return {
         "ok": ok,
         "latency_ms": max(0, round((time.perf_counter() - started) * 1000)),
         "model": provider.model,
         "protocol": provider.protocol,
+        "category": category,
+        "recommended_protocol": recommended_protocol,
+        "diagnostic": diagnostic,
         "error": error,
     }
 
@@ -1603,6 +1674,13 @@ async def run_settings_health_check(session: AsyncSession) -> dict[str, Any]:
             "latency_ms": max(0, int(result.get("latency_ms") or 0)),
             "model": str(result.get("model") or provider.model),
             "protocol": str(result.get("protocol") or provider.protocol),
+            "category": str(
+                result.get("category") or ("ok" if result.get("ok") else "transient")
+            ),
+            "recommended_protocol": str(result.get("recommended_protocol") or ""),
+            "diagnostic": _sanitize_error_detail(
+                str(result.get("diagnostic") or ""), redact_values=all_secrets
+            ),
             "error": _sanitize_error_detail(
                 str(result.get("error") or ""), redact_values=all_secrets
             ),

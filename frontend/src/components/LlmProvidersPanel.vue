@@ -402,6 +402,14 @@ watch(
               <template v-else-if="!testResults.get(provider.name).stale">
                 · {{ testResults.get(provider.name).error || "服务不可用" }}
                 <strong v-if="testResults.get(provider.name).auto_disabled"> · 已自动停用</strong>
+                <span v-if="testResults.get(provider.name).recommended_protocol">
+                  · 建议协议 {{ protocolLabels[testResults.get(provider.name).recommended_protocol]
+                    || testResults.get(provider.name).recommended_protocol }}
+                </span>
+                <span v-if="testResults.get(provider.name).diagnostic"
+                  :title="testResults.get(provider.name).diagnostic">
+                  · 诊断 {{ testResults.get(provider.name).diagnostic }}
+                </span>
               </template>
             </p>
           </div>
