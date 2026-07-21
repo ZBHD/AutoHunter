@@ -127,6 +127,21 @@ def _classify_error(e: Exception, redact_values: tuple[str, ...] = ()) -> LLMErr
     if any(k in text for k in ("connection", "network", "name resolution", "连接")):
         return LLMError("network", "LLM 网络连接失败，请检查服务器出网或代理。",
                         e, status=status, code=safe_code, detail=detail)
+    if any(k in text for k in (
+        "unknown variant",
+        "failed to deserialize",
+        "tools[",
+        "unsupported model",
+        "invalid tool schema",
+    )):
+        return LLMError(
+            "protocol",
+            "LLM Provider 协议或工具格式不兼容，请检查协议配置。",
+            e,
+            status=status,
+            code=safe_code,
+            detail=detail,
+        )
     logger.warning("LLM unknown error: type=%s status=%s code=%s detail=%s",
                    type(e).__name__, status, safe_code, detail[:600])
     return LLMError("unknown", "LLM 调用失败：模型服务返回未知错误。",

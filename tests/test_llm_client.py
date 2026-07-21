@@ -32,3 +32,19 @@ def test_provider_error_classification_respects_status_before_body_keywords(
     error = _classify_error(ProviderError(status, message, code=code))
 
     assert error.kind == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unknown variant `custom`; expected `web_search_20250305`",
+        "failed to deserialize tools[0]: invalid tool schema",
+        "unsupported model for this protocol",
+    ],
+)
+def test_protocol_shape_errors_are_classified_as_protocol(message: str) -> None:
+    error = _classify_error(ProviderError(400, message))
+
+    assert error.kind == "protocol"
+    assert error.status == 400
+    assert "协议" in error.diagnostic()
