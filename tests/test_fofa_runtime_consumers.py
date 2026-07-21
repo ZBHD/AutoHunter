@@ -216,6 +216,95 @@ async def test_collector_transient_keeps_page_and_does_not_rotate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_collector_transient_diagnostics_are_redacted(monkeypatch):
+    from app.agents import collector
+
+    secret = "secret-a"
+
+    class Engine:
+        display_name = "FOFA"
+
+        async def search(self, key, query, page, page_size, base_url=None):
+            raise FofaError(
+                f"gateway timeout {key}",
+                kind="transient",
+                code="502",
+                retry_after=15,
+            )
+
+    monkeypatch.setattr(collector, "get_engine", lambda _name: Engine())
+    monkeypatch.setattr(collector, "resolve_engine_config", lambda _task: {
+        "engine": "fofa", "key": "", "base_url": "https://fofa.info",
+        "max_pages": 2, "page_size": 1,
+    })
+    monkeypatch.setattr(collector, "_llm_for_task", lambda _task: None)
+    task = SimpleNamespace(
+        fofa_config={"current_query": 'host="example.com"', "cursor": 0},
+        src_type="edusrc",
+        fofa_query="",
+    )
+    reports = []
+
+    async def progress(phase, text, **payload):
+        reports.append((phase, text, payload))
+
+    router = FofaKeyRouter([_key("A", secret)])
+    await collector._fofa_collect(
+        SimpleNamespace(add=lambda _obj: None),
+        task,
+        set(),
+        {},
+        progress,
+        fofa_router=router,
+    )
+
+    assert task.fofa_config["last_fofa_error_kind"] == "transient"
+    assert task.fofa_config["last_fofa_error_code"] == "502"
+    assert task.fofa_config["fofa_retry_after"] == 15
+    assert task.fofa_config["fofa_last_error_signature"]
+    assert task.fofa_config["fofa_last_error_reported_at"]
+    assert secret not in repr(task.fofa_config)
+    assert secret not in repr(reports)
+
+
+@pytest.mark.asyncio
+async def test_collector_repeated_transient_event_is_rate_limited(monkeypatch):
+    from app.agents import collector
+
+    class Engine:
+        display_name = "FOFA"
+
+    class AlwaysTransientRouter:
+        state_snapshot = []
+
+        async def execute_async(self, _operation):
+            raise FofaError("gateway timeout", kind="transient", code="502")
+
+    monkeypatch.setattr(collector, "get_engine", lambda _name: Engine())
+    monkeypatch.setattr(collector, "resolve_engine_config", lambda _task: {
+        "engine": "fofa", "key": "", "base_url": "https://fofa.info",
+        "max_pages": 2, "page_size": 1,
+    })
+    monkeypatch.setattr(collector, "_llm_for_task", lambda _task: None)
+    task = SimpleNamespace(
+        fofa_config={"current_query": 'host="example.com"', "cursor": 0},
+        src_type="edusrc",
+        fofa_query="",
+    )
+    reports = []
+
+    async def progress(phase, text, **payload):
+        reports.append((phase, text, payload))
+
+    router = AlwaysTransientRouter()
+    session = SimpleNamespace(add=lambda _obj: None)
+    await collector._fofa_collect(session, task, set(), {}, progress, fofa_router=router)
+    await collector._fofa_collect(session, task, set(), {}, progress, fofa_router=router)
+
+    assert len(reports) == 1
+
+
+@pytest.mark.asyncio
 async def test_collector_terminal_pool_marker_is_safe(monkeypatch):
     from app.agents import collector
 

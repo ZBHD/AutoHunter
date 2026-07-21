@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import time
@@ -47,8 +48,72 @@ _TARGET_FILTER_HARD_TIMEOUT = float(os.environ.get("TARGET_FILTER_HARD_TIMEOUT",
 # 泄露凭证查询走外部 logs API，并发要小、节奏要慢，避免把对方打挂或被限流。
 _LEAK_CONCURRENCY = int(os.environ.get("LEAK_QUERY_CONCURRENCY", "2"))
 _LEAK_QUERY_DELAY = float(os.environ.get("LEAK_QUERY_DELAY", "0.6"))
+_FOFA_ERROR_REPORT_INTERVAL = 60
 ProgressCallback = Callable[[str, str, dict], Awaitable[None]]
 ProgressReporter = Callable[..., Awaitable[None]]
+
+
+def fofa_error_signature(error: BaseException) -> str:
+    """Create a stable, credential-free signature for one FOFA failure shape."""
+    kind = str(getattr(error, "kind", "transient") or "transient")
+    code = str(getattr(error, "code", "") or "")
+    message = " ".join(str(error or "").split())[:300]
+    payload = f"{kind}|{code}|{message}".encode("utf-8", "replace")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def should_report_fofa_error(
+    cfg: dict,
+    signature: str,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether this error signature may emit another progress event."""
+    if cfg.get("fofa_last_error_signature") != signature:
+        return True
+    reported_at = str(cfg.get("fofa_last_error_reported_at") or "").strip()
+    if not reported_at:
+        return True
+    try:
+        previous = datetime.fromisoformat(reported_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if previous.tzinfo is None or previous.utcoffset() is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    current = current.astimezone(timezone.utc)
+    return (current - previous.astimezone(timezone.utc)).total_seconds() >= _FOFA_ERROR_REPORT_INTERVAL
+
+
+def _fofa_router_next_retry_at(router: FofaKeyRouter) -> datetime | None:
+    """Return a retry time only when every usable FOFA key is cooling."""
+    now = datetime.now(timezone.utc)
+    states = list(getattr(router, "state_snapshot", ()) or ())
+    eligible = [
+        state for state in states
+        if state.enabled
+        and state.key_set
+        and state.runtime_state not in {"auth_invalid", "daily_suspended"}
+    ]
+    if not eligible:
+        return None
+    if any(
+        state.cooldown_until is None or state.cooldown_until <= now
+        for state in eligible
+    ):
+        return None
+    return min(state.cooldown_until for state in eligible if state.cooldown_until is not None)
+
+
+def _clear_fofa_error_diagnostics(cfg: dict) -> None:
+    for field in (
+        "last_fofa_error",
+        "last_fofa_error_kind",
+        "last_fofa_error_code",
+        "fofa_retry_after",
+        "fofa_last_error_signature",
+        "fofa_last_error_reported_at",
+    ):
+        cfg.pop(field, None)
 
 
 def normalize_host(url_or_host: str) -> str:
@@ -530,19 +595,40 @@ async def _fofa_collect(
         except FofaError as exc:
             # Transient errors deliberately stop this page without trying a
             # second key; the router preserves the active candidate for retry.
+            now = datetime.now(timezone.utc)
+            safe_error = " ".join(str(exc).split())[:300]
+            signature = fofa_error_signature(exc)
+            emit_event = should_report_fofa_error(cfg, signature, now)
+            cfg["last_fofa_error"] = safe_error
+            cfg["last_fofa_error_kind"] = str(exc.kind or "transient")
+            cfg["last_fofa_error_code"] = str(exc.code or "")
+            if exc.retry_after is None:
+                cfg.pop("fofa_retry_after", None)
+            else:
+                cfg["fofa_retry_after"] = int(exc.retry_after)
+            if emit_event:
+                cfg["fofa_last_error_signature"] = signature
+                cfg["fofa_last_error_reported_at"] = now.isoformat().replace("+00:00", "Z")
+            retry_at = _fofa_router_next_retry_at(fofa_router)
+            if retry_at is not None:
+                cfg["fofa_next_retry_at"] = retry_at.isoformat().replace("+00:00", "Z")
             cfg["collector_phase"] = "fofa_error"
             cfg["fofa_pool_summary"] = "FOFA 请求暂时失败，游标保持不变"
             task.fofa_config = {**cfg}
-            await report(
-                "fofa_error",
-                "FOFA 请求暂时失败，游标保持不变",
-                fofa_error=str(exc.kind or "transient"),
-                cursor=cursor,
-            )
+            if emit_event:
+                await report(
+                    "fofa_error",
+                    "FOFA 请求暂时失败，游标保持不变",
+                    fofa_error=str(exc.kind or "transient"),
+                    fofa_error_code=str(exc.code or ""),
+                    cursor=cursor,
+                    retry_after=exc.retry_after,
+                )
             return 0
         cfg.pop("fofa_next_retry_at", None)
         cfg.pop("fofa_pool_blocked", None)
         cfg.pop("fofa_pool_summary", None)
+        _clear_fofa_error_diagnostics(cfg)
     try:
         if engine_name != "fofa":
             res = await engine.search(key, cur_query, page=next_cursor, page_size=size,
