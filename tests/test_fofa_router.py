@@ -155,7 +155,37 @@ def test_transient_failure_does_not_rotate_and_is_reraised_safely() -> None:
     assert router.active_name == "A"
     assert exc_info.value.kind == "transient"
     assert "secret-a" not in str(exc_info.value)
-    assert router.keys[0].runtime_state == "ready"
+    assert router.keys[0].runtime_state == "transient_cooldown"
+
+
+def test_transient_failure_enters_bounded_cooldown_and_recovers() -> None:
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    now, advance = clock(start)
+    router = FofaKeyRouter(
+        [key("A", "secret-a"), key("B", "secret-b")],
+        now=now,
+    )
+
+    elapsed = 0
+    for count, delay in enumerate((15, 30, 60, 120, 300, 300), start=1):
+        with pytest.raises(FofaError):
+            router.execute_sync(
+                lambda *_: (_ for _ in ()).throw(
+                    FofaError("gateway timeout", kind="transient")
+                )
+            )
+        state = router.keys[0]
+        assert state.runtime_state == "transient_cooldown"
+        assert state.failure_count == count
+        assert state.cooldown_until == start + timedelta(seconds=elapsed + delay)
+        advance(seconds=delay)
+        elapsed += delay
+
+    assert router.execute_sync(lambda *_: "ok") == "ok"
+    state = router.keys[0]
+    assert state.runtime_state == "ready"
+    assert state.failure_count == 0
+    assert state.cooldown_until is None
 
 
 def test_earliest_retry_and_all_blocked_pool_state() -> None:
@@ -424,6 +454,7 @@ def test_callback_reentry_is_lock_free_and_revision_ordered() -> None:
     release = threading.Event()
     events = []
     router: FofaKeyRouter
+    now, advance = clock(datetime(2026, 7, 16, tzinfo=UTC))
 
     def callback(change) -> None:
         events.append(change)
@@ -432,7 +463,7 @@ def test_callback_reentry_is_lock_free_and_revision_ordered() -> None:
             assert release.wait(timeout=2)
             router.execute_sync(lambda *_: "reentered")
 
-    router = FofaKeyRouter([key("A", "key-a")], on_state_change=callback)
+    router = FofaKeyRouter([key("A", "key-a")], on_state_change=callback, now=now)
 
     def transient() -> None:
         with pytest.raises(FofaError):
@@ -441,9 +472,11 @@ def test_callback_reentry_is_lock_free_and_revision_ordered() -> None:
     first = threading.Thread(target=transient)
     first.start()
     assert entered.wait(timeout=2)
+    advance(seconds=15)
     second = threading.Thread(target=transient)
     second.start()
     second.join(timeout=2)
+    advance(seconds=30)
     release.set()
     first.join(timeout=2)
     assert [event.revision for event in events] == [1, 2, 3]

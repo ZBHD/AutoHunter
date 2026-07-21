@@ -69,7 +69,12 @@ def _key_overlaps_name(name: str, key: str) -> bool:
 
 
 FofaRuntimeState = Literal[
-    "ready", "rate_limited", "daily_cooldown", "daily_suspended", "auth_invalid"
+    "ready",
+    "rate_limited",
+    "daily_cooldown",
+    "transient_cooldown",
+    "daily_suspended",
+    "auth_invalid",
 ]
 FofaFailureKindValue = Literal["", "auth", "rate_limit", "daily_limit", "transient"]
 

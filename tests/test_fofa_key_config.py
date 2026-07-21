@@ -136,6 +136,19 @@ def test_fofa_key_config_accepts_utc_cooldown() -> None:
     assert item.cooldown_until == cooldown
 
 
+def test_fofa_key_config_accepts_transient_cooldown_state() -> None:
+    item = FofaKeyConfig(
+        name="A",
+        key="secret-a",
+        runtime_state="transient_cooldown",
+        failure_kind="transient",
+        failure_count=1,
+        cooldown_until=datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc),
+    )
+
+    assert item.runtime_state == "transient_cooldown"
+
+
 def test_fofa_key_config_repr_hides_key() -> None:
     secret = "fofa-secret-that-must-not-leak"
 

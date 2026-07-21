@@ -2,6 +2,7 @@ const STATUS_META = {
   ready: { code: "ready", label: "可用", tone: "ok" },
   rate_limited: { code: "rate_limited", label: "限流冷却", tone: "warn" },
   daily_cooldown: { code: "daily_cooldown", label: "额度冷却", tone: "warn" },
+  transient_cooldown: { code: "transient_cooldown", label: "临时故障冷却", tone: "warn" },
   daily_suspended: { code: "daily_suspended", label: "今日暂停", tone: "danger" },
   auth_invalid: { code: "auth_invalid", label: "Key 无效", tone: "danger" },
 };
@@ -52,7 +53,7 @@ export function isFofaKeyUsable(item = {}, now = Date.now()) {
   if (item.enabled !== true || item.key_set !== true) return false;
   const state = String(item.runtime_state || "ready");
   if (state === "auth_invalid" || state === "daily_suspended") return false;
-  if (state === "rate_limited" || state === "daily_cooldown") {
+  if (state === "rate_limited" || state === "daily_cooldown" || state === "transient_cooldown") {
     if (!item.cooldown_until) return false;
     const until = Date.parse(item.cooldown_until);
     return Number.isFinite(until) && until <= Number(now);

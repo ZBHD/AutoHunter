@@ -47,6 +47,18 @@ test("FOFA usability excludes disabled, blocked, and cooling entries", () => {
     runtime_state: "rate_limited",
     cooldown_until: "2026-07-16T11:59:00Z",
   }, Date.parse("2026-07-16T12:00:00Z")), true);
+  assert.equal(isFofaKeyUsable({
+    enabled: true,
+    key_set: true,
+    runtime_state: "transient_cooldown",
+    cooldown_until: "2026-07-16T12:01:00Z",
+  }, Date.parse("2026-07-16T12:00:00Z")), false);
+  assert.equal(isFofaKeyUsable({
+    enabled: true,
+    key_set: true,
+    runtime_state: "transient_cooldown",
+    cooldown_until: "2026-07-16T11:59:00Z",
+  }, Date.parse("2026-07-16T12:00:00Z")), true);
 });
 
 test("moveFofaKey reorders names without mutating the input", () => {
@@ -108,6 +120,11 @@ test("status and labels explain runtime state, category, endpoint mode, and cool
     code: "auth_invalid",
     label: "Key 无效",
     tone: "danger",
+  });
+  assert.deepEqual(fofaKeyStatus({ enabled: true, runtime_state: "transient_cooldown" }), {
+    code: "transient_cooldown",
+    label: "临时故障冷却",
+    tone: "warn",
   });
   assert.equal(categoryLabel("daily_limit"), "每日额度");
   assert.equal(endpointModeLabel("api_php"), "完整地址");

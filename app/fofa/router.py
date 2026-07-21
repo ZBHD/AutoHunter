@@ -260,6 +260,7 @@ class FofaKeyRouter(Generic[T]):
                     if item.failure_kind in {
                         FofaFailureKind.RATE_LIMIT.value,
                         FofaFailureKind.DAILY_LIMIT.value,
+                        FofaFailureKind.TRANSIENT.value,
                     }:
                         cooldown_kind = item.failure_kind
                     elif item.runtime_state == "daily_cooldown":
@@ -436,6 +437,11 @@ class FofaKeyRouter(Generic[T]):
             same_state = (
                 item.failure_kind == kind.value and item.runtime_state == "daily_cooldown"
             )
+        elif kind is FofaFailureKind.TRANSIENT:
+            same_state = (
+                item.failure_kind == kind.value
+                and item.runtime_state == "transient_cooldown"
+            )
         else:
             same_state = False
         if not same_state:
@@ -476,7 +482,10 @@ class FofaKeyRouter(Generic[T]):
                 item.runtime_state = "daily_cooldown"
                 item.cooldown_until = self._current_time() + timedelta(hours=1)
         else:
-            item.runtime_state = "ready"
+            item.runtime_state = "transient_cooldown"
+            transient_delays = (15, 30, 60, 120, 300)
+            delay = transient_delays[min(item.failure_count - 1, len(transient_delays) - 1)]
+            item.cooldown_until = self._current_time() + timedelta(seconds=delay)
         self._record_state_change(before, entry)
 
     def _safe_error(self, error: BaseException, kind: FofaFailureKind) -> FofaError:
