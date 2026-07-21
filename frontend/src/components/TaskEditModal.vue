@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "./VulnerabilityTypeSelector.vue";
+import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode, fofaKeyPatch } from "../taskSourceModes.js";
 
 const props = defineProps({
   open: Boolean,
@@ -66,6 +67,7 @@ const form = reactive({
   temperature: 0.3,
   prompt_version: "current",
   fofa_key: "",
+  fofa_key_mode: "global",
   fofa_base_url: "",
   max_pages: 20,
   page_size: 100,
@@ -78,14 +80,30 @@ const original = reactive({
   fofa_base_url: "",
   max_pages: 20,
   page_size: 100,
+  fofa_key_mode: "global",
+  fofa_is_fofa: true,
 });
 const isSiteMode = computed(() => form.target_source === "site");
+const isAutoMode = computed(() => isAutoSource(form.target_source));
+const isManualOnlyMode = computed(() => isManualOnly(form.target_source));
+const isFofaMode = computed(() => isFofaPoolMode(form.target_source, form.engine));
+const showManualTargets = computed(() => isManualOnlyMode.value || isSiteSource(form.target_source) || form.target_source === "both");
 const dedicatedKeyRequired = computed(() => (
   !form.use_global_pool && (original.use_global_pool || !form.api_key_set)
 ));
 
 function handleTargetSourceChange() {
   if (isSiteMode.value) form.site_recon_mode = "full";
+}
+
+function handleEngineChange() {
+  if (!isFofaMode.value) {
+    form.fofa_key_mode = "global";
+  }
+}
+
+function setFofaKeyMode(mode) {
+  form.fofa_key_mode = mode;
 }
 
 function fill(task) {
@@ -112,6 +130,9 @@ function fill(task) {
   form.temperature = Number(modelCfg.temperature ?? 0.3);
   form.prompt_version = modelCfg.prompt_version || "current";
   form.fofa_key = "";
+  const initialIsFofa = isFofaPoolMode(form.target_source, form.engine);
+  const initialHasTaskKey = fofaCfg.key_source === "task";
+  form.fofa_key_mode = initialIsFofa && initialHasTaskKey ? "task" : "global";
   form.fofa_base_url = fofaCfg.base_url || "";
   form.max_pages = fofaCfg.max_pages ?? 20;
   form.page_size = fofaCfg.page_size ?? 100;
@@ -121,6 +142,8 @@ function fill(task) {
   original.fofa_base_url = form.fofa_base_url;
   original.max_pages = Number(form.max_pages);
   original.page_size = Number(form.page_size);
+  original.fofa_key_mode = initialHasTaskKey ? "task" : "global";
+  original.fofa_is_fofa = initialIsFofa;
   // 重置模型列表状态（打开弹窗时 watch 会随即自动 loadModels 拉好列表）
   models.value = [];
   modelsError.value = "";
@@ -151,11 +174,23 @@ async function save() {
   const maxPages = parseInt(form.max_pages) || 20;
   const pageSize = parseInt(form.page_size) || 100;
   const fofaConfig = {};
-  if (maxPages !== original.max_pages) fofaConfig.max_pages = maxPages;
-  if (pageSize !== original.page_size) fofaConfig.page_size = pageSize;
-  if (form.intent_mode !== original.intent_mode) fofaConfig.intent_mode = form.intent_mode;
-  if (form.fofa_key.trim()) fofaConfig.key = form.fofa_key.trim();
-  if (form.fofa_base_url !== original.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
+  const engineConfig = {};
+  Object.assign(fofaConfig, fofaKeyPatch({
+    initialMode: original.fofa_key_mode,
+    finalMode: form.fofa_key_mode,
+    initialIsFofa: original.fofa_is_fofa,
+    finalIsFofa: isFofaMode.value,
+    key: form.fofa_key,
+  }));
+  if (isFofaMode.value) {
+    if (maxPages !== original.max_pages) fofaConfig.max_pages = maxPages;
+    if (pageSize !== original.page_size) fofaConfig.page_size = pageSize;
+    if (form.intent_mode !== original.intent_mode) fofaConfig.intent_mode = form.intent_mode;
+    if (form.fofa_base_url !== original.fofa_base_url) fofaConfig.base_url = form.fofa_base_url;
+  } else if (isAutoMode.value) {
+    if (form.fofa_key.trim()) engineConfig.key = form.fofa_key.trim();
+    if (form.fofa_base_url !== original.fofa_base_url) engineConfig.base_url = form.fofa_base_url;
+  }
   if (isSiteMode.value) fofaConfig.site_recon_mode = form.site_recon_mode;
 
   const updated = await api.updateTask(props.task.id, {
@@ -164,13 +199,16 @@ async function save() {
     vuln_types: [...form.vuln_types],
     hunt_direction: form.hunt_direction.trim(),
     target_source: form.target_source,
-    engine: form.engine,
-    fofa_query: form.fofa_query,
-    manual_targets: form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean),
+    engine: isAutoMode.value ? form.engine : "",
+    fofa_query: isAutoMode.value || isSiteMode.value ? form.fofa_query : "",
+    manual_targets: showManualTargets.value
+      ? form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean)
+      : [],
     src_rules: form.src_rules,
     concurrency: parseInt(form.concurrency) || 3,
     model_config_data: modelConfig,
     fofa_config: fofaConfig,
+    engine_config: engineConfig,
   });
   emit("saved", updated);
 }
@@ -219,8 +257,8 @@ async function save() {
           </div>
           <p class="model-mode-copy">轻量模式保留全部路由，仅将 site_map 预算限制为最多 18 轮。</p>
         </div>
-        <label v-if="!isSiteMode">搜索引擎
-          <select v-model="form.engine">
+        <label v-if="isAutoMode">搜索引擎
+          <select v-model="form.engine" @change="handleEngineChange">
             <option value="">默认引擎</option>
             <option value="fofa">FOFA</option>
             <option value="quake">360 Quake</option>
@@ -230,7 +268,7 @@ async function save() {
             <option value="censys">Censys</option>
           </select>
         </label>
-        <label v-if="!isSiteMode">搜集方式
+        <label v-if="isFofaMode">搜集方式
           <select v-model="form.intent_mode">
             <option value="">自动判断</option>
             <option value="syntax">FOFA 语法</option>
@@ -244,16 +282,16 @@ async function save() {
         <textarea v-model="form.hunt_direction" rows="3" maxlength="2000"
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
       </label>
-      <label v-if="!isSiteMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
-      <label v-else>目标相关信息 / 协作重点 / 已有凭据
+        <label v-if="isAutoMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
+        <label v-else-if="isSiteMode">目标相关信息 / 协作重点 / 已有凭据
         <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置，以及【已有的登录凭据】。给了凭据 Agent 会先前台测、再登录进系统内部深挖。&#10;例：后台在 /admin；已有账号 test / Test@123；或 Cookie: JSESSIONID=xxxx"></textarea>
       </label>
-      <label>{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
+        <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
         <textarea v-model="form.manual_targets" rows="3"></textarea>
       </label>
 
       <details open>
-        <summary>高级：模型 / FOFA</summary>
+        <summary>高级：模型{{ isFofaMode ? " / FOFA" : "" }}</summary>
         <div class="model-mode-switch" role="group" aria-label="任务模型来源">
           <button type="button" :class="{ active: form.use_global_pool }" :aria-pressed="form.use_global_pool"
             @click="form.use_global_pool = true">
@@ -315,10 +353,27 @@ async function save() {
               :required="dedicatedKeyRequired"
               :placeholder="dedicatedKeyRequired ? '切换到专用模型时必须填写' : '已配置，留空保留原值'" />
           </label>
-          <label v-if="!isSiteMode">FOFA key <input v-model="form.fofa_key" type="password" placeholder="留空保留原值" /></label>
-          <label v-if="!isSiteMode">FOFA API 端点 <input v-model="form.fofa_base_url" placeholder="https://fofa.info" /></label>
-          <label v-if="!isSiteMode">FOFA 最大页数 <input v-model="form.max_pages" type="number" min="1" max="200" /></label>
-          <label v-if="!isSiteMode">FOFA page_size <input v-model="form.page_size" type="number" min="1" max="1000" /></label>
+          <template v-if="isFofaMode">
+            <div class="model-mode-switch" role="group" aria-label="FOFA Key 来源">
+              <button type="button" :class="{ active: form.fofa_key_mode === 'global' }"
+                :aria-pressed="form.fofa_key_mode === 'global'" @click="setFofaKeyMode('global')">
+                使用全局 FOFA Key 池
+              </button>
+              <button type="button" :class="{ active: form.fofa_key_mode === 'task' }"
+                :aria-pressed="form.fofa_key_mode === 'task'" @click="setFofaKeyMode('task')">
+                任务专用 FOFA Key
+              </button>
+            </div>
+            <p class="model-mode-copy">任务专用 Key 不参与全局轮换。</p>
+            <label v-if="form.fofa_key_mode === 'task'">FOFA Key <input v-model="form.fofa_key" type="password" placeholder="留空保留原值" /></label>
+            <label>FOFA API 端点 <input v-model="form.fofa_base_url" placeholder="https://fofa.info" /></label>
+            <label>FOFA 最大页数 <input v-model="form.max_pages" type="number" min="1" max="200" /></label>
+            <label>FOFA page_size <input v-model="form.page_size" type="number" min="1" max="1000" /></label>
+          </template>
+          <template v-else-if="isAutoMode">
+            <label>{{ form.engine || "搜索引擎" }} Key <input v-model="form.fofa_key" type="password" placeholder="留空保留原值" /></label>
+            <label>{{ form.engine || "搜索引擎" }} API 端点 <input v-model="form.fofa_base_url" placeholder="https://api.example.com" /></label>
+          </template>
         </div>
       </details>
 

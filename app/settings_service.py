@@ -368,8 +368,9 @@ def _legacy_fofa_is_suppressed(value: Any) -> bool:
     return isinstance(value, dict) and value.get("legacy_suppressed") is True
 
 
-def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
-    """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
+def _resolve_fofa_keys_with_source(
+    task: Task | None = None,
+) -> tuple[list[FofaKeyConfig], bool]:
     if task is not None:
         task_config = task.fofa_config or {}
         task_key = str(task_config.get("key") or "").strip()
@@ -383,7 +384,7 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
                     key=task_key,
                     base_url=task_base_url,
                 )
-            ]
+            ], False
 
     stored_pool = list(_cache.get("fofa_keys") or [])
     if stored_pool:
@@ -393,10 +394,10 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
                 keys.append(_fofa_key_from_value(item))
             except (TypeError, ValidationError):
                 logger.error("忽略无法解析的缓存 FOFA Key: name=<invalid>")
-        return keys
+        return keys, False
 
     if _legacy_fofa_is_suppressed(_cache.get("fofa")):
-        return []
+        return [], False
 
     fofa = dict(_cache.get("fofa") or {})
     engines = dict(_cache.get("engines") or {})
@@ -415,7 +416,13 @@ def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
             base_url=_resolve_legacy_fofa_base_url(),
             enabled=fofa.get("enabled") is not False,
         )
-    ]
+    ], True
+
+
+def resolve_fofa_keys(task: Task | None = None) -> list[FofaKeyConfig]:
+    """解析 FOFA Key 池，保留禁用项并兼容任务及旧单 Key 配置。"""
+    keys, _legacy_fallback = _resolve_fofa_keys_with_source(task)
+    return keys
 
 
 def _fofa_router_fingerprint(keys: list[FofaKeyConfig]) -> str:
@@ -468,13 +475,13 @@ def fofa_router_for_task(task: Task | None = None) -> FofaKeyRouter:
     if override is not None:
         return FofaKeyRouter([override], active_name=override.name)
 
-    keys = resolve_fofa_keys()
+    keys, legacy_fallback = _resolve_fofa_keys_with_source()
     fingerprint = _fofa_router_fingerprint(keys)
     try:
         loop_token: object = asyncio.get_running_loop()
     except RuntimeError:
         loop_token = "sync"
-    cache_key = (fingerprint, loop_token)
+    cache_key = (legacy_fallback, fingerprint, loop_token)
     router = _fofa_router_cache.get(cache_key)
     if router is not None:
         _fofa_router_cache.move_to_end(cache_key)
@@ -488,7 +495,12 @@ def fofa_router_for_task(task: Task | None = None) -> FofaKeyRouter:
         # synchronous settings reads still receive a functional router.
         callback = None
     active_name = str(((_cache.get("fofa") or {}).get("active_key_name")) or "")
-    router = FofaKeyRouter(keys, active_name=active_name, on_state_change=callback)
+    router = FofaKeyRouter(
+        keys,
+        active_name=active_name,
+        legacy_fallback=legacy_fallback,
+        on_state_change=callback,
+    )
     # There is one active global configuration at a time. Dropping stale
     # entries prevents old credentials and callbacks from accumulating.
     _fofa_router_cache.clear()
@@ -509,8 +521,10 @@ def resolve_engine_name(task: Task | None = None) -> str:
 def resolve_engine_key(engine_name: str, task: Task | None = None) -> str:
     """获取指定引擎的 API Key（任务级 > DB缓存 > 环境变量）。"""
     effective = effective_settings()
-    # 任务级 fofa_config 兼容旧版
-    if engine_name == "fofa" and task:
+    # 任务级配置历史上存放在 fofa_config 中；只在请求的引擎就是任务当前
+    # 引擎时读取，避免从 Quake 切回 FOFA 时误用上一引擎遗留的 Key。
+    task_engine = resolve_engine_name(task) if task else ""
+    if task and engine_name == task_engine:
         cfg = task.fofa_config or {}
         if cfg.get("key"):
             return str(cfg["key"])
@@ -531,8 +545,9 @@ def resolve_engine_base_url(engine_name: str, task: Task | None = None) -> str:
     engine = get_engine(engine_name)
     default = engine.get_default_base_url() if engine else ""
     effective = effective_settings()
-    # 任务级 fofa_config 兼容旧版
-    if engine_name == "fofa" and task:
+    # 任务级配置历史上存放在 fofa_config 中；按当前引擎限定作用域。
+    task_engine = resolve_engine_name(task) if task else ""
+    if task and engine_name == task_engine:
         cfg = task.fofa_config or {}
         if cfg.get("base_url"):
             return str(cfg["base_url"])

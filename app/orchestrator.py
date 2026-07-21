@@ -833,13 +833,15 @@ class TaskRunner:
 
             # 1. 队列水位低 → 补目标
             async def collector_progress(phase: str, text: str, payload: dict) -> None:
+                event_payload = dict(payload)
+                event_kind = str(event_payload.pop("event_kind", "") or "").strip()
                 await self._log(
                     session,
                     "collector",
-                    "collector_phase",
+                    event_kind or "collector_phase",
                     text,
                     phase=phase,
-                    **payload,
+                    **event_payload,
                 )
 
             added = await collector.refill(session, task, LOW_WATERMARK, progress_cb=collector_progress)

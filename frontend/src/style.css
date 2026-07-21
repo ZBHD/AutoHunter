@@ -2087,6 +2087,16 @@ main {
   display: block; height: 100%; width: 100%; transform-origin: left;
   background: var(--accent); transition: transform .45s ease;
 }
+.mission-progress.indeterminate i,
+.collector-stage-bar.indeterminate i {
+  animation: collector-progress 1.45s ease-in-out infinite;
+  transform-origin: left;
+}
+@keyframes collector-progress {
+  0% { transform: scaleX(.08); opacity: .58; }
+  50% { transform: scaleX(.72); opacity: 1; }
+  100% { transform: scaleX(.16); opacity: .66; }
+}
 .collector-stage {
   background: color-mix(in oklch, var(--surface) 92%, var(--bg));
   border: 1px solid var(--border);
@@ -2094,17 +2104,37 @@ main {
   padding: 12px 14px;
   margin: -8px 0 18px;
 }
+.collector-stage.tone-active { border-color: color-mix(in oklch, var(--info) 44%, var(--border)); }
+.collector-stage.tone-waiting { border-color: color-mix(in oklch, var(--warn) 60%, var(--border)); background: color-mix(in oklch, var(--warn-bg) 42%, var(--surface)); }
+.collector-stage.tone-blocked { border-color: color-mix(in oklch, var(--danger) 62%, var(--border)); background: color-mix(in oklch, var(--danger-bg) 42%, var(--surface)); }
+.collector-stage.tone-neutral { border-color: var(--border); }
 .collector-stage-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
   margin-bottom: 9px;
 }
+.collector-stage-label { min-width: 0; display: grid; gap: 2px; }
 .collector-stage-head b {
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; overflow-wrap: anywhere;
   color: var(--ink); font-size: 13px; font-weight: 650;
 }
-.collector-stage-head span {
+.collector-stage-label small { color: var(--faint); font-size: 11px; }
+.collector-stage-meta {
+  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px 10px;
   color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 12px;
-  white-space: nowrap;
+  text-align: right;
+}
+.collector-stage-meta > span { white-space: nowrap; }
+.collector-rotation,
+.collector-cooldown,
+.collector-blocked-help {
+  margin: 6px 0 9px; font-size: 11.5px; overflow-wrap: anywhere;
+}
+.collector-rotation { color: var(--accent-ink); }
+.collector-cooldown { color: var(--warn); }
+.collector-blocked-help { color: var(--danger); }
+.collector-settings-link {
+  border: 0; padding: 0; min-height: 0; color: inherit; background: transparent;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer; font: inherit;
 }
 .collector-stage-bar {
   height: 5px; background: var(--bg); border: 1px solid var(--border-soft);
@@ -2113,6 +2143,16 @@ main {
 .collector-stage-bar i {
   display: block; width: 100%; height: 100%; transform-origin: left;
   background: var(--info); transition: transform .35s ease;
+}
+@media (max-width: 640px) {
+  .collector-stage-head { flex-direction: column; gap: 5px; }
+  .collector-stage-meta { justify-content: flex-start; text-align: left; }
+  .collector-stage-meta > span { white-space: normal; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .view-progress i,
+  .mission-progress.indeterminate i,
+  .collector-stage-bar.indeterminate i { animation: none; }
 }
 
 /* ---------- 单站协作态势（三阶段流水线） ---------- */
