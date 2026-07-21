@@ -52,8 +52,9 @@ class FofaError(Exception):
 
 _FOFA_DAILY_LIMIT_MARKERS = (
     "820041", "daily quota", "daily limit", "daily request limit",
-    "daily search limit", "每日额度", "每日配额", "每日限额", "当日额度",
-    "当日配额", "今日额度", "今日配额", "每日",
+    "daily search limit", "call limit has been exhausted", "calls exhausted",
+    "每日额度", "每日配额", "每日限额", "当日额度", "当日配额", "今日额度",
+    "今日配额", "今日调用次数已用完", "调用次数已用完", "每日",
 )
 _FOFA_RATE_LIMIT_MARKERS = (
     "q3005", "too many", "rate limit", "ratelimit",

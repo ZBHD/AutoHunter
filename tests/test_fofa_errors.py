@@ -71,6 +71,27 @@ def test_standalone_daily_marker_is_daily_limit() -> None:
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "[-200] 今日调用次数已用完",
+        "今日调用次数已用完",
+        "调用次数已用完",
+        "today's call limit has been exhausted",
+    ],
+)
+def test_call_exhaustion_messages_are_daily_limit(message: str) -> None:
+    kind, code, retry_after = classify(message, status=200)
+
+    assert kind == "daily_limit"
+    assert code in {"", "-200"}
+    assert retry_after == 3600
+
+
+def test_standalone_minus_200_is_not_daily_limit() -> None:
+    assert classify("upstream returned -200", status=200)[0] == "transient"
+
+
+@pytest.mark.parametrize(
     ("message", "status", "expected_code"),
     [
         ("Too Many Requests", 429, "429"),
