@@ -238,6 +238,8 @@ created_at / updated_at  DateTime
 
 `origin_key` 由 `scheme + host + explicit_port + normalized_mount_path` 生成。同一任务内唯一。默认端口归一化，路径移除重复斜杠和尾斜杠，但保留反向代理挂载路径。
 
+现有 `targets` 唯一索引是 `(task_id, host, source)`，因此 LiteLLM 不能直接把所有挂载路径都写成 `source=fofa`。创建 Target 时使用稳定的短路由键 `source=gw:llm:<origin_hash8>`，其中 `origin_hash8` 来自 origin_key；搜索引擎、原始查询和真实来源保存在 GatewayAsset/Observation。该键长度不超过现有 `targets.source VARCHAR(20)`，并沿用单站协作“同主机不同 source 可并行”的既有语义。
+
 ### GatewaySecret
 
 ```text
@@ -293,7 +295,7 @@ observed_at              DateTime, indexed
 
 Observation 只保存索引字段和 Evidence 引用；完整请求、响应继续进入现有 `raw_evidence`，不重复存储大文本。
 
-唯一约束为 `(gateway_asset_id, scan_epoch, probe_id, auth_variant)`，用于保证服务重启后同一轮已完成 Probe 不会再次发送。`gateway_assets` 另有 `(task_id, origin_key)` 唯一约束。
+唯一约束为 `(gateway_asset_id, scan_epoch, probe_id, auth_variant)`，用于保证服务重启后同一轮已完成 Probe 不会再次发送。`gateway_assets` 另有 `(task_id, origin_key)` 唯一约束；Target 的 `source` 由同一 origin_key 生成，不允许用随机值绕过去重。
 
 ### 迁移
 
