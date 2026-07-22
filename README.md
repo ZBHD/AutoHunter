@@ -2,459 +2,315 @@
 
 <img src="assets/banner.png" alt="AutoHunter" width="880">
 
-多 Agent 协同 · 24×7 自动挖洞 · 人工只做复审决策
+# AutoHunter
+
+多 Agent 协同的 AI 漏洞挖掘与人工复审平台
 
 `锁定 · 侦察 · 出洞`
 
-Powered By **StanleyNull** · License: CC BY-NC 4.0
+**原作者：StanleyNull** · **Copyright (c) 2026 StanleyNull**<br>
+**许可证：[CC BY-NC 4.0](./LICENSE)** · **仅限非商业使用**
 
-作者 EDUSRC 主页：<https://src.sjtu.edu.cn/profile/46491/>
+原作者 EduSRC 主页：<https://src.sjtu.edu.cn/profile/46491/>
 
-🌱 **本项目为 Demo 级别，作者抛砖引玉，希望对大家有所帮助。**
+原项目地址：[StanleyNull/AutoHunter](https://github.com/StanleyNull/AutoHunter)
 
-**战绩可查**
-
-<img src="assets/proof-results.png" alt="战绩可查" width="480">
+<img src="assets/proof-results.png" alt="项目成果截图" width="480">
 
 </div>
 
 ---
 
-## 这是什么
+## 版权与版本说明
 
-AutoHunter 是一个**多 Agent 协同的自动化漏洞挖掘系统**。你把一台机器交给它当作 7×24 小时不停歇的挖洞平台，自己只做「人工复审员」：
+AutoHunter 原作由 **StanleyNull** 发布，版权归原作者所有。本仓库在原作基础上进行了持续维护和功能扩展，具体修改记录以本仓库 Git 历史为准。
 
-```
-Collector（搜集）  →  Worker（1:1 真实挖洞）  →  Reviewer（AI 初审去垃圾）  →  人工复审 → 待提交
-     ↑ FOFA/手动录目标        ↑ LLM + 真实工具链（httpx/Katana/FFUF/Arjun/JS 与证据分析…）
-```
+根据 CC BY-NC 4.0 的署名要求，使用、修改或再分发本项目时必须：
 
-- **Collector**：从 FOFA 持续产出目标，探活、预筛、评分、归属标注后入队。
-- **Worker**：每个目标一个 Worker，LLM 自主侦察 + 调用真实工具挖洞，出洞即提交。
-- **Reviewer**：极理性 AI 初审，过滤半成品/误报，只把够格的洞送到人工面前。
-- **控制台**：实时看板一眼看清每个 Worker 在干什么、目标优先级、事件流；结果区高效复审、编辑、标记提交。
-- **归属标注**：写报告时按目标 IP/域名离线反查所属高校（`app/data_static/edu_ip.db`），自动填充报告归属单位与 EduSRC 提交 JSON 的标题/单位；重建脚本见 `tools/edu_ip_builder/`。
+- 保留原作者 `StanleyNull` 的姓名、项目内署名和版权声明；
+- 保留 [LICENSE](./LICENSE) 并提供 CC BY-NC 4.0 协议链接；
+- 明确说明是否对原作进行了修改；
+- 不得暗示原作者认可、担保或参与维护后的版本；
+- 不得用于商业销售、付费服务、付费分发或其他营利用途。
 
-> ⚠️ **仅限对已获明确书面授权的目标使用。** 本工具遵循 CC BY-NC 4.0，禁止商用。滥用后果自负。
+> 修改声明：当前仓库属于基于原作的修改版本，并非未经改动的原始发行版。
 
----
+## 项目现状
 
-## 各平台环境准备
+它以任务为单位组织目标搜集、排队、AI 驱动的单目标分析、AI 初审、人工复审、通杀分析和报告整理，并把运行状态持久化到 SQLite。
 
-AutoHunter 全程基于 **Docker + Docker Compose v2** 运行，任意装得上 Docker 的系统都能跑。下面按平台给出准备步骤，装好 Docker 后统一走 [一键部署](#一键部署推荐) 或 [手动部署](#手动部署)。
-
-<details open>
-<summary><b>🐧 Linux 服务器（推荐，Ubuntu / Debian / CentOS）</b></summary>
-
-生产环境首选。2C4G 起步，磁盘 ≥ 20G。
-
-```bash
-# 1. 安装 Docker（官方一键脚本，适配主流发行版）
-curl -fsSL https://get.docker.com | sh
-sudo systemctl enable --now docker
-
-# 2. 把当前用户加入 docker 组（免 sudo，重登生效）
-sudo usermod -aG docker $USER && newgrp docker
-
-# 3. 验证
-docker version && docker compose version
-
-# 4. 拉代码 + 部署
-git clone https://github.com/StanleyNull/AutoHunter.git autohunter && cd autohunter
-bash scripts/install.sh
-```
-
-**开放端口**（默认 18800）：
-
-```bash
-# Ubuntu/Debian(ufw)
-sudo ufw allow 18800/tcp
-# CentOS/RHEL(firewalld)
-sudo firewall-cmd --permanent --add-port=18800/tcp && sudo firewall-cmd --reload
-```
-
-> 云服务器还需在厂商**安全组**里放行 18800（或你自定义的 `AUTOHUNTER_HOST_PORT`）。
-
-**SSH 断开后仍要运行**：容器由 Docker 守护，`docker compose up -d` 已是后台运行，关掉 SSH 不影响。可选设开机自启见下方 [服务器长期运行](#服务器长期运行--开机自启)。
-
-</details>
-
-<details>
-<summary><b>🪟 Windows（Docker Desktop + WSL2）</b></summary>
-
-适合本地跑 / 自用。Windows 10/11 均可。
-
-1. **装 WSL2**（管理员 PowerShell）：
-   ```powershell
-   wsl --install
-   ```
-   装完重启。
-
-2. **装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)**：安装时勾选 “Use WSL 2 based engine”，启动后在 Settings → Resources → WSL Integration 打开集成。
-
-3. **拉代码 + 部署**（在 PowerShell 或 WSL 终端里）：
-   ```powershell
-   git clone https://github.com/StanleyNull/AutoHunter.git autohunter
-   cd autohunter
-   bash scripts/install.sh
-   ```
-   > `install.sh` 是 bash 脚本，在 **WSL / Git Bash** 里跑最顺。若只用 PowerShell，也可走 [手动部署](#手动部署)：`copy .env.example .env`，编辑后 `docker compose up -d --build`。
-
-4. 浏览器访问 `http://localhost:18800/`。
-
-> 💡 Windows 下代码放在 **WSL 文件系统内**（如 `~/autohunter`）比放在 `C:\` 挂载盘性能好很多。
-
-</details>
-
-<details>
-<summary><b>🍎 macOS（Docker Desktop）</b></summary>
-
-1. 装 [Docker Desktop for Mac](https://www.docker.com/products/docker-desktop/)（Apple Silicon / Intel 均支持），启动它。
-2. 部署：
-   ```bash
-   git clone https://github.com/StanleyNull/AutoHunter.git autohunter && cd autohunter
-   bash scripts/install.sh
-   ```
-3. 访问 `http://localhost:18800/`。
-
-</details>
-
----
-
-## 一键部署（推荐）
-
-> 前置：一台 Linux 服务器（2C4G 起步，磁盘 ≥ 20G），已装 [Docker](https://docs.docker.com/engine/install/) + Docker Compose v2。
-
-```bash
-# 1. 拉取代码
-git clone <your-repo-url> autohunter && cd autohunter
-
-# 2. 运行引导脚本（带字符画，交互式采集必填参数，自动生成 .env、构建并启动）
-bash scripts/install.sh
-```
-
-脚本会：检查 Docker 环境 → 引导你填 **LLM API Key**（必填）、**FOFA Key**（推荐）→ 自动生成高强度访问令牌 → 构建镜像并启动 → 打印访问地址和令牌。
-
-> 首次构建会编译前端，并安装 HTTPX、Katana、FFUF、Arjun、wafw00f、Nmap、WhatWeb，以及仅供非企业模式定向验证的 Nuclei、Dalfox、SQLMap，约 5–15 分钟，请耐心等待。企业 SRC 的工具限制见下方[模式矩阵](#企业与非企业模式矩阵)；镜像内存在某个二进制不代表该模式允许调用。
-
----
-
-## 手动部署
-
-```bash
-cp .env.example .env
-# 编辑 .env：至少填 LLM_API_KEY；建议填 FOFA_KEY 和 AUTOHUNTER_API_TOKEN
-vim .env
-
-docker compose up -d --build
-docker compose logs -f autohunter   # 看启动日志
-```
-
-启动后访问 `http://<服务器IP>:18800/`，用你在 `.env` 里设置的 `AUTOHUNTER_API_TOKEN` 登录。
-
----
-
-## 创建任务：配置怎么填
-
-登录控制台 → 「新建挖掘任务」，各字段含义如下：
-
-| 字段 | 填什么 | 说明 |
-|------|--------|------|
-| **任务名称** | 随便起，方便自己区分 | 如 `edu批量挖掘-2026` |
-| **任务模式** | `EduSRC` / `企业SRC` | 决定评分口径和审核标准，教育资产选 EduSRC |
-| **漏洞类型** | 中文复选项 | 默认全选 SQL 注入、远程代码执行、未授权访问、越权访问、文件上传、验证码绕过 |
-| **目标来源** | `FOFA 自动搜` / `手动清单` / `两者` / `单站协作` | 想让它自己找目标就选 FOFA |
-| **搜集方式** | `自动判断` / `FOFA 语法` / `自然语言意图` | 见下方说明 |
-| **FOFA 语法 / 搜集意图** | 你的查询语句或大白话 | 见下方示例 |
-| **手动目标清单** | 每行一个 URL | 选了「手动/两者/单站」时填 |
-
-### 两种搜集方式
-
-**① 我自己会写 FOFA 语法** → 搜集方式选 `FOFA 语法`，直接把语句粘进去。例如挖教育网（CERNET）下带「管理」后台的资产：
+当前主流程：
 
 ```text
-body="管理" && org="China Education and Research Network Center"
+目标搜集/手动录入
+        ↓
+存活检测、预筛、评分、去重、排队
+        ↓
+Worker 按目标执行侦察、定位、验证与取证
+        ↓
+Reviewer 初审：采纳 / 忽略 / 打回深挖
+        ↓
+人工复审：编辑报告 / 通过 / 驳回 / 标记提交
+        ↓
+通杀分析、疑似信号复盘、情报沉淀
 ```
 
-**② 不会写语法，只想说要找什么** → 搜集方式选 `自然语言意图`，用大白话描述，搜集 Agent 会自动翻译成 FOFA 语法并逐轮演化。例如：
 
-```text
-找全国高校的统一身份认证登录系统
-找某集团的 OA / CRM / ERP / API 网关 / 运维后台资产
-```
+## 已实现能力
 
-> 留空「搜集方式」= **自动判断**：写得像语法就当语法，否则当意图，新手直接用这个即可。
+### 任务与目标
 
-### FOFA 语法速查（常用字段）
+- 支持 `EduSRC` 与 `企业SRC` 两种任务策略。
+- 目标来源支持 `FOFA 自动搜`、`手动清单`、`两者` 和 `单站协作`。
+- 自动搜集引擎包括 FOFA、360 Quake、Hunter、ZoomEye、Shodan 和 Censys；是否可用取决于对应凭据和接口配置。
+- FOFA 查询支持直接语法、自然语言意图和自动判断。
+- 单站协作支持完整深挖与轻量入口盘点；轻量模式保留路由能力，但限制站点地图阶段预算。
+- 可为任务选择漏洞类型、指定挖掘方向、SRC 规则、Worker 并发数和任务专用模型。
+- 目标队列支持人工排序、移除、状态查看；失败或跳过的目标进入硬骨头视图。
+- 任务状态、队列、证据和运行事件持久化；默认在进程重启后恢复运行中的任务。
 
-| 字段 | 含义 | 示例 |
-|------|------|------|
-| `title=` | 网页标题 | `title="后台管理"` |
-| `body=` | 网页正文包含 | `body="管理"` |
-| `domain=` | 域名 | `domain=".edu.cn"` |
-| `host=` | 主机名 | `host="admin.example.com"` |
-| `org=` | 所属机构（归属收窄利器） | `org="China Education and Research Network Center"` |
-| `cert=` / `cert.subject.org=` | 证书信息 | `cert.subject.org="某某大学"` |
-| `port=` / `country=` | 端口 / 国家 | `port="8080" && country="CN"` |
+### Agent 工作流
 
-组合逻辑：`&&`（且）、`||`（或）、`!=`（非）。**语句越精确、归属越收窄，Worker 越不会打到范围外资产。**
+- `Collector`：搜索、探活、预筛、评分、归属标注、聚类与入队。
+- `Worker`：以单个目标为边界，按 `recon → locate → verify → evidence` 分阶段工作。
+- `Reviewer`：校验证据、范围、重复性和危害等级，可采纳、忽略或打回定向深挖。
+- `Killsweep`：围绕已确认线索建立通杀案例，记录事件、验证结果和人工复核状态。
+- `Missed Signals`：保留尚未形成正式 Finding 的高价值信号，支持恢复、深挖和草稿处理。
+- `Intel`：保存经验证、可复用的凭据、端点或目标画像，供后续 Worker 使用。
+- `Report Assistant`：围绕 Finding 整理和编辑报告，并支持把结构化证据交给下一轮深挖。
 
-### 高级选项（可留空，用服务端默认）
+### 模型与搜索凭据
 
-展开「高级」可选择使用**全局 Provider 池**，或按任务固定 `base_url`/`api_key`/模型名/协议/温度；还可覆盖 Worker 提示词版本、FOFA key、FOFA 最大页数和 Worker 并发数。默认使用全局池。
+- 全局 LLM Provider 池支持加权首选和单次请求内故障转移。
+- 支持 `OpenAI Chat Completions`、`Anthropic Messages` 和 `OpenAI Responses` 三种协议适配。
+- Provider 可独立启停、排序、设置权重和健康检测；健康检测会验证基础请求及工具调用协议。
+- FOFA Key 池支持独立启停、排序、检测、限流冷却、日额度冷却、临时故障退避和运行状态持久化。
+- API 与界面中的密钥采用脱敏显示，脱敏占位不会覆盖已保存的真实密钥。
 
-> ⚠️ **务必收窄授权范围**：只搜你有权限测试的资产。`org` / `domain` / `cert` 是最有效的归属过滤手段。
+### 控制台与运维
 
-### Worker 工具使用方法与场景
+- Vue 3 控制台提供任务、指挥台、全局复审、疑似信号、通杀、设置等主要视图。
+- 额外提供硬骨头、情报库、漏洞库和运行日志视图。
+- 支持全权限、只读和观摩三种访问角色；观摩角色会隐藏敏感字段。
+- 内置应用层 WAF、安全响应头、请求体大小限制和可选反向代理信任配置。
+- Docker watchdog 定期检查 `/health`；应用无响应时输出诊断并交由 Docker 重启。
+- 提供数据备份、服务器更新、健康检查和旧镜像回滚脚本。
 
-工具由 Worker 根据当前响应自动选择，通常不需要人工逐个调用。任务的「挖掘方向」可以明确要求优先走某条链路，例如“先提取 OpenAPI，再重点验证对象级权限边界”。
+## 工具链与边界
 
-| 工具 | 使用方法 | 适用场景 |
-|------|----------|----------|
-| `http_request` | 传完整 URL、方法、请求头和请求体，获取真实状态码、响应头、正文和请求包 | 所有 HTTP 基线、候选和取证请求的首选入口 |
-| `extract_http_surface` | 优先直接传页面 `url`，工具会内部获取完整的有界 HTML；已有完整内容时也可传 `body`/`base_url`/响应头 | 登录页、后台页、服务端渲染页面；提取表单、上传字段、脚本和 API/管理路径 |
-| `analyze_javascript` | 传入口 URL 或已经取得的 JS 文本 | Vue/React/SPA、前端路由、隐藏 API、签名参数、硬编码配置和密钥线索 |
-| `analyze_api_schema` | 优先直接传文档 `url`，工具会内部获取完整的有界文档；已有完整 JSON 时可传 `document`，可附 `base_url` 和关注关键词 | Swagger/OpenAPI 暴露；按鉴权、对象参数、读写方法和业务敏感度排序接口 |
-| `analyze_auth_material` | 传已取得的请求头、响应头或正文 | 识别 Authorization、Cookie、JWT、API Key 头、CSRF 字段和会话属性；完整令牌只保留指纹 |
-| `session_set` | 登记已经取得的 Cookie 或 Authorization 等请求头 | 登录成功、拿到 Token 或切换测试身份后，后续 `http_request` 自动保持会话 |
-| `compare_http_responses` | 传入基线响应和候选响应，可指定忽略的动态 JSON 路径 | IDOR/BOLA、未授权、身份切换、修改前后状态；量化状态码、关键头和 JSON 路径差异 |
-| `decode_transform` | 传 token/编码串并选择 `auto/base64/hex/url/jwt/hash` | JWT 结构、Base64/Hex 参数、URL 编码和哈希类型识别 |
-| `suggest_waf_bypass` | 传被拦截的最小 payload、状态码、响应头和正文 | 明确验证请求遇到 403/406/429 或拦截页；输出少量候选变形后必须重新实测 |
-| `fofa_lookup` | 传精确 FOFA 语法和小样本数量 | 确认裸 IP 归属、同 IP/同域服务和隐藏端口，不替代漏洞验证 |
-| `run_shell` | 传具体命令和超时；优先用于 curl 或短脚本构造单请求 | 已知入口的最小复现、格式转换和本地辅助；企业 SRC 严禁借此调用 Nuclei 类自动化漏洞扫描器 |
-| `check_duplicate_finding` | 传漏洞类型、标题和 URL | 提交前查询统一查重库，避免重复报告 |
-| `report_intel` | 上报已验证的端点、凭证状态或技术画像 | 把可复用情报提供给后续同系统 Worker；失败和猜测不沉淀 |
-| `report_coverage` | 上报已验证端点、剩余入口和覆盖缺口 | 单站多路线协作，避免后续 Worker 重复测试同一批接口 |
-| `submit_finding` | 填完整 Finding、自检、原始请求响应和利用链 | 已形成真实影响并满足证据门槛时提交原始发现 |
-| `finish` | 填 `found/no_vuln`、总结和可选 `deepen_lead` | 当前 Worker 收尾；线索真实但差一步时明确下一轮接口、参数和动作 |
+Docker 镜像内包含以下主要工具：
 
-#### SRC CLI 工具
+| 类别 | 工具或能力 | 用途 |
+| --- | --- | --- |
+| HTTP 与指纹 | HTTPX、WhatWeb、curl | 存活、标题、技术栈和基线请求 |
+| 端点与参数 | Katana、FFUF、Arjun | 当前目标内的有界端点、目录和参数发现 |
+| 防护与端口 | wafw00f、Nmap | WAF 指纹和少量明确 Web 端口验证 |
+| 定向验证 | Nuclei、Dalfox、SQLMap | 已有明确入口、参数或模板时的辅助验证 |
+| 本地分析 | JS、OpenAPI、认证材料、编码和响应差异分析 | 从已有响应中提取线索与证据 |
 
-以下工具均由 Worker 以结构化参数调用，命令使用独立参数数组执行，不经过 shell 拼接。示例只展示最小参数；请求头、Cookie 等敏感值会在展示命令中脱敏。
+扫描器命中只作为候选线索，不能替代真实请求、响应和影响证据。企业 SRC 模式会限制自动化漏洞扫描器；Nuclei 和 Dalfox 不会作为企业模式的可用结构化工具，命令执行同样受企业策略检查。
 
-| 工具 | 最小用法 | 适用场景 | 执行边界与结果处理 |
-|------|----------|----------|------------------|
-| `probe_http`（HTTPX） | `{"url":"https://host/","rate_limit":20}` | 初次进入目标时确认状态码、标题、技术栈、Server、IP 和 CNAME，建立 HTTP 基线 | 仅当前目标主机；速率最高 50 req/s、单请求超时最高 30 秒。指纹不是漏洞，后续用 `http_request` 取证 |
-| `crawl_endpoints`（Katana） | `{"url":"https://host/","depth":2,"js_crawl":true}` | SPA、登录后页面、JS 较多的站点；补全页面、表单、脚本和带参端点 | 仅当前 FQDN；深度最高 3、并发最高 10，并限制爬取时长、页面数和响应大小。优先复核认证、上传、导出和管理端点 |
-| `discover_content`（FFUF） | `{"url":"https://host/FUZZ","wordlist":"api"}` | 已确认存在 Web 服务，但页面或 JS 未暴露完整的 API、后台、文档、上传等高价值路径 | URL 必须包含 `FUZZ`；只能选仓库内置 `common/api` 小字典；线程最高 20、速率最高 50 req/s。命中后须排除软 404 和统一跳转 |
-| `discover_parameters`（Arjun） | `{"url":"https://host/api/item","method":"GET"}` | 已知业务端点疑似存在隐藏的对象、租户、分页、导出或鉴权参数 | 仅使用内置小参数字典；方法限 `GET/POST/JSON/XML`，线程最高 5、速率最高 20 req/s。发现参数后先用无害值做基线与候选对比 |
-| `scan_nuclei`（Nuclei） | `{"url":"https://host/","template_id":["TEMPLATE_ID"]}` | **仅非企业模式**，且已经形成组件、配置或 CVE 假设时，用具体模板、tag 或 template ID 做定向验证 | 至少提供一种 selector；并发最高 10、速率最高 50 req/s。企业 SRC 不提供该工具，`run_shell` 也不得调用；命中仅算候选，必须回到最小请求复核 |
-| `verify_xss`（Dalfox） | `{"url":"https://host/search?q=test","params":["q"]}` | **仅非企业模式**，已通过基线请求确认具体参数可控或反射时，做定向 XSS 验证 | 必须给出已知参数，最多 5 个；跳过参数挖掘，worker 最高 5、速率最高 20 req/s。输出需结合实际上下文和 SRC 收取规则复核 |
-| `fingerprint_waf`（wafw00f） | `{"url":"https://host/"}` | 出现 403、406、429、挑战页或响应差异时，识别 WAF、CDN 或安全网关 | 只做当前 URL 的防护指纹，不代表已绕过，也不自动生成漏洞结论；后续请求保持低频并保存基线 |
-| `scan_web_ports`（Nmap） | `{"host":"host","ports":[443,8443]}` | 当前目标存在明确的 Web、API 或管理端口线索时，确认少量端口和服务版本 | 仅当前单主机，最多 20 个明确端口；固定 TCP connect、轻量版本识别和主机超时，不做全端口或网段扫描 |
-
-##### 分阶段工作流与事件
-
-Worker 按 `recon → locate → verify → evidence` 推进，而不是把所有工具一次性暴露给模型：
-
-- `recon`：建立 HTTP、技术栈和防护基线，只做当前目标的有界侦察。
-- `locate`：根据站点路线调用端点、目录、参数、JS 或 API 文档工具，形成按优先级排序的候选。
-- `verify`：隐藏宽泛发现工具，使用 `http_request`、会话和响应对比逐条结算高价值候选。
-- `evidence`：提交 Finding 时的短暂取证阶段；提交后仍有待验证线索就回到 `verify`，否则回到 `locate`。
-
-SRC CLI 输出是**候选地图而不是漏洞**。CLI 命中会先规范化为带来源、优先级和验证动作的 Lead，再交给 HTTP 单请求复核；403 只能证明入口存在，超时或网络错误会进入有限重试，只有同一次真实请求/响应能证明可控性和实际影响时才可提交 Finding。CLI 和 HTTP 遇到跳转时只允许同主机重定向，跨主机 `Location` 仅记录而不跟随。
-
-实时看板会收到两个有界事件：`tool_src_cli_started` 表示工具、轮次和当前阶段已经确定；`tool_src_cli_result` 表示进程与解析状态、候选数量和脱敏后的最高优先级线索已经返回。完整 stdout、Header、Cookie、query 值和 capture 路径只进入私有证据存储，不进入公开事件。Worker 收尾时只持久化各状态计数、脱敏交接线索和最多 3 个样本。
+SRC CLI 输出是**候选地图而不是漏洞**。CLI 结果会先转换为带来源、优先级和验证动作的候选，再通过 HTTP 单请求验证。实时看板用 `tool_src_cli_started` 记录工具、轮次和阶段，用 `tool_src_cli_result` 记录执行状态、解析状态和脱敏后的候选摘要；完整输出只进入私有证据存储。工具和 HTTP 请求只跟随**同主机重定向**，跨主机地址仅记录，不自动跟随。
 
 | 场景 | 首选链路 | 结束条件 |
 | --- | --- | --- |
-| SPA/API | `probe_http → crawl_endpoints → analyze_javascript → http_request` | 高价值端点已逐条复核并结算 |
-| 后台/目录 | `probe_http → discover_content → http_request` | 命中已排除软 404 和统一跳转 |
-| 隐藏参数 | `discover_parameters → http_request 基线/候选 → compare_http_responses` | 参数差异已结算，证据或阴性结果明确 |
-| API 文档 | `http_request → analyze_api_schema → http_request` | 高风险读写接口的鉴权与对象边界已复核 |
-| 登录/越权 | `http_request → analyze_auth_material → session_set → compare_http_responses` | 不同身份或对象的真实响应差异已结算 |
-| 企业 SRC | `crawl_endpoints → discover_parameters → http_request` | 只使用有界侦察、单请求和本地解析器完成取证 |
+| SPA/API | `probe_http → crawl_endpoints → analyze_javascript → http_request` | 高价值端点已经逐条验证并结算 |
+| 后台或目录 | `probe_http → discover_content → http_request` | 已排除软 404 和统一跳转 |
+| 隐藏参数 | `discover_parameters → http_request → compare_http_responses` | 基线与候选差异已经验证 |
+| API 文档 | `http_request → analyze_api_schema → http_request` | 高风险接口的鉴权和对象边界已经验证 |
+| 登录与越权 | `http_request → analyze_auth_material → session_set → compare_http_responses` | 不同身份或对象的响应差异已经验证 |
+| 企业 SRC | `crawl_endpoints → discover_parameters → http_request` | 通过有界侦察、单请求和本地分析完成取证 |
 
-#### 企业与非企业模式矩阵
+企业 SRC **严禁使用** Nuclei、Dalfox 等自动化漏洞扫描器。项目策略同时禁止破坏性写入、删除、密码重置、批量导出、全端口宽扫、压力测试等操作。即使工具存在于镜像中，也不代表所有任务模式都允许调用。
 
-“有界侦察工具”用于梳理当前目标的资产、端点和参数；“自动化漏洞扫描器”会批量生成漏洞探测请求。企业 SRC 只开放前者和单请求取证，二者不可混用。
+## 快速部署
 
-任务启动后会锁定 SRC 模式；如需在 EduSRC 与企业 SRC 之间切换，先暂停任务再修改，避免运行中的 Worker 使用不同策略。
+### 环境要求
 
-| 能力 | 非企业模式（EduSRC 等） | 企业 SRC | 共同要求 |
-|------|-------------------------|----------|----------|
-| HTTP/防护指纹：`probe_http`、`fingerprint_waf` | 可用 | 可用 | 仅当前主机、低频执行，结果只用于选择后续入口 |
-| 端点与参数发现：`crawl_endpoints`、`discover_content`、`discover_parameters` | 可用 | 可用，但必须遵守任务资产边界和内置小字典/并发上限 | 命中后以 `http_request` 做单请求复核，不把发现结果直接当漏洞 |
-| 少量 Web 端口确认：`scan_web_ports` | 可用 | 可用 | 最多 20 个明确端口，不做全端口、网段或姊妹域扫描 |
-| 自动化漏洞扫描：`scan_nuclei`、`verify_xss`，以及 Nuclei、SQLMap、Dalfox、Nikto、Xray 等同类命令 | 仅在任务规则允许且已有明确入口、参数或 selector 时定向使用 | **严禁使用；对应结构化工具不会开放，`run_shell` 也不可作为绕过入口** | 扫描结果均不是漏洞证据，非企业模式命中后仍须最小请求复核 |
-| 真实验证与取证：`http_request`、curl 单请求、证据分析工具 | 首选 | 首选 | 保存同一次真实请求/响应，证明可控性和实际影响 |
+- Docker Engine 或 Docker Desktop
+- Docker Compose v2
+- 建议至少 `2 核 CPU / 4 GB 内存 / 20 GB 磁盘`
+- 可访问所配置的 LLM API、搜索引擎 API 和授权测试目标
 
-典型调用链：
+Linux 服务器是推荐运行环境。Windows 建议使用 Docker Desktop + WSL2，macOS 可使用 Docker Desktop。
 
-1. HTTP 基线：`probe_http → fingerprint_waf（出现防护信号时）→ http_request`。
-2. SPA/前端入口：`crawl_endpoints → analyze_javascript → http_request`，服务端 HTML 可走 `extract_http_surface`。
-3. 高价值路径：`discover_content（URL 带 FUZZ）→ http_request 排除软 404/统一跳转 → extract_http_surface 或 analyze_api_schema`。
-4. 隐藏参数：`discover_parameters（已知端点）→ 两次 http_request → compare_http_responses`。
-5. Web 端口线索：`scan_web_ports（不超过 20 个明确端口）→ probe_http → http_request`。
-6. API 文档：`http_request → analyze_api_schema → http_request → compare_http_responses`。
-7. 登录与越权：`http_request → analyze_auth_material → session_set → 两次 http_request → compare_http_responses`。
-8. 非企业定向验证：`scan_nuclei 或 verify_xss → http_request/curl 最小复现 → 保存原始证据`；企业 SRC 跳过此链，直接从已知入口构造单请求。
-9. 提交结果：实证完成后 `check_duplicate_finding → submit_finding → finish`。
-
-`analyze_api_schema` 和 `extract_http_surface` 的 `url` 模式适合超过 LLM 预览长度的文档或页面：它们在工具层按 `WORKER_HTTP_MAX_BYTES` 取回内容，保留原始证据 capture，再只把有界结构化摘要送回 LLM。
-
-### 按等级深挖
-
-Reviewer 打回和 accepted 后的扩大危害使用同一份等级策略。Worker 的硬轮数仍受 `WORKER_MAX_ROUNDS` 和 `*_BUDGET_CAP` 控制，等级策略只决定回炉次数、队列优先级和软收敛位置。
-
-报告驱动的“继续深挖”会把证据按可信来源交接给下一轮 Worker：原始请求、响应和 evidence 标记为观察事实；漏洞描述、PoC、步骤与攻击链标记为上一轮声明；AI/人工审核标记为评估意见。报告助手只继承最近三条用户问题，不继承助手回答，避免旧模型结论被新模型当成事实。人工编辑后的报告字段优先于 Finding 原值，所有字段均有长度与裁剪标识，总字符预算由 `DEEPEN_CONTEXT_MAX_CHARS` 控制（默认 `18000`，范围 `4000-40000`）。
-
-| 原等级 | Reviewer 回炉上限 | Worker 软收敛位置 | accepted 后扩大危害预算 | 主要目标 |
-|--------|:----------------:|:-----------------:|:-----------------------:|----------|
-| 低危 | 1 次 | 硬上限的 60% | 6 轮 | 串联鉴权、对象接口或业务状态，证明能否升级到中危影响 |
-| 中危 | 2 次 | 硬上限的 72% | 10 轮 | 从单对象/局部影响推进到批量、敏感写、认证突破或高权限 |
-| 高危 | 3 次 | 硬上限的 85% | 14 轮 | 推进管理员能力、任意用户接管、核心数据、关键写操作或执行链 |
-| 严重 | 3 次 | 硬上限的 95% | 16 轮 | 复核稳定性和权限边界，量化横向、租户或供应链级影响 |
-
-`ESCALATE_MAX_ROUNDS=0` 使用上表预算；设置为正数会统一覆盖所有等级。每个 accepted Finding 会在审核事务内创建唯一的持久化扩大危害 attempt；暂停、取消或进程重启后，未完成的 attempt 会重新排队。`ESCALATE_TASK_MAX_ATTEMPTS=100` 限制单任务尝试数，`ESCALATE_TASK_ROUND_BUDGET=1000` 限制单任务计划轮数总和；两者设为 `0` 表示不限制。预算用尽的 attempt 会以 `skipped` 留痕，删除任务时一并清理。
-
-扩大危害结果仍需通过等级提升、顶格危害或影响面数量级门槛，未形成新实证时只记录事件，不生成重复 Finding。
-
----
-
-## 必填 / 推荐配置
-
-| 变量 | 必填 | 说明 | 获取方式 |
-|------|:---:|------|---------|
-| `LLM_API_KEY` | ✅ **必填** | 大模型 API Key，平台核心 | [DeepSeek](https://platform.deepseek.com/) / OpenAI / 通义 / Kimi 等 |
-| `LLM_BASE_URL` | 默认 DeepSeek | OpenAI 兼容接口地址（需含 `/v1`） | 默认 `https://api.deepseek.com/v1` |
-| `LLM_MODEL` | 默认 deepseek-chat | 模型名 | 按模型商填 |
-| `LLM_PROTOCOL` | 默认 openai_chat | legacy 回退协议：`openai_chat` / `anthropic_messages` / `openai_responses` | 按模型商接口填 |
-| `FOFA_KEY` | ⭐ 推荐 | 单 Key 兼容回退，用于自动搜集目标 | [FOFA 个人中心](https://fofa.info/) |
-| `FOFA_BASE_URL` | 可选，默认官方地址 | 单 Key 兼容回退的 FOFA API 端点 | 默认 `https://fofa.info` |
-| `AUTOHUNTER_API_TOKEN` | ⭐ 强烈建议 | 控制台全权限访问令牌，**不设则任何人可访问** | `install.sh` 自动生成，或自填随机串 |
-| `AUTOHUNTER_HOST_PORT` | 默认 18800 | 对外访问端口 | 按需 |
-
-> 其余全部参数（Worker 预算、并发、超时、WAF 等）都有合理默认值，见 `.env.example` 内注释，按需微调即可。
-> 也支持**不填 `.env`、直接在控制台「设置」页配置 LLM Provider/FOFA Key**。两个池都会持久化到数据库；数据库 FOFA Key 池非空后，`FOFA_KEY` / `FOFA_BASE_URL` 只作为历史兼容回退。
-
-### 多 LLM Provider 池
-
-控制台「设置」支持同时维护多个 Provider，每项可选择以下协议：
-
-- `OpenAI Chat Completions`（`openai_chat`）
-- `Anthropic Messages`（`anthropic_messages`）
-- `OpenAI Responses`（`openai_responses`）
-
-每次 LLM 调用先按已启用 Provider 的权重选择首个节点；若调用失败，会从该节点开始按配置顺序环形切换，每个 Provider 最多尝试一次。超时、网络错误、限流和上游 5xx 只跳过当前调用；鉴权失败或额度不足会自动禁用对应 Provider，并持久化到设置中，修复 Key 后可在设置页重新启用。
-
-配置解析优先级为：
-
-1. 任务选择「专用模型」时固定使用任务配置。
-2. 否则使用数据库中的全局 Provider 池。
-3. 数据库池为空时，兼容回退到旧的数据库单模型设置和 `LLM_*` 环境变量。
-
-数据库池只要非空，即使其中所有 Provider 都被禁用，也不会偷偷回退到旧环境变量。此时应在设置页修复并重新启用 Provider，或删除全部 Provider 后恢复 legacy 回退。API 和界面只返回脱敏 Key；编辑时留空或保留脱敏占位不会覆盖已保存的真实 Key。
-
-### 多 FOFA Key 池
-
-控制台「设置 → FOFA Key 池」支持同时维护多个 Key。每一项都有独立的名称、启停状态和 FOFA URL，支持官方地址、第三方根地址以及完整接口地址（例如 `http://fofapi.services/api.php`）。根地址会自动解析为标准接口；填写 `/api.php` 或其他完整路径时按原地址调用，必要时才回退同源标准路径。
-
-列表中的「当前使用」表示运行时首选 Key；排序决定正常调用时的轮换顺序。单项「检测」和侧栏「一键检测」会展示检测延迟、分类、实际解析 URL、端点模式和 HTTP 状态码。`auth_invalid`、`rate_limited`、`daily_cooldown`、`daily_suspended` 会分别显示为 Key 无效、限流冷却、额度冷却和今日暂停；临时网络故障、5xx 或路径错误不会把 Key 误判为失效，冷却结束后 Router 会自动恢复。旧 `.env` 或旧数据库单 Key 会以只读的「兼容回退」项显示，新增数据库 Key 后即可迁移到池管理。
-
-FOFA 配置优先级为：`任务级 fofa_config.key` > `非空全局 fofa_keys 池` > `旧 fofa.key` > `engines.fofa.key` > `FOFA_KEY`。Collector、Worker 工具调用和 Killsweep 共用同一组 Key + URL 轮换状态；池中某项临时故障时按规则冷却或切换，健康检测恢复后继续使用。
-
----
-
-## 常用运维命令
+### 一键安装
 
 ```bash
-docker compose logs -f autohunter     # 实时日志
-docker compose restart autohunter     # 重启
-docker compose down                    # 停止（数据保留在 volume）
-docker compose up -d --build           # 更新代码后重建
+git clone https://github.com/ZBHD/AutoHunter.git autohunter
+cd autohunter
+bash scripts/install.sh
 ```
 
-数据持久化在 Docker volume：`ah_data`（SQLite 数据库 + 漏洞证据）、`ah_work`（Worker 临时工作区）。**升级/重启不丢数据。**
+安装脚本会检查 Docker，交互式采集 LLM 和 FOFA 配置，生成 `.env`，构建镜像并启动服务。首次构建需要下载前后端依赖及安全工具，耗时取决于网络环境。
 
-### 服务器无损更新（推荐）
+启动后访问：
 
-服务器部署后使用仓库内的更新脚本，避免直接删除卷或在构建失败时中断旧版本：
+```text
+http://<服务器地址>:18800/
+```
+
+### 手动安装
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少配置一个可用的 LLM Provider，并设置访问令牌
+docker compose up -d --build
+docker compose logs -f autohunter
+```
+
+检查服务：
+
+```bash
+curl http://127.0.0.1:18800/health
+# 正常返回：{"ok":true}
+```
+
+> 公网或可达网络部署时，务必设置 `AUTOHUNTER_API_TOKEN`。未配置任何访问令牌时，受保护的 `/api` 接口不会启用身份认证。
+
+## 首次配置
+
+### 最小配置
+
+`.env.example` 是应用环境变量的主要参考；Compose 还支持少量部署变量。首次部署重点检查：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 兼容回退 Provider 的 API 基址 |
+| `LLM_API_KEY` | 空 | 兼容回退 Provider 的 API Key |
+| `LLM_MODEL` | `deepseek-chat` | 兼容回退模型名 |
+| `LLM_PROTOCOL` | `openai_chat` | 模型协议适配器 |
+| `FOFA_KEY` | 空 | FOFA 单 Key 兼容回退配置 |
+| `AUTOHUNTER_API_TOKEN` | 空 | 全权限令牌，生产部署必须设置 |
+| `AUTOHUNTER_READ_TOKEN` | 空 | 只读令牌，可查看复审等敏感页面但不能写入 |
+| `AUTOHUNTER_OBSERVER_TOKEN` | 空 | 观摩令牌，只返回脱敏信息 |
+| `AUTOHUNTER_HOST_PORT` | `18800` | Compose 使用的宿主机端口（可自行加入 `.env`） |
+| `AUTOHUNTER_RESTORE_ON_STARTUP` | `1` | 重启后恢复运行中任务 |
+
+可在控制台“设置”页维护 LLM Provider 池、FOFA Key 池、其他搜索引擎凭据、默认并发和 Worker 提示词版本。数据库配置会持久化在 `ah_data` 卷中。
+
+### 配置优先级
+
+LLM 实际配置按以下顺序解析：
+
+1. 任务选择专用模型时，使用任务配置；
+2. 否则使用数据库中的全局 Provider 池；
+3. 全局池为空时，回退到旧单模型设置和 `LLM_*` 环境变量。
+
+FOFA 凭据按以下顺序解析：
+
+1. 任务级 FOFA Key；
+2. 非空的全局 FOFA Key 池；
+3. 旧数据库 FOFA 配置；
+4. 搜索引擎中的 FOFA 配置；
+5. `FOFA_KEY` 环境变量。
+
+全局池已经存在但全部被停用时，系统不会静默回退到旧环境变量。应在设置页修复、启用或删除池内配置。
+
+### 任务配置建议
+
+1. 先选择与授权范围一致的任务模式和目标来源。
+2. 自动搜集时明确选择引擎并配置对应 Key；FOFA 可选直接语法或自然语言意图。
+3. 手动清单每行填写一个 URL；单站协作建议只填写同一授权站点的入口。
+4. 用“指定挖掘方向”描述本任务重点，不要把授权范围仅写在自然语言提示中。
+5. 小内存机器从 `1-2` 个 Worker 并发开始；默认任务并发为 `3`。
+6. 创建后先检查队列、搜集事件和 Provider 健康状态，再提高并发或扩大页数。
+
+## 数据、备份与更新
+
+Docker Compose 使用两个命名卷：
+
+- `ah_data`：SQLite 数据库和持久化证据；
+- `ah_work`：Worker 工作目录。
+
+常用命令：
+
+```bash
+docker compose ps
+docker compose logs -f autohunter
+docker compose restart autohunter
+docker compose down
+docker compose up -d --build
+```
+
+`docker compose down` 默认保留命名卷；**不要执行 `docker compose down -v`**，否则会删除数据库和证据。
+
+手动备份：
+
+```bash
+bash scripts/backup-data.sh
+```
+
+脚本会备份并校验 `ah_data`，同时备份 `.env`，默认保留最近 10 份，文件写入 `backups/`。
+
+服务器更新：
 
 ```bash
 bash scripts/update-server.sh
 ```
 
-脚本会先拉取 `main` 并构建新镜像，构建成功后才优雅停止旧容器，备份 `ah_data`，再启动新版本并检查 `/health`。更新失败会尝试恢复旧镜像；备份保存在 `backups/`，默认保留最近 10 份。不要执行 `docker compose down -v`，否则会删除任务、漏洞和 Provider 数据。
+更新脚本要求工作区没有未提交改动。它会快进拉取 `main`、验证 Compose 配置、构建新镜像、停止旧容器、备份数据、启动并检查 `/health`；新版本未通过健康检查时会尝试回滚旧镜像。脚本也支持通过 `SOURCE_BUNDLE` 使用离线 Git bundle 更新。
 
-如果服务器不能直接访问 GitHub，可在有仓库凭据的部署机生成 bundle 后上传，再执行同一脚本：
+## 本地开发与测试
 
-```bash
-git bundle create /tmp/autohunter.bundle main
-scp /tmp/autohunter.bundle root@server:/opt/autohunter.bundle
-ssh root@server 'cd /opt/autohunter && SOURCE_BUNDLE=/opt/autohunter.bundle bash scripts/update-server.sh'
+完整运行环境建议继续使用 Docker。本地开发可分别启动后端和前端；本机未安装 Dockerfile 中的外部工具时，与 CLI 工具有关的 Worker 能力不会完整可用。
+
+```powershell
+# Python 3.12 环境
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+
+# 后端开发服务
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
----
+另开终端：
 
-## 服务器长期运行 / 开机自启
-
-`docker compose up -d` 启动的容器默认已配置 `restart: unless-stopped`——**容器崩溃或服务器重启后会自动拉起**，一般无需额外操作。
-
-若想让整套服务随系统开机、并托管给 systemd 管理，可加一个 unit：
-
-```bash
-sudo tee /etc/systemd/system/autohunter.service >/dev/null <<EOF
-[Unit]
-Description=AutoHunter
-Requires=docker.service
-After=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=$(pwd)          # 指向 autohunter 目录
-ExecStart=/usr/bin/docker compose up -d --build
-ExecStop=/usr/bin/docker compose down
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now autohunter
-sudo systemctl status autohunter
+```powershell
+cd frontend
+npm install
+npm run dev
 ```
 
-**（可选）反向代理 + HTTPS**：生产环境建议前面挂一层 Nginx/Caddy，做域名 + TLS，再把 `AUTOHUNTER_HOST_PORT` 只绑到 `127.0.0.1` 不对公网直接暴露。Caddy 示例（自动签发证书）：
+Vite 开发服务器会把 `/api` 代理到 `http://localhost:8000`。
 
-```caddyfile
-hunt.example.com {
-    reverse_proxy 127.0.0.1:18800
-}
+运行测试：
+
+```powershell
+python -m pytest
+cd frontend
+npm test
+npm run build
 ```
 
----
+## 安全与使用限制
 
-## 注意事项 / 避坑
-
-- **授权边界**：只测你有权限的目标。FOFA 语法要收窄归属（域名 / 证书 / org），别让 Worker 打到范围外资产。
-- **访问控制**：公网部署**务必设 `AUTOHUNTER_API_TOKEN`**，否则控制台和挖洞能力对全网裸奔。内置应用层 WAF 默认开启，但令牌是第一道门。
-- **成本控制**：Worker 靠 LLM 驱动，目标越多 token 消耗越大。可用 `.env` 里的 `WORKER_MAX_ROUNDS` / `*_BUDGET_CAP` 收紧预算，或降低任务并发。
-- **资源**：每个并发 Worker 会跑真实工具子进程。小内存机器请调小 `AUTOHUNTER_AGENT_THREAD_POOL_SIZE` 和任务并发数。
-- **网络**：服务器需能访问 LLM API 和目标网络。若走代理，给 Docker/容器配好出网。
-- **重启恢复**：`AUTOHUNTER_RESTORE_ON_STARTUP=1` 时重启会自动续跑之前 running 的任务；受限机器可设 `0`，只起 Web/API。
-
----
+- 本项目仅供已经取得明确授权的安全测试、漏洞研究和教学使用。
+- 搜索语法、手动目标、重定向和任务范围都应由使用者复核；自动化系统不能替代授权边界管理。
+- 公网部署必须配置强随机全权限令牌，并建议通过 HTTPS 反向代理访问。
+- 内置 WAF 不是网络隔离或身份认证的替代品。
+- LLM 会产生费用，也可能输出错误判断；漏洞结论必须经过人工复核。
+- 目标数、FOFA 页数、Worker 轮数和并发都会影响 API 成本、内存和子进程数量。
+- 数据库存放目标、证据、报告和密钥配置；备份文件和 Docker 卷应按敏感数据保护。
+- 原作者及维护者不对未授权使用、误报、漏报、数据损失或其他使用后果承担责任；完整免责声明见 [LICENSE](./LICENSE)。
 
 ## 技术栈
 
-- 后端：Python 3.12 · FastAPI · SQLAlchemy(SQLite) · asyncio
-- 前端：Vue 3 · Vite
-- 模型：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses，以及兼容这些协议的网关
-- 有界侦察与指纹：HTTPX · Katana · FFUF · Arjun · wafw00f · Nmap · WhatWeb
-- 真实验证与辅助：`http_request` · curl/wget/jq · JS/OpenAPI/认证材料/响应差异分析
-- 非企业模式定向验证：Nuclei · Dalfox · SQLMap（企业 SRC 严禁调用 Nuclei 类自动化漏洞扫描器，`run_shell` 同样执行该限制）
+- 后端：Python 3.12、FastAPI、SQLAlchemy 2、SQLite、asyncio
+- 前端：Vue 3、Vue Router、Vite 5
+- 模型接入：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses
+- 部署：Docker 多阶段构建、Docker Compose、Uvicorn、watchdog
+- 测试：pytest、pytest-asyncio、Node.js test runner
 
----
+## 许可证
 
-## 许可协议
+本项目采用 **Creative Commons Attribution-NonCommercial 4.0 International（CC BY-NC 4.0）** 协议。协议摘要与免责声明见 [LICENSE](./LICENSE)，完整法律文本见：
 
-本项目采用 **[CC BY-NC 4.0](./LICENSE)**（署名-非商业性使用）：
+- <https://creativecommons.org/licenses/by-nc/4.0/legalcode>
+- <https://creativecommons.org/licenses/by-nc/4.0/deed.zh>
 
-- ✅ 可自由使用、修改、二次分发
-- ✅ **必须保留原作者署名**：`Powered By StanleyNull`
-- ❌ **禁止任何商业用途**
+本 README 是对当前修改版本的说明，不改变 LICENSE 中属于原作者的版权声明和许可条件。
 
 ---
 
@@ -462,6 +318,6 @@ hunt.example.com {
 
 **Powered By StanleyNull**
 
-*仅供授权安全测试与研究 · 请遵守当地法律法规*
+Copyright (c) 2026 StanleyNull · CC BY-NC 4.0
 
 </div>
