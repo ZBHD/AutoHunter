@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import delete, func, inspect, select
+from sqlalchemy import delete, event, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -23,12 +23,21 @@ from app.db.session import _auto_migrate, _ensure_secondary_indexes, _ensure_uni
 
 
 def _engine(tmp_path, name: str):
-    return create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
+    return engine
 
 
 async def _initialize(engine) -> async_sessionmaker[AsyncSession]:
     async with engine.begin() as connection:
-        await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         await connection.run_sync(Base.metadata.create_all)
         await _auto_migrate(connection)
         await _ensure_unique_indexes(connection)
@@ -251,6 +260,57 @@ def test_gateway_unique_indexes_do_not_fall_back_to_non_unique_indexes() -> None
 
 
 @pytest.mark.parametrize(
+    ("table", "index", "columns"),
+    [
+        ("gateway_assets", "ux_gateway_asset_task_origin", ("task_id", "origin_key")),
+        (
+            "gateway_secrets",
+            "ux_gateway_secret_asset_hash",
+            ("gateway_asset_id", "secret_sha256"),
+        ),
+        (
+            "gateway_observations",
+            "ux_gateway_observation_probe",
+            ("gateway_asset_id", "scan_epoch", "probe_id", "auth_variant"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("bad_shape", ["non_unique", "wrong_columns"])
+def test_gateway_named_unique_index_must_have_expected_shape(
+    table: str,
+    index: str,
+    columns: tuple[str, ...],
+    bad_shape: str,
+) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(
+                    f"CREATE TABLE {table} (id VARCHAR(32) PRIMARY KEY, "
+                    + ", ".join(f"{column} VARCHAR(500) NOT NULL" for column in columns)
+                    + ")"
+                )
+                index_columns = ", ".join(columns)
+                if bad_shape == "non_unique":
+                    await connection.exec_driver_sql(
+                        f"CREATE INDEX {index} ON {table}({index_columns})"
+                    )
+                else:
+                    wrong_columns = ", ".join(reversed(columns))
+                    await connection.exec_driver_sql(
+                        f"CREATE UNIQUE INDEX {index} ON {table}({wrong_columns})"
+                    )
+
+                with pytest.raises(RuntimeError, match=index):
+                    await _ensure_unique_indexes(connection)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
     ("duplicate_kind", "expected_index"),
     [
         ("origin", "ux_gateway_asset_task_origin"),
@@ -296,6 +356,39 @@ def test_gateway_uniqueness_constraints(tmp_path, duplicate_kind: str, expected_
                 with pytest.raises(IntegrityError) as exc_info:
                     await session.commit()
                 assert expected_index in str(exc_info.value) or "UNIQUE constraint failed" in str(exc_info.value)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("row_kind", ["asset", "secret", "observation"])
+def test_gateway_rows_cannot_cross_task_boundaries(tmp_path, row_kind: str) -> None:
+    async def scenario() -> None:
+        engine = _engine(tmp_path, f"cross-task-{row_kind}.db")
+        try:
+            sessions = await _initialize(engine)
+            async with sessions() as session:
+                task, target = _task_target()
+                session.add_all([task, Task(id="task-2", name="Other"), target])
+                await session.flush()
+
+                if row_kind == "asset":
+                    session.add(_asset(task_id="task-2"))
+                else:
+                    session.add(_asset())
+                    await session.flush()
+                    if row_kind == "secret":
+                        secret = _secret()
+                        secret.task_id = "task-2"
+                        session.add(secret)
+                    else:
+                        observation = _observation()
+                        observation.task_id = "task-2"
+                        session.add(observation)
+
+                with pytest.raises(IntegrityError):
+                    await session.commit()
         finally:
             await engine.dispose()
 
@@ -384,6 +477,39 @@ def test_deleting_task_cascades_gateway_extension_rows(tmp_path) -> None:
                 assert task is not None
                 await session.delete(task)
                 await session.commit()
+
+            async with sessions() as session:
+                for model in (GatewayAsset, GatewaySecret, GatewayObservation):
+                    assert await session.scalar(select(func.count()).select_from(model)) == 0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_deleting_target_cascades_gateway_rows_on_a_second_connection(tmp_path) -> None:
+    async def scenario() -> None:
+        engine = _engine(tmp_path, "target-cascade.db")
+        try:
+            sessions = await _initialize(engine)
+            async with sessions() as session:
+                task, target = _task_target()
+                asset = _asset()
+                secret = _secret()
+                observation = _observation(secret_id=secret.id)
+                session.add_all([task, target, asset, secret, observation])
+                await session.commit()
+
+            # Hold one pooled connection so deletion necessarily uses another
+            # physical connection and its own connect-event PRAGMA setup.
+            async with engine.connect() as held_connection:
+                held_pragma = await held_connection.exec_driver_sql("PRAGMA foreign_keys")
+                assert held_pragma.scalar_one() == 1
+                async with sessions() as session:
+                    pragma = await session.execute(text("PRAGMA foreign_keys"))
+                    assert pragma.scalar_one() == 1
+                    await session.execute(delete(Target).where(Target.id == "target-1"))
+                    await session.commit()
 
             async with sessions() as session:
                 for model in (GatewayAsset, GatewaySecret, GatewayObservation):

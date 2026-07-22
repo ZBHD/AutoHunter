@@ -95,6 +95,12 @@ _MIGRATIONS = [
 # 唯一索引：目标库(host)/漏洞库(dedup_key)的 DB 级查重兜底。
 # 名字与 models.__table_args__ 保持一致；老库表已存在不会被 create_all 补，靠这里建。
 _UNIQUE_INDEXES = [
+    ("ux_targets_id_task_id",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_targets_id_task_id "
+     "ON targets(id, task_id)"),
+    ("ux_gateway_assets_id_task_id",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_assets_id_task_id "
+     "ON gateway_assets(id, task_id)"),
     ("ux_gateway_asset_task_origin",
      "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_asset_task_origin "
      "ON gateway_assets(task_id, origin_key)"),
@@ -297,28 +303,60 @@ async def _ensure_unique_indexes(conn) -> None:
         except Exception:
             pass
 
-    strict_index_tables = {
-        "ux_gateway_asset_task_origin": "gateway_assets",
-        "ux_gateway_observation_probe": "gateway_observations",
-        "ux_gateway_secret_asset_hash": "gateway_secrets",
+    strict_index_shapes = {
+        "ux_targets_id_task_id": ("targets", ("id", "task_id")),
+        "ux_gateway_assets_id_task_id": ("gateway_assets", ("id", "task_id")),
+        "ux_gateway_asset_task_origin": ("gateway_assets", ("task_id", "origin_key")),
+        "ux_gateway_observation_probe": (
+            "gateway_observations",
+            ("gateway_asset_id", "scan_epoch", "probe_id", "auth_variant"),
+        ),
+        "ux_gateway_secret_asset_hash": (
+            "gateway_secrets",
+            ("gateway_asset_id", "secret_sha256"),
+        ),
     }
     table_rows = await conn.exec_driver_sql(
         "SELECT name FROM sqlite_master WHERE type='table'"
     )
     existing_tables = {row[0] for row in table_rows.fetchall()}
+
+    async def strict_index_shape(table: str, index: str) -> tuple[bool, tuple[str, ...]] | None:
+        index_rows = await conn.exec_driver_sql(f'PRAGMA index_list("{table}")')
+        index_row = next((row for row in index_rows.fetchall() if row[1] == index), None)
+        if index_row is None:
+            return None
+        column_rows = await conn.exec_driver_sql(f'PRAGMA index_info("{index}")')
+        columns = tuple(row[2] for row in sorted(column_rows.fetchall(), key=lambda row: row[0]))
+        return bool(index_row[2]), columns
+
+    async def verify_strict_index(name: str, table: str, columns: tuple[str, ...]) -> bool:
+        shape = await strict_index_shape(table, name)
+        if shape is None:
+            return False
+        if shape != (True, columns):
+            raise RuntimeError(
+                f"数据库索引 {name} 形态错误：需要 UNIQUE{columns}，实际为 {shape}"
+            )
+        return True
+
     for name, sql in _UNIQUE_INDEXES:
-        strict_table = strict_index_tables.get(name)
-        if strict_table is not None and strict_table not in existing_tables:
+        strict_shape = strict_index_shapes.get(name)
+        if strict_shape is not None and strict_shape[0] not in existing_tables:
+            continue
+        if strict_shape is not None and await verify_strict_index(name, *strict_shape):
             continue
         try:
             await conn.exec_driver_sql(sql)
         except Exception:
-            if strict_table is not None:
+            if strict_shape is not None:
                 raise
             try:
                 await conn.exec_driver_sql(sql.replace("UNIQUE INDEX", "INDEX"))
             except Exception:
                 pass
+        if strict_shape is not None:
+            await verify_strict_index(name, *strict_shape)
 
 
 async def _ensure_secondary_indexes(conn) -> None:
