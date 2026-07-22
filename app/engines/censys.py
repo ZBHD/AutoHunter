@@ -32,6 +32,7 @@ class CensysEngine(SearchEngine):
         page: int = 1,
         page_size: int = 100,
         base_url: str | None = None,
+        cursor: str | None = None,
     ) -> EngineResult:
         if not api_key:
             raise ValueError("缺少 Censys API Key")
@@ -41,38 +42,61 @@ class CensysEngine(SearchEngine):
         base = (base_url or self.get_default_base_url()).rstrip("/")
         basic_auth = base64.b64encode(api_key.encode()).decode()
         headers = {"Authorization": f"Basic {basic_auth}"}
-        params = {"q": query, "per_page": str(page_size), "page": str(page)}
+        params: dict[str, str] = {
+            "q": query,
+            "per_page": str(min(int(page_size or 100), 100)),
+        }
+        if cursor:
+            params["cursor"] = cursor
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=45) as client:
                 resp = await client.get(f"{base}/api/v2/hosts/search", params=params, headers=headers)
                 data = resp.json()
         except Exception as e:
             raise ValueError(f"Censys 请求失败: {e}") from e
 
-        hits = data.get("result", {}).get("hits", [])
+        if isinstance(data, dict) and data.get("error"):
+            error = data.get("error")
+            message = error.get("message") if isinstance(error, dict) else error
+            raise ValueError(f"Censys 错误: {message}")
+
+        result = (data or {}).get("result") or {}
+        hits = result.get("hits") or []
         results = []
         for item in hits:
             ip = item.get("ip", "")
-            services = item.get("services", [])
-            # 取第一个 HTTP 服务的 title
+            services = item.get("services") or []
             title = ""
             hostname = ""
-            org = ""
             port = ""
             for svc in services:
-                if isinstance(svc, dict):
-                    if not port:
-                        port = str(svc.get("port", ""))
-                    http = svc.get("http", {}) if isinstance(svc.get("http"), dict) else {}
-                    if http and http.get("title"):
-                        title = http.get("title", "")
-                    if svc.get("service_name") == "HTTP" and http:
-                        hostname = http.get("host", hostname)
-                else:
+                if not isinstance(svc, dict):
                     if not port:
                         port = str(svc)
-            location = item.get("location", {}) or {}
-            org = location.get("country", "") if isinstance(location, dict) else ""
+                    continue
+                if not port:
+                    port = str(svc.get("port", ""))
+                http = svc.get("http") if isinstance(svc.get("http"), dict) else {}
+                response = http.get("response") if isinstance(http.get("response"), dict) else {}
+                title = title or str(http.get("title") or response.get("html_title") or "")
+                if svc.get("service_name") in ("HTTP", "HTTPS"):
+                    hostname = hostname or str(http.get("host") or "")
+            if not hostname:
+                dns = item.get("dns") or {}
+                names = (dns.get("names") or []) if isinstance(dns, dict) else []
+                hostname = str(names[0]) if names else ""
+            autonomous_system = item.get("autonomous_system") or {}
+            org = ""
+            if isinstance(autonomous_system, dict):
+                org = str(
+                    autonomous_system.get("organization")
+                    or autonomous_system.get("name")
+                    or ""
+                )
+            if not org:
+                location = item.get("location") or {}
+                if isinstance(location, dict):
+                    org = str(location.get("country") or "")
             results.append([
                 hostname or ip,
                 ip,
@@ -85,7 +109,12 @@ class CensysEngine(SearchEngine):
         return EngineResult(
             fields=["host", "ip", "port", "title", "domain", "org"],
             results=results,
-            size=data.get("result", {}).get("total", 0),
+            size=int(result.get("total") or 0),
             page=page,
             engine="censys",
+            next_cursor=(
+                (result.get("links") or {}).get("next")
+                if isinstance(result.get("links"), dict)
+                else None
+            ),
         )

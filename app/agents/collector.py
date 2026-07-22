@@ -29,6 +29,7 @@ from app.agents import target_cluster
 from app.agents.prompts import is_enterprise_src
 from app.db.models import Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
+from app.engines.translator import translate_fofa_query
 from app.tools.leakcreds import query_leaked_creds
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.fofa.client import FofaError
@@ -698,8 +699,20 @@ async def _fofa_collect(
         _clear_fofa_error_diagnostics(cfg)
     try:
         if engine_name != "fofa":
-            res = await engine.search(key, cur_query, page=next_cursor, page_size=size,
-                                      base_url=base_url)
+            native_query = translate_fofa_query(cur_query, engine_name)
+            engine_cursor = cfg.get("engine_cursor") or None
+            if cfg.get("translated_query") != native_query:
+                engine_cursor = None
+                cfg.pop("engine_cursor", None)
+            cfg["translated_query"] = native_query
+            search_kwargs = {
+                "page": next_cursor,
+                "page_size": size,
+                "base_url": base_url,
+            }
+            if engine_cursor:
+                search_kwargs["cursor"] = engine_cursor
+            res = await engine.search(key, native_query, **search_kwargs)
     except QuakeRateLimitError as e:
         # Quake 专用限流异常
         err = f"{e}"[:300]
@@ -766,6 +779,11 @@ async def _fofa_collect(
         return 0
     cursor = next_cursor
     if engine_name != "fofa":
+        next_engine_cursor = getattr(res, "next_cursor", None)
+        if next_engine_cursor:
+            cfg["engine_cursor"] = next_engine_cursor
+        else:
+            cfg.pop("engine_cursor", None)
         cfg["fofa_auth_fail_count"] = 0
         cfg["rate_limit_count"] = 0  # 成功请求重置限流计数
         cfg.pop("rate_limit_until", None)
