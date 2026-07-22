@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   TASK_STATUS_FILTERS,
@@ -15,6 +16,8 @@ const tasks = [
   { id: "stopped", status: "stopped" },
   { id: "unknown", status: "unknown" },
 ];
+
+const taskView = readFileSync(new URL("../src/views/TasksView.vue", import.meta.url), "utf8");
 
 test("task status filters keep the required display order", () => {
   assert.deepEqual(TASK_STATUS_FILTERS.map(({ key, label }) => [key, label]), [
@@ -42,4 +45,14 @@ test("task status counts use the same grouping rules as filtering", () => {
     paused: 3,
     stopped: 1,
   });
+});
+
+test("task list renders status filters and filtered results", () => {
+  assert.match(taskView, /TASK_STATUS_FILTERS/);
+  assert.match(taskView, /const statusFilter = ref\("all"\)/);
+  assert.match(taskView, /const filteredTasks = computed/);
+  assert.match(taskView, /v-for="filter in TASK_STATUS_FILTERS"/);
+  assert.match(taskView, /:aria-pressed="statusFilter === filter\.key"/);
+  assert.match(taskView, /v-for="t in filteredTasks"/);
+  assert.match(taskView, /当前筛选下没有任务/);
 });

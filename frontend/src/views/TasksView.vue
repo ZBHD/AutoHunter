@@ -3,13 +3,21 @@ import { ref, onMounted, computed, watch } from "vue";
 import { useRouter } from "vue-router";
 import { api, authReadyRef, authRequiredRef, authRoleRef, loadAuthRole, verifyToken } from "../api.js";
 import TaskEditModal from "../components/TaskEditModal.vue";
+import {
+  TASK_STATUS_FILTERS,
+  filterTasksByStatus,
+  taskStatusFilterCounts,
+} from "../taskStatusFilters.js";
 
 const tasks = ref([]);
+const statusFilter = ref("all");
 const initialLoading = ref(true);
 const refreshing = ref(false);
 const editOpen = ref(false);
 const editingTask = ref(null);
 const writable = computed(() => authRoleRef.value === "full");
+const filteredTasks = computed(() => filterTasksByStatus(tasks.value, statusFilter.value));
+const statusCounts = computed(() => taskStatusFilterCounts(tasks.value));
 const router = useRouter();
 
 const STATUS_LABEL = {
@@ -143,6 +151,15 @@ watch(authReadyRef, (ready) => {
         </router-link>
       </div>
     </header>
+    <div v-if="!initialLoading && tasks.length" class="task-status-filters" aria-label="按任务状态筛选">
+      <button v-for="filter in TASK_STATUS_FILTERS" :key="filter.key" type="button"
+        :class="{ active: statusFilter === filter.key }"
+        :aria-pressed="statusFilter === filter.key"
+        @click="statusFilter = filter.key">
+        <span>{{ filter.label }}</span>
+        <b>{{ statusCounts[filter.key] }}</b>
+      </button>
+    </div>
     <div v-if="initialLoading" class="task-list">
       <div v-for="n in 4" :key="n" class="task-card skeleton-task" aria-hidden="true">
         <div class="task-card-main">
@@ -170,8 +187,9 @@ watch(authReadyRef, (ready) => {
       <span v-if="writable" class="hint">使用右上角「新建任务」创建第一个挖掘任务</span>
       <span v-else class="hint">当前令牌没有创建任务的权限</span>
     </div>
+    <div v-else-if="!filteredTasks.length" class="empty">当前筛选下没有任务</div>
     <div v-else class="task-list">
-      <div v-for="t in tasks" :key="t.id" class="task-card" :class="{ live: t.status === 'running' }"
+      <div v-for="t in filteredTasks" :key="t.id" class="task-card" :class="{ live: t.status === 'running' }"
         @click="router.push(`/task/${t.id}`)">
         <div class="task-card-main">
           <div class="tc-title">
