@@ -443,3 +443,53 @@ def test_running_litellm_allows_full_mutable_config_update(task_api) -> None:
     assert response.json()["mode_config"]["checks"]["anonymous_inference"] is False
     assert response.json()["mode_config"]["validation"]["max_requests_per_asset_epoch"] == 30
     assert response.json()["mode_config"]["recheck_intervals"]["confirmed_seconds"] == 7200
+
+
+def test_running_litellm_locks_target_source_and_manual_target_set(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Running LiteLLM scope",
+            "src_type": "litellm",
+            "target_source": "both",
+            "manual_targets": [
+                "https://one.example/gateway",
+                "https://two.example/gateway",
+            ],
+            "mode_config": {"scope_mode": "global"},
+        },
+    ).json()
+
+    async def mark_running() -> None:
+        async with session_maker() as session:
+            task = await session.get(Task, created["id"])
+            assert task is not None
+            task.status = "running"
+            await session.commit()
+
+    asyncio.run(mark_running())
+
+    unchanged = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "target_source": "both",
+            "manual_targets": [
+                "https://two.example/gateway",
+                "https://one.example/gateway",
+            ],
+        },
+    )
+    assert unchanged.status_code == 200, unchanged.text
+
+    changed_targets = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"manual_targets": ["https://three.example/gateway"]},
+    )
+    assert changed_targets.status_code == 409, changed_targets.text
+
+    changed_source = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"target_source": "fofa"},
+    )
+    assert changed_source.status_code == 409, changed_source.text

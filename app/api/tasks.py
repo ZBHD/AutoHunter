@@ -90,12 +90,18 @@ def _merge_litellm_mode_config(
     return LiteLlmModeConfigDTO.model_validate(merged)
 
 
-def _litellm_scope_signature(config: LiteLlmModeConfigDTO) -> tuple:
+def _litellm_scope_signature(
+    config: LiteLlmModeConfigDTO,
+    target_source: str,
+    manual_targets: list[str] | None,
+) -> tuple:
     return (
         config.scope_mode,
         tuple(sorted(set(config.scope_anchors))),
         tuple(sorted(set(config.enabled_profiles))),
         tuple(sorted(config.profile_versions.items())),
+        str(target_source or "").strip().lower(),
+        tuple(sorted({str(target or "").strip() for target in manual_targets or []})),
     )
 
 
@@ -605,9 +611,19 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         if (
             task.status == "running"
             and is_litellm_src(task.src_type)
-            and req.mode_config is not None
-            and _litellm_scope_signature(current_mode_config)
-            != _litellm_scope_signature(effective_mode_config)
+            and (
+                req.mode_config is not None
+                or req.target_source is not None
+                or req.manual_targets is not None
+            )
+            and _litellm_scope_signature(
+                current_mode_config, task.target_source, task.manual_targets
+            )
+            != _litellm_scope_signature(
+                effective_mode_config,
+                effective_target_source,
+                effective_manual_targets,
+            )
         ):
             raise HTTPException(
                 status_code=409,
