@@ -41,6 +41,33 @@ def _validated_http_url(value: str) -> str:
     return normalized
 
 
+def validate_litellm_manual_target_url(value: str) -> str:
+    """校验 LiteLLM 手动资产 URL；路径和 query 可作为网关挂载线索。"""
+
+    normalized = str(value or "").strip()
+    try:
+        parsed = urlparse(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "LiteLLM manual target must be an absolute HTTP(S) URL "
+            "without credentials or fragment"
+        ) from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or "#" in normalized
+    ):
+        raise ValueError(
+            "LiteLLM manual target must be an absolute HTTP(S) URL "
+            "without credentials or fragment"
+        )
+    return normalized
+
+
 class ModelConfigDTO(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -189,6 +216,10 @@ class CreateTaskRequest(BaseModel):
         if is_litellm_src(self.src_type):
             if self.mode_config is None:
                 self.mode_config = LiteLlmModeConfigDTO()
+            self.manual_targets = [
+                validate_litellm_manual_target_url(target)
+                for target in self.manual_targets
+            ]
             if (
                 self.target_source in {"fofa", "manual", "both"}
                 and self.mode_config.scope_mode == "targeted"
@@ -260,6 +291,19 @@ class UpdateTaskRequest(BaseModel):
     @classmethod
     def _hunt_direction(cls, value: str | None) -> str | None:
         return None if value is None else str(value).strip()
+
+    @model_validator(mode="after")
+    def _validate_explicit_litellm_targets(self):
+        if (
+            self.src_type is not None
+            and is_litellm_src(self.src_type)
+            and self.manual_targets is not None
+        ):
+            self.manual_targets = [
+                validate_litellm_manual_target_url(target)
+                for target in self.manual_targets
+            ]
+        return self
 
 
 class TaskStats(BaseModel):

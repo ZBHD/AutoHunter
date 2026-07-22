@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 
 import pytest
 from fastapi import FastAPI
@@ -42,6 +43,36 @@ def test_targeted_mode_requires_anchor_or_manual_target() -> None:
             target_source="manual",
             mode_config={"scope_mode": "targeted", "scope_anchors": []},
         )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "gateway.example/path",
+        "https://user:password@gateway.example/path",
+        "https://gateway.example/path#fragment",
+    ],
+)
+def test_litellm_manual_targets_require_safe_absolute_http_urls(target) -> None:
+    with pytest.raises(ValidationError):
+        CreateTaskRequest(
+            name="lite",
+            src_type="litellm",
+            target_source="manual",
+            manual_targets=[target],
+            mode_config={"scope_mode": "targeted"},
+        )
+
+
+def test_non_litellm_manual_targets_keep_legacy_compatibility() -> None:
+    req = CreateTaskRequest(
+        name="legacy",
+        src_type="edusrc",
+        target_source="manual",
+        manual_targets=["legacy-host-without-scheme"],
+    )
+
+    assert req.manual_targets == ["legacy-host-without-scheme"]
 
 
 def test_litellm_mode_rejects_unknown_fields_and_profiles() -> None:
@@ -209,6 +240,38 @@ def test_litellm_rejects_site_source_with_400(task_api) -> None:
     assert response.status_code == 400, response.text
 
 
+@pytest.mark.parametrize(
+    "mode_config",
+    [
+        {
+            "scope_mode": "global",
+            "enabled_profiles": ["litellm"],
+            "profile_versions": {},
+        },
+        {
+            "scope_mode": "global",
+            "enabled_profiles": ["litellm"],
+            "profile_versions": {"litellm": ""},
+        },
+    ],
+)
+def test_litellm_profile_versions_must_match_enabled_profiles(
+    task_api, mode_config
+) -> None:
+    client, _session_maker = task_api
+    response = client.post(
+        "/api/tasks",
+        json={
+            "name": "Invalid profile versions",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": mode_config,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+
+
 def test_litellm_illegal_source_is_400_before_scope_validation(task_api) -> None:
     client, _session_maker = task_api
     response = client.post(
@@ -250,3 +313,133 @@ def test_legacy_task_mode_config_defaults_to_empty_object(task_api) -> None:
     response = client.get(f"/api/tasks/{task_id}")
     assert response.status_code == 200, response.text
     assert response.json()["mode_config"] == {}
+
+
+def test_patch_litellm_rejects_invalid_manual_target(task_api) -> None:
+    client, _session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "LiteLLM target patch",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {"scope_mode": "global"},
+        },
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"manual_targets": ["relative-target"]},
+    )
+
+    assert response.status_code == 400, response.text
+
+
+def test_patch_litellm_rejects_profile_version_key_mismatch(task_api) -> None:
+    client, _session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "LiteLLM profile patch",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {"scope_mode": "global"},
+        },
+    ).json()
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={
+            "mode_config": {
+                "enabled_profiles": ["litellm"],
+                "profile_versions": {},
+            }
+        },
+    )
+
+    assert response.status_code == 400, response.text
+
+
+def test_running_litellm_rejects_scope_and_profile_changes(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Running LiteLLM",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {"scope_mode": "global"},
+        },
+    ).json()
+
+    async def mark_running() -> None:
+        async with session_maker() as session:
+            task = await session.get(Task, created["id"])
+            assert task is not None
+            task.status = "running"
+            await session.commit()
+
+    asyncio.run(mark_running())
+
+    changed_configs = []
+    scope_mode = deepcopy(created["mode_config"])
+    scope_mode["scope_mode"] = "targeted"
+    scope_mode["scope_anchors"] = ["example.com"]
+    changed_configs.append(scope_mode)
+
+    scope_anchors = deepcopy(created["mode_config"])
+    scope_anchors["scope_anchors"] = ["example.com"]
+    changed_configs.append(scope_anchors)
+
+    enabled_profiles = deepcopy(created["mode_config"])
+    enabled_profiles["enabled_profiles"] = []
+    enabled_profiles["profile_versions"] = {}
+    changed_configs.append(enabled_profiles)
+
+    profile_versions = deepcopy(created["mode_config"])
+    profile_versions["profile_versions"] = {"litellm": "2"}
+    changed_configs.append(profile_versions)
+
+    for mode_config in changed_configs:
+        response = client.patch(
+            f"/api/tasks/{created['id']}",
+            json={"mode_config": mode_config},
+        )
+        assert response.status_code == 409, response.text
+
+
+def test_running_litellm_allows_full_mutable_config_update(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Running mutable LiteLLM",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {"scope_mode": "global"},
+        },
+    ).json()
+
+    async def mark_running() -> None:
+        async with session_maker() as session:
+            task = await session.get(Task, created["id"])
+            assert task is not None
+            task.status = "running"
+            await session.commit()
+
+    asyncio.run(mark_running())
+    config = deepcopy(created["mode_config"])
+    config["checks"]["anonymous_inference"] = False
+    config["validation"]["max_requests_per_asset_epoch"] = 30
+    config["recheck_intervals"]["confirmed_seconds"] = 7200
+
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"mode_config": config, "concurrency": 5},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["concurrency"] == 5
+    assert response.json()["mode_config"]["checks"]["anonymous_inference"] is False
+    assert response.json()["mode_config"]["validation"]["max_requests_per_asset_epoch"] == 30
+    assert response.json()["mode_config"]["recheck_intervals"]["confirmed_seconds"] == 7200

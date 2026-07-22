@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dto import (
     CreateTaskRequest, LiteLlmModeConfigDTO, QueueOrderRequest, TaskResponse,
-    TaskStats, UpdateTaskRequest,
+    TaskStats, UpdateTaskRequest, validate_litellm_manual_target_url,
 )
 from app.agents import site_collab
 from app.agents.prompts import is_litellm_src, normalize_src_type
@@ -72,6 +72,33 @@ def _litellm_vuln_types(mode_config) -> list[str]:
     ]
 
 
+def _merge_litellm_mode_config(
+    current: dict | None,
+    patch: LiteLlmModeConfigDTO,
+) -> LiteLlmModeConfigDTO:
+    merged = LiteLlmModeConfigDTO.model_validate(current or {}).model_dump()
+    patch_data = patch.model_dump(exclude_unset=True)
+    for key, value in patch_data.items():
+        if (
+            key in {"checks", "validation", "recheck_intervals"}
+            and isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return LiteLlmModeConfigDTO.model_validate(merged)
+
+
+def _litellm_scope_signature(config: LiteLlmModeConfigDTO) -> tuple:
+    return (
+        config.scope_mode,
+        tuple(sorted(set(config.scope_anchors))),
+        tuple(sorted(set(config.enabled_profiles))),
+        tuple(sorted(config.profile_versions.items())),
+    )
+
+
 def _validate_litellm_request(
     mode_config,
     target_source: str,
@@ -84,10 +111,19 @@ def _validate_litellm_request(
     )
     profiles = set(config.enabled_profiles)
     versions = set(config.profile_versions)
-    if profiles != _LITELLM_ALLOWED_PROFILES or not versions <= _LITELLM_ALLOWED_PROFILES:
+    if profiles != _LITELLM_ALLOWED_PROFILES:
         raise HTTPException(400, "enabled_profiles 仅支持 litellm Profile")
+    if versions != profiles or any(
+        not str(version or "").strip() for version in config.profile_versions.values()
+    ):
+        raise HTTPException(400, "profile_versions 必须与 enabled_profiles 一致且版本非空")
     if target_source not in _LITELLM_TARGET_SOURCES:
         raise HTTPException(400, "LiteLLM target_source 必须是 fofa/manual/both")
+    try:
+        for target in manual_targets or []:
+            validate_litellm_manual_target_url(target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if config.scope_mode == "global" and target_source not in {"fofa", "both"}:
         raise HTTPException(400, "LiteLLM 全网发现必须使用 fofa 或 both source")
     if (
@@ -556,13 +592,27 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
     effective_manual_targets = (
         req.manual_targets if req.manual_targets is not None else (task.manual_targets or [])
     )
-    effective_mode_config = (
-        req.mode_config
-        if req.mode_config is not None
-        else (task.mode_config_json or {})
-    )
     validated_mode_config: LiteLlmModeConfigDTO | None = None
     if is_litellm_src(effective_src_type):
+        current_mode_config = LiteLlmModeConfigDTO.model_validate(
+            task.mode_config_json or {}
+        )
+        effective_mode_config = (
+            _merge_litellm_mode_config(task.mode_config_json, req.mode_config)
+            if req.mode_config is not None
+            else current_mode_config
+        )
+        if (
+            task.status == "running"
+            and is_litellm_src(task.src_type)
+            and req.mode_config is not None
+            and _litellm_scope_signature(current_mode_config)
+            != _litellm_scope_signature(effective_mode_config)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="运行中的 LiteLLM 任务需暂停后修改范围或 Profile",
+            )
         validated_mode_config = _validate_litellm_request(
             effective_mode_config, effective_target_source, effective_manual_targets
         )
