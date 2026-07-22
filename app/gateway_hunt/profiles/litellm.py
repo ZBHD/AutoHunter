@@ -1,11 +1,17 @@
 """LiteLLM Proxy 的版本化搜索、探测与指纹定义。"""
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
-from typing import Literal, cast
+from typing import Literal
 
 from app.gateway_hunt.profiles.base import GatewayProfile
+from app.gateway_hunt.profiles.response_matchers import (
+    WAF_MARKERS,
+    classify_probe_response,
+    parse_models_response,
+    response_content_type,
+    response_identity,
+)
 from app.gateway_hunt.schemas import (
     FingerprintResult,
     FingerprintSignal,
@@ -272,32 +278,9 @@ _HEALTH_PATHS = {
     for probe in _PROBES
     if probe.category == "public" and probe.public_by_design
 }
-_WAF_MARKERS = (
-    "web application firewall",
-    "access denied",
-    "request blocked",
-    "cf-ray",
-)
-
-
-def _json_value(body: str) -> JsonValue | None:
-    try:
-        return cast(JsonValue, json.loads(body))
-    except (TypeError, ValueError):
-        return None
-
-
-def _content_type(response: HttpObservation) -> str:
-    return response.content_type.partition(";")[0].strip().lower()
-
-
 def _probe_id(path: str, fallback: str) -> str:
     probe = _PROBES_BY_PATH.get(path)
     return probe.probe_id if probe is not None else fallback
-
-
-def _deduplicate(values: list[str]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(values))
 
 
 class LiteLLMProfile(GatewayProfile):
@@ -319,183 +302,22 @@ class LiteLLMProfile(GatewayProfile):
         return tuple(pattern.model_copy(deep=True) for pattern in _SECRET_PATTERNS)
 
     def parse_models(self, response: HttpObservation) -> ModelParseResult:
-        content_type = _content_type(response)
-        if not 200 <= response.status_code < 300:
-            return ModelParseResult(valid=False, reason="non-success status")
-        if content_type != "application/json" and not content_type.endswith("+json"):
-            return ModelParseResult(valid=False, reason="response is not JSON")
-
-        payload = _json_value(response.body)
-        if not isinstance(payload, dict) or "error" in payload:
-            return ModelParseResult(valid=False, reason="JSON object is missing or contains error")
-        records = payload.get("data")
-        if not isinstance(records, list) or not records:
-            return ModelParseResult(valid=False, reason="model data must be a non-empty list")
-
-        if all(
-            isinstance(record, dict)
-            and isinstance(record.get("model_name"), str)
-            and bool(str(record["model_name"]).strip())
-            and isinstance(record.get("litellm_params"), dict)
-            and isinstance(record.get("model_info"), dict)
-            for record in records
-        ):
-            model_ids = _deduplicate(
-                [str(record["model_name"]).strip() for record in records]
-            )
-            return ModelParseResult(
-                valid=True,
-                schema_kind="litellm_model_info",
-                model_ids=model_ids,
-            )
-
-        if all(
-            isinstance(record, dict)
-            and isinstance(record.get("id"), str)
-            and bool(str(record["id"]).strip())
-            for record in records
-        ):
-            model_ids = _deduplicate(
-                [str(record["id"]).strip() for record in records]
-            )
-            return ModelParseResult(
-                valid=True,
-                schema_kind="openai_models",
-                model_ids=model_ids,
-            )
-
-        return ModelParseResult(valid=False, reason="model records do not match a supported schema")
+        return parse_models_response(response)
 
     def classify_response(
         self,
         probe: ProbeSpec,
         response: HttpObservation,
     ) -> ResponseClassification:
-        content_type = _content_type(response)
-        body = response.body.strip()
-        body_lower = body.lower()
-        if any(marker in body_lower for marker in _WAF_MARKERS):
-            return ResponseClassification(
-                category="waf_response",
-                valid=False,
-                reason="response contains a WAF marker",
-            )
-        if content_type == "text/html" or body_lower.startswith(("<!doctype html", "<html")):
-            return ResponseClassification(
-                category="html_response",
-                valid=False,
-                reason="HTML does not satisfy a gateway API matcher",
-            )
-        if response.status_code in {401, 403}:
-            return ResponseClassification(
-                category="auth_required",
-                valid=False,
-                reason="route requires authentication",
-            )
-        if response.status_code == 429:
-            return ResponseClassification(
-                category="rate_limited",
-                valid=False,
-                reason="route is rate limited",
-            )
-        if response.status_code == 404:
-            return ResponseClassification(
-                category="not_found",
-                valid=False,
-                reason="route was not found",
-            )
-        if response.status_code >= 500:
-            return ResponseClassification(
-                category="server_error",
-                valid=False,
-                reason="gateway returned a server error",
-            )
-        if not 200 <= response.status_code < 300:
-            return ResponseClassification(
-                category="error_response",
-                valid=False,
-                reason="route returned a non-success status",
-            )
-
-        payload = _json_value(body) if content_type == "application/json" or content_type.endswith("+json") else None
-        if isinstance(payload, dict) and "error" in payload:
-            return ResponseClassification(
-                category="error_response",
-                valid=False,
-                reason="successful status contains an error object",
-            )
-
-        if probe.success_matcher == SuccessMatcher.EXACT_ALIVE_TEXT:
-            valid = content_type == "text/plain" and body == "I'm alive!"
-            return ResponseClassification(
-                category="public_baseline" if valid else "invalid_response",
-                valid=valid,
-                reason="exact health response matched" if valid else "health response mismatch",
-            )
-
-        if probe.success_matcher in {
-            SuccessMatcher.MODELS_JSON,
-            SuccessMatcher.MODEL_INFO_JSON,
-        }:
-            parsed = self.parse_models(response)
-            expected_schema = (
-                "litellm_model_info"
-                if probe.success_matcher == SuccessMatcher.MODEL_INFO_JSON
-                else "openai_models"
-            )
-            valid = parsed.valid and parsed.schema_kind == expected_schema
-            category = "model_info" if probe.category == "model_info" else "models"
-            return ResponseClassification(
-                category=category if valid else "invalid_response",
-                valid=valid,
-                reason="model schema matched" if valid else parsed.reason or "unexpected model schema",
-                model_ids=parsed.model_ids if valid else (),
-            )
-
-        if probe.success_matcher == SuccessMatcher.OPENAI_CHAT_JSON:
-            choices = payload.get("choices") if isinstance(payload, dict) else None
-            first_choice = choices[0] if isinstance(choices, list) and choices else None
-            message = first_choice.get("message") if isinstance(first_choice, dict) else None
-            valid = (
-                isinstance(payload, dict)
-                and isinstance(payload.get("id"), str)
-                and bool(str(payload["id"]).strip())
-                and isinstance(payload.get("model"), str)
-                and bool(str(payload["model"]).strip())
-                and isinstance(message, dict)
-                and isinstance(message.get("content"), str)
-            )
-            return ResponseClassification(
-                category="inference" if valid else "invalid_response",
-                valid=valid,
-                reason="OpenAI chat schema matched" if valid else "OpenAI chat schema mismatch",
-            )
-
-        if probe.success_matcher == SuccessMatcher.ADMIN_JSON:
-            valid = isinstance(payload, (dict, list))
-            return ResponseClassification(
-                category="management" if valid else "invalid_response",
-                valid=valid,
-                reason="admin JSON matched" if valid else "admin JSON schema mismatch",
-            )
-
-        return ResponseClassification(
-            category="invalid_response",
-            valid=False,
-            reason="unsupported response matcher",
-        )
+        return classify_probe_response(probe, response)
 
     def match_fingerprint(
         self,
         observations: Sequence[HttpObservation],
     ) -> FingerprintResult:
         signals: list[FingerprintSignal] = []
-        catch_all_responses = {
-            (
-                observation.status_code,
-                observation.content_type.partition(";")[0].strip().lower(),
-                observation.body.strip(),
-            )
+        control_responses = {
+            response_identity(observation)
             for observation in observations
             if (observation.path.partition("?")[0].rstrip("/") or "/")
             not in _PROBES_BY_PATH
@@ -503,10 +325,14 @@ class LiteLLMProfile(GatewayProfile):
 
         for observation in observations:
             path = observation.path.partition("?")[0].rstrip("/") or "/"
+            if path not in _PROBES_BY_PATH:
+                continue
+            if response_identity(observation) in control_responses:
+                continue
             body = observation.body.strip()
-            content_type = observation.content_type.partition(";")[0].strip().lower()
+            content_type = response_content_type(observation)
             body_lower = body.lower()
-            if any(marker in body_lower for marker in _WAF_MARKERS):
+            if any(marker in body_lower for marker in WAF_MARKERS):
                 continue
 
             if (
@@ -514,8 +340,6 @@ class LiteLLMProfile(GatewayProfile):
                 and observation.status_code == 200
                 and content_type == "text/plain"
                 and body == "I'm alive!"
-                and (observation.status_code, content_type, body)
-                not in catch_all_responses
             ):
                 probe = _PROBES_BY_PATH[path]
                 signals.append(

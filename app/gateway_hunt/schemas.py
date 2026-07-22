@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, TypeVar, cast
 
 from pydantic import (
     AliasChoices,
@@ -22,6 +22,84 @@ FingerprintStatus: TypeAlias = Literal["confirmed", "probable", "rejected"]
 ProbeCategory: TypeAlias = Literal[
     "public", "models", "model_info", "inference", "readonly_admin"
 ]
+
+_Key = TypeVar("_Key")
+_Value = TypeVar("_Value")
+
+
+class FrozenDict(dict[_Key, _Value]):
+    """可序列化、可深拷贝，但所有常规写操作都明确失败的字典。"""
+
+    def _immutable(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("FrozenDict is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __copy__(self) -> "FrozenDict[_Key, _Value]":
+        return self
+
+    def __deepcopy__(
+        self,
+        _memo: dict[int, object],
+    ) -> "FrozenDict[_Key, _Value]":
+        return self
+
+    def copy(self) -> "FrozenDict[_Key, _Value]":
+        return self
+
+
+class FrozenList(list[_Value]):
+    """保留 JSON list 序列化语义的只读列表。"""
+
+    def _immutable(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("FrozenList is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+    def __copy__(self) -> "FrozenList[_Value]":
+        return self
+
+    def __deepcopy__(
+        self,
+        _memo: dict[int, object],
+    ) -> "FrozenList[_Value]":
+        return self
+
+    def copy(self) -> "FrozenList[_Value]":
+        return self
+
+
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, dict):
+        return FrozenDict(
+            {
+                key: _deep_freeze(child)
+                for key, child in value.items()
+            }
+        )
+    if isinstance(value, list):
+        return FrozenList(_deep_freeze(child) for child in value)
+    if isinstance(value, tuple):
+        return tuple(_deep_freeze(child) for child in value)
+    return value
 
 
 class SuccessMatcher(StrEnum):
@@ -133,6 +211,19 @@ class ProbeSpec(GatewayValue):
     success_matcher: SuccessMatcher
     request_cost: int = Field(ge=1)
 
+    @field_validator("headers_template")
+    @classmethod
+    def _freeze_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        return cast(dict[str, str], _deep_freeze(value))
+
+    @field_validator("body_template")
+    @classmethod
+    def _freeze_body(
+        cls,
+        value: dict[str, JsonValue] | None,
+    ) -> dict[str, JsonValue] | None:
+        return cast(dict[str, JsonValue] | None, _deep_freeze(value))
+
     @property
     def request_json(self) -> dict[str, JsonValue] | None:
         """兼容旧调用方；请求正文只存于 body_template。"""
@@ -226,6 +317,8 @@ __all__ = [
     "FingerprintResult",
     "FingerprintSignal",
     "FingerprintStatus",
+    "FrozenDict",
+    "FrozenList",
     "GatewayCandidate",
     "HttpObservation",
     "JsonScalar",

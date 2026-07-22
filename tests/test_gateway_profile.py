@@ -67,6 +67,24 @@ def test_profile_callers_cannot_mutate_shared_signature_templates() -> None:
     assert profile.search_signatures()[0].engine_clauses["fofa"] == original_clause
 
 
+def test_probe_templates_are_deeply_immutable_and_serializable() -> None:
+    probe = {
+        probe.probe_id: probe for probe in LiteLLMProfile().probes()
+    }["v1_chat_completions"]
+    cloned = deepcopy(probe)
+    dumped = probe.model_dump()
+
+    assert dumped["headers_template"]["Authorization"] == "Bearer {auth_token}"
+    assert dumped["body_template"]["messages"][0]["role"] == "user"
+    assert cloned == probe
+    with pytest.raises(TypeError):
+        probe.headers_template["Accept"] = "text/html"
+    with pytest.raises(TypeError):
+        probe.body_template["model"] = "changed"
+    with pytest.raises(TypeError):
+        cloned.body_template["messages"][0]["role"] = "changed"
+
+
 def test_litellm_probes_define_complete_request_and_success_contracts() -> None:
     probes = {probe.probe_id: probe for probe in LiteLLMProfile().probes()}
 
@@ -152,7 +170,11 @@ def test_parse_models_accepts_openai_and_explicit_litellm_shapes() -> None:
             path="/v1/models",
             status_code=200,
             content_type="application/json",
-            body='{"object":"list","data":[{"id":"model-a"},{"id":"model-b"}]}',
+            body=(
+                '{"object":"list","data":['
+                '{"id":"model-a","object":"model"},'
+                '{"id":"model-b","object":"model"}]}'
+            ),
         )
     )
     litellm = profile.parse_models(
@@ -173,6 +195,21 @@ def test_parse_models_accepts_openai_and_explicit_litellm_shapes() -> None:
     assert litellm.valid is True
     assert litellm.schema_kind == "litellm_model_info"
     assert litellm.model_ids == ("proxy-model",)
+
+
+def test_parse_models_rejects_generic_data_id_without_discriminators() -> None:
+    parsed = LiteLLMProfile().parse_models(
+        HttpObservation(
+            path="/v1/models",
+            status_code=200,
+            content_type="application/json",
+            body='{"data":[{"id":"looks-like-a-model"}]}',
+        )
+    )
+
+    assert parsed.valid is False
+    assert parsed.schema_kind == "none"
+    assert parsed.model_ids == ()
 
 
 @pytest.mark.parametrize(
@@ -241,6 +278,80 @@ def test_classify_response_uses_probe_matcher_and_returns_structured_result() ->
 
 
 @pytest.mark.parametrize(
+    ("probe_id", "body"),
+    [
+        (
+            "key_info",
+            '{"key":"sk-fixture","info":{"key_alias":"fixture-key"}}',
+        ),
+        (
+            "key_list",
+            '{"keys":["hashed-fixture"],"total_count":1,'
+            '"current_page":1,"total_pages":1}',
+        ),
+        (
+            "routes",
+            '{"routes":[{"path":"/v1/models","methods":["GET"],'
+            '"name":"model_list","endpoint":"model_list"}]}',
+        ),
+        (
+            "config_list",
+            '[{"field_name":"max_parallel_requests","field_type":"Integer",'
+            '"field_description":"","field_value":10,"stored_in_db":true,'
+            '"field_default_value":null}]',
+        ),
+        (
+            "config_callbacks",
+            '{"status":"success","callbacks":[{"name":"langfuse",'
+            '"variables":{},"type":"success"}],"alerts":[],'
+            '"router_settings":{},"available_callbacks":{}}',
+        ),
+    ],
+)
+def test_admin_matcher_accepts_only_endpoint_specific_official_shape(
+    probe_id: str,
+    body: str,
+) -> None:
+    profile = LiteLLMProfile()
+    probe = {probe.probe_id: probe for probe in profile.probes()}[probe_id]
+
+    result = profile.classify_response(
+        probe,
+        HttpObservation(
+            path=probe.path,
+            status_code=200,
+            content_type="application/json",
+            body=body,
+        ),
+    )
+
+    assert result.valid is True
+    assert result.category == "management"
+
+
+@pytest.mark.parametrize(
+    "probe_id",
+    ["key_info", "key_list", "routes", "config_list", "config_callbacks"],
+)
+def test_generic_status_json_is_not_a_valid_admin_response(probe_id: str) -> None:
+    profile = LiteLLMProfile()
+    probe = {probe.probe_id: probe for probe in profile.probes()}[probe_id]
+
+    result = profile.classify_response(
+        probe,
+        HttpObservation(
+            path=probe.path,
+            status_code=200,
+            content_type="application/json",
+            body='{"status":"ok"}',
+        ),
+    )
+
+    assert result.valid is False
+    assert result.category == "invalid_response"
+
+
+@pytest.mark.parametrize(
     ("status_code", "content_type", "body", "category"),
     [
         (200, "text/html", "<html>LiteLLM dashboard</html>", "html_response"),
@@ -306,6 +417,79 @@ def test_catch_all_alive_response_does_not_confirm_litellm() -> None:
                 status_code=200,
                 content_type="text/plain",
                 body="I'm alive!",
+            ),
+        ]
+    )
+
+    assert result.status != "confirmed"
+    assert result.signals == ()
+
+
+def test_model_info_matching_control_response_does_not_confirm_litellm() -> None:
+    body = (
+        '{"data":[{"model_name":"proxy-model",'
+        '"litellm_params":{},"model_info":{}}]}'
+    )
+    result = LiteLLMProfile().match_fingerprint(
+        [
+            HttpObservation(
+                path="/model/info",
+                status_code=200,
+                content_type="application/json",
+                body=body,
+            ),
+            HttpObservation(
+                path="/__autohunter_control__",
+                status_code=200,
+                content_type="application/json",
+                body=body,
+            ),
+        ]
+    )
+
+    assert result.status != "confirmed"
+    assert result.signals == ()
+
+
+def test_brand_matching_control_response_does_not_confirm_litellm() -> None:
+    body = '{"routes":[{"path":"/litellm/dashboard","methods":["GET"]}]}'
+    result = LiteLLMProfile().match_fingerprint(
+        [
+            HttpObservation(
+                path="/routes",
+                status_code=200,
+                content_type="application/json",
+                body=body,
+            ),
+            HttpObservation(
+                path="/__autohunter_control__",
+                status_code=200,
+                content_type="application/json",
+                body=body,
+            ),
+        ]
+    )
+
+    assert result.status != "confirmed"
+    assert result.signals == ()
+
+
+def test_litellm_header_matching_control_response_does_not_confirm_product() -> None:
+    result = LiteLLMProfile().match_fingerprint(
+        [
+            HttpObservation(
+                path="/routes",
+                status_code=200,
+                content_type="application/json",
+                body='{"routes":[]}',
+                headers={"x-litellm-version": "fixture"},
+            ),
+            HttpObservation(
+                path="/__autohunter_control__",
+                status_code=200,
+                content_type="application/json",
+                body='{"routes":[]}',
+                headers={"x-litellm-version": "fixture"},
             ),
         ]
     )
