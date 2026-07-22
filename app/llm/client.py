@@ -16,6 +16,7 @@ from app.config import LLMProviderConfig
 from app.llm.protocols import (
     LLMResponse, ADAPTER_REGISTRY, ProtocolAdapter,
     OpenAIChatAdapter, AnthropicMessagesAdapter, OpenAIResponsesAdapter,
+    coerce_response_payload,
 )
 from app.llm.usage import record_usage
 
@@ -58,6 +59,41 @@ class LLMError(RuntimeError):
 
     def __str__(self) -> str:
         return self.diagnostic()
+
+
+def _is_forced_tool_choice(value: Any) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and isinstance(value.get("function"), dict)
+        and str(value["function"].get("name") or "").strip()
+    )
+
+
+def _is_forced_tool_choice_unsupported(error: LLMError) -> bool:
+    text = f"{error.status or ''} {error.code or ''} {error.detail or ''}".lower()
+    if "thinking mode does not support this tool_choice" in text:
+        return True
+
+    status = str(error.status or "")
+    if status not in {"400", "422"} and not any(
+        marker in f" {text} " for marker in (" 400 ", " 422 ")
+    ):
+        return False
+    if status == "422" or "upstream error" in text or "unprocessable" in text:
+        return True
+    return any(marker in text for marker in (
+        "tool_choice",
+        "tool choice",
+        "function call",
+        "invalid parameter",
+        "invalid_request",
+        "unsupported",
+        "not support",
+        "unrecognized",
+        "unexpected",
+        "参数有误",
+        "参数错误",
+    ))
 
 
 def _sanitize_error_detail(
@@ -190,11 +226,28 @@ class LLMClient:
             return True
         return False
 
+    def _send(self, payload) -> httpx.Response:
+        try:
+            resp = self._client.post(payload.url, headers=payload.headers, json=payload.body)
+        except Exception as exc:
+            if not self._maybe_downgrade_tls(exc):
+                raise _classify_error(exc, (self.config.api_key,)) from exc
+            try:
+                resp = self._client.post(payload.url, headers=payload.headers, json=payload.body)
+            except Exception as retry_exc:
+                raise _classify_error(retry_exc, (self.config.api_key,)) from retry_exc
+
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            raise _classify_error(exc, (self.config.api_key,)) from exc
+        return resp
+
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        tool_choice: str = "auto",
+        tool_choice: Any = "auto",
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
@@ -214,23 +267,57 @@ class LLMClient:
         )
 
         try:
-            resp = self._client.post(payload.url, headers=payload.headers, json=payload.body)
-            # TLS 自适应
-        except Exception as e:
-            if self._maybe_downgrade_tls(e):
-                try:
-                    resp = self._client.post(payload.url, headers=payload.headers, json=payload.body)
-                except Exception as e2:
-                    raise _classify_error(e2, (self.config.api_key,)) from e2
-            else:
-                raise _classify_error(e, (self.config.api_key,)) from e
+            resp = self._send(payload)
+        except LLMError as error:
+            if not (
+                tools
+                and _is_forced_tool_choice(tool_choice)
+                and _is_forced_tool_choice_unsupported(error)
+            ):
+                raise
+            logger.warning(
+                "LLM forced tool_choice rejected (400/422); falling back to auto "
+                "(provider=%s, model=%s, detail=%s)",
+                self.config.name,
+                self.config.model,
+                error.detail[:300],
+            )
+            fallback = self.adapter.build_request(
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                model=self.config.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temp,
+                max_tokens=mt,
+            )
+            resp = self._send(fallback)
 
         try:
-            resp.raise_for_status()
-        except Exception as e:
-            raise _classify_error(e, (self.config.api_key,)) from e
-
-        data = resp.json()
+            try:
+                raw_data = resp.json()
+            except ValueError:
+                raw_data = resp.text
+            data = coerce_response_payload(raw_data, self.adapter.protocol_name)
+        except ValueError as exc:
+            raise LLMError(
+                "upstream",
+                "LLM 返回无法解析的响应。",
+                exc,
+                status=resp.status_code,
+                detail=_sanitize_error_detail(str(exc)),
+            ) from exc
+        if data.get("error"):
+            detail = data["error"]
+            if not isinstance(detail, str):
+                detail = str(detail)
+            raise LLMError(
+                "upstream",
+                "LLM 网关返回错误。",
+                status=resp.status_code,
+                detail=_sanitize_error_detail(detail, redact_values=(self.config.api_key,)),
+            )
         self._record_usage(data)
         return self.adapter.parse_response(data)
 

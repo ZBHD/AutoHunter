@@ -11,6 +11,67 @@ from typing import Any
 _CONTINUATION_KEY = "_llm_continuation"
 
 
+def _openai_chat_text_payload(text: str) -> dict[str, Any]:
+    return {
+        "choices": [{
+            "message": {"role": "assistant", "content": text},
+        }],
+    }
+
+
+def coerce_response_payload(raw: Any, protocol_name: str) -> dict[str, Any]:
+    """Normalize transport-level gateway variants before protocol parsing."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise ValueError("LLM returned an empty response")
+        if text.startswith("data:") or "\ndata:" in text:
+            chunks = [
+                line[5:].strip()
+                for line in text.splitlines()
+                if line.startswith("data:")
+                and line[5:].strip()
+                and line[5:].strip() != "[DONE]"
+            ]
+            if chunks:
+                text = chunks[-1]
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            if protocol_name == "openai_chat":
+                return _openai_chat_text_payload(text)
+            raise ValueError(f"{protocol_name} response is not valid JSON") from None
+
+    if not isinstance(raw, dict):
+        if protocol_name == "openai_chat" and raw is not None:
+            return _openai_chat_text_payload(str(raw))
+        raise ValueError(f"{protocol_name} response must be a JSON object")
+
+    if protocol_name != "openai_chat":
+        return raw
+
+    normalized = deepcopy(raw)
+    choices = normalized.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, str):
+            choices[0] = {"message": {"role": "assistant", "content": first}}
+        elif isinstance(first, dict):
+            message = first.get("message", first)
+            if isinstance(message, str):
+                first["message"] = {"role": "assistant", "content": message}
+            elif "message" not in first and (
+                "content" in first or "tool_calls" in first
+            ):
+                choices[0] = {"message": message}
+    elif "content" in normalized or "tool_calls" in normalized:
+        return {"choices": [{"message": normalized}]}
+    return normalized
+
+
 @dataclass
 class ToolCall:
     id: str
@@ -46,6 +107,20 @@ def _argument_string(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def _content_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return "" if value is None else str(value)
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and item.get("type") == "text":
+            parts.append(str(item.get("text") or ""))
+    return "".join(parts)
 
 
 @dataclass
@@ -136,7 +211,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
         choices = raw.get("choices") or []
         choice = choices[0] if choices else {}
         msg = choice.get("message") or {}
-        content = msg.get("content") or ""
+        content = _content_string(msg.get("content"))
         raw_calls = msg.get("tool_calls") or []
         calls = [
             ToolCall(
