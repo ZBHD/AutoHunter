@@ -321,22 +321,25 @@ async def _ensure_unique_indexes(conn) -> None:
     )
     existing_tables = {row[0] for row in table_rows.fetchall()}
 
-    async def strict_index_shape(table: str, index: str) -> tuple[bool, tuple[str, ...]] | None:
+    async def strict_index_shape(
+        table: str,
+        index: str,
+    ) -> tuple[bool, tuple[str, ...], bool] | None:
         index_rows = await conn.exec_driver_sql(f'PRAGMA index_list("{table}")')
         index_row = next((row for row in index_rows.fetchall() if row[1] == index), None)
         if index_row is None:
             return None
         column_rows = await conn.exec_driver_sql(f'PRAGMA index_info("{index}")')
         columns = tuple(row[2] for row in sorted(column_rows.fetchall(), key=lambda row: row[0]))
-        return bool(index_row[2]), columns
+        return bool(index_row[2]), columns, bool(index_row[4])
 
     async def verify_strict_index(name: str, table: str, columns: tuple[str, ...]) -> bool:
         shape = await strict_index_shape(table, name)
         if shape is None:
             return False
-        if shape != (True, columns):
+        if shape != (True, columns, False):
             raise RuntimeError(
-                f"数据库索引 {name} 形态错误：需要 UNIQUE{columns}，实际为 {shape}"
+                f"数据库索引 {name} 形态错误：需要完整 UNIQUE{columns}，实际为 {shape}"
             )
         return True
 

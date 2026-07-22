@@ -275,7 +275,7 @@ def test_gateway_unique_indexes_do_not_fall_back_to_non_unique_indexes() -> None
         ),
     ],
 )
-@pytest.mark.parametrize("bad_shape", ["non_unique", "wrong_columns"])
+@pytest.mark.parametrize("bad_shape", ["non_unique", "wrong_columns", "partial"])
 def test_gateway_named_unique_index_must_have_expected_shape(
     table: str,
     index: str,
@@ -296,10 +296,15 @@ def test_gateway_named_unique_index_must_have_expected_shape(
                     await connection.exec_driver_sql(
                         f"CREATE INDEX {index} ON {table}({index_columns})"
                     )
-                else:
+                elif bad_shape == "wrong_columns":
                     wrong_columns = ", ".join(reversed(columns))
                     await connection.exec_driver_sql(
                         f"CREATE UNIQUE INDEX {index} ON {table}({wrong_columns})"
+                    )
+                else:
+                    await connection.exec_driver_sql(
+                        f"CREATE UNIQUE INDEX {index} ON {table}({index_columns}) "
+                        "WHERE id <> ''"
                     )
 
                 with pytest.raises(RuntimeError, match=index):
