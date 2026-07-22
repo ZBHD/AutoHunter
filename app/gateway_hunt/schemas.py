@@ -2,9 +2,17 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+)
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -16,10 +24,40 @@ ProbeCategory: TypeAlias = Literal[
 ]
 
 
+class SuccessMatcher(StrEnum):
+    EXACT_ALIVE_TEXT = "exact_alive_text"
+    MODELS_JSON = "models_json"
+    MODEL_INFO_JSON = "model_info_json"
+    OPENAI_CHAT_JSON = "openai_chat_json"
+    ADMIN_JSON = "admin_json"
+
+
+class ModelSchemaKind(StrEnum):
+    NONE = "none"
+    OPENAI_MODELS = "openai_models"
+    LITELLM_MODEL_INFO = "litellm_model_info"
+
+
+class ResponseCategory(StrEnum):
+    PUBLIC_BASELINE = "public_baseline"
+    MODELS = "models"
+    MODEL_INFO = "model_info"
+    INFERENCE = "inference"
+    MANAGEMENT = "management"
+    AUTH_REQUIRED = "auth_required"
+    RATE_LIMITED = "rate_limited"
+    NOT_FOUND = "not_found"
+    SERVER_ERROR = "server_error"
+    ERROR_RESPONSE = "error_response"
+    HTML_RESPONSE = "html_response"
+    WAF_RESPONSE = "waf_response"
+    INVALID_RESPONSE = "invalid_response"
+
+
 class GatewayValue(BaseModel):
     """默认严格且不可变，防止扫描阶段悄然改写规划输入。"""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
 class GatewayCandidate(GatewayValue):
@@ -80,8 +118,55 @@ class ProbeSpec(GatewayValue):
     public_by_design: bool = False
     finding_eligible: bool = True
     read_only: bool = True
-    request_json: dict[str, JsonValue] | None = None
-    accepted_content_types: tuple[str, ...] = ()
+    fingerprint_probe: bool = False
+    headers_template: dict[str, str]
+    body_template: dict[str, JsonValue] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("body_template", "request_json"),
+    )
+    expected_content_types: tuple[str, ...] = Field(
+        validation_alias=AliasChoices(
+            "expected_content_types",
+            "accepted_content_types",
+        )
+    )
+    success_matcher: SuccessMatcher
+    request_cost: int = Field(ge=1)
+
+    @property
+    def request_json(self) -> dict[str, JsonValue] | None:
+        """兼容旧调用方；请求正文只存于 body_template。"""
+
+        return self.body_template
+
+    @property
+    def accepted_content_types(self) -> tuple[str, ...]:
+        """兼容旧调用方；响应类型只存于 expected_content_types。"""
+
+        return self.expected_content_types
+
+
+class SecretPattern(GatewayValue):
+    pattern_id: str
+    secret_kind: Literal["master_key", "virtual_key"]
+    provider: str
+    variable_names: tuple[str, ...] = Field(min_length=1)
+    value_prefixes: tuple[str, ...] = Field(min_length=1)
+    description: str = ""
+
+
+class ModelParseResult(GatewayValue):
+    valid: bool
+    schema_kind: ModelSchemaKind = ModelSchemaKind.NONE
+    model_ids: tuple[str, ...] = ()
+    reason: str = ""
+
+
+class ResponseClassification(GatewayValue):
+    category: ResponseCategory
+    valid: bool
+    reason: str
+    model_ids: tuple[str, ...] = ()
 
 
 class FingerprintSignal(GatewayValue):
@@ -145,12 +230,18 @@ __all__ = [
     "HttpObservation",
     "JsonScalar",
     "JsonValue",
+    "ModelParseResult",
+    "ModelSchemaKind",
     "ProbeCategory",
     "ProbeSpec",
     "QueryFamilyState",
     "QueryPlan",
+    "ResponseCategory",
+    "ResponseClassification",
     "ScopeAnchor",
     "ScopeMode",
     "SearchSignature",
+    "SecretPattern",
     "SignatureStrength",
+    "SuccessMatcher",
 ]
