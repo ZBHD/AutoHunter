@@ -1,6 +1,7 @@
 """LiteLLM 网关发现链路共用的结构化值对象。"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, TypeAlias, TypeVar, cast
@@ -19,6 +20,15 @@ JsonScalar: TypeAlias = str | int | float | bool | None
 ScopeMode: TypeAlias = Literal["targeted", "global"]
 SignatureStrength: TypeAlias = Literal["low", "medium", "high"]
 FingerprintStatus: TypeAlias = Literal["confirmed", "probable", "rejected"]
+AuthDiffKind: TypeAlias = Literal[
+    "public_baseline",
+    "protected",
+    "anonymous_models",
+    "anonymous_inference",
+    "candidate_valid",
+    "inconclusive",
+]
+AuthSchemaKind: TypeAlias = Literal["invalid", "models", "inference", "management"]
 ProbeCategory: TypeAlias = Literal[
     "public", "models", "model_info", "inference", "readonly_admin"
 ]
@@ -162,6 +172,78 @@ class GatewayValue(BaseModel):
     """默认严格且不可变，防止扫描阶段悄然改写规划输入。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseSample:
+    """一次鉴权变体的最小响应快照，不包含任何传输能力。"""
+
+    status_code: int
+    content_type: str
+    body: str
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.status_code <= 599:
+            raise ValueError("status_code must be between 0 and 599")
+
+
+class AuthDiffResult(GatewayValue):
+    kind: AuthDiffKind
+    no_auth_schema: AuthSchemaKind = "invalid"
+    invalid_auth_schema: AuthSchemaKind = "invalid"
+    candidate_schema: AuthSchemaKind = "invalid"
+    status_changed: bool = False
+    content_type_changed: bool = False
+    body_similarity: float = Field(ge=0, le=1)
+    model_ids: tuple[str, ...] = ()
+    reason: str = ""
+
+
+class SecretArtifact(GatewayValue):
+    """从本地文本确定性提取、等待持久化与验证的 Secret。"""
+
+    name: str
+    value: str
+    sha256: str = Field(min_length=64, max_length=64)
+    secret_type: Literal[
+        "master_key",
+        "virtual_key",
+        "provider_key",
+        "database_dsn",
+        "redis_url",
+        "jwt_secret",
+        "other",
+    ]
+    provider: Literal[
+        "litellm",
+        "openai",
+        "anthropic",
+        "azure_openai",
+        "gemini",
+        "bedrock",
+        "unknown",
+    ]
+    source_url: str = ""
+    source_location: str = ""
+    context: str = Field(default="", max_length=240)
+    credential_group_id: str | None = None
+    validation_context: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @property
+    def secret_name(self) -> str:
+        return self.name
+
+    @property
+    def secret_value(self) -> str:
+        return self.value
+
+    @property
+    def secret_sha256(self) -> str:
+        return self.sha256
+
+    @property
+    def source_context(self) -> str:
+        return self.context
 
 
 class GatewayCandidate(GatewayValue):
@@ -370,6 +452,9 @@ class QueryPlan(GatewayValue):
 
 
 __all__ = [
+    "AuthDiffKind",
+    "AuthDiffResult",
+    "AuthSchemaKind",
     "FingerprintResult",
     "FingerprintSignal",
     "FingerprintStatus",
@@ -388,10 +473,12 @@ __all__ = [
     "QueryPlan",
     "ResponseCategory",
     "ResponseClassification",
+    "ResponseSample",
     "ScopeAnchor",
     "ScopeMode",
     "SearchSignature",
     "SecretPattern",
+    "SecretArtifact",
     "SignatureStrength",
     "SuccessMatcher",
 ]
