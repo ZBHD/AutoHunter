@@ -101,6 +101,23 @@ def parse_models_response(response: HttpObservation) -> ModelParseResult:
             ),
         )
 
+    # Some OpenAI-compatible deployments omit discriminators. Keep this exact
+    # minimal shape parseable for A/B auth comparison, but classify it separately.
+    if set(payload) == {"data"} and all(
+        isinstance(record, dict)
+        and set(record) == {"id"}
+        and isinstance(record.get("id"), str)
+        and bool(str(record["id"]).strip())
+        for record in records
+    ):
+        return ModelParseResult(
+            valid=True,
+            schema_kind="openai_models_compatible",
+            model_ids=_deduplicate(
+                [str(record["id"]).strip() for record in records]
+            ),
+        )
+
     return ModelParseResult(
         valid=False,
         reason="model records do not match a supported schema",
@@ -296,6 +313,16 @@ def classify_probe_response(
         SuccessMatcher.MODEL_INFO_JSON,
     }:
         parsed = parse_models_response(response)
+        if (
+            probe.success_matcher == SuccessMatcher.MODELS_JSON
+            and parsed.schema_kind == "openai_models_compatible"
+        ):
+            return ResponseClassification(
+                category="models_compatible",
+                valid=False,
+                reason="compatible model shape requires auth diff",
+                model_ids=parsed.model_ids,
+            )
         expected_schema = (
             "litellm_model_info"
             if probe.success_matcher == SuccessMatcher.MODEL_INFO_JSON

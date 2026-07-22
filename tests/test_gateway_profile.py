@@ -85,6 +85,36 @@ def test_probe_templates_are_deeply_immutable_and_serializable() -> None:
         cloned.body_template["messages"][0]["role"] = "changed"
 
 
+def test_probe_materializers_return_mutable_substituted_copies() -> None:
+    probe = {
+        probe.probe_id: probe for probe in LiteLLMProfile().probes()
+    }["v1_chat_completions"]
+
+    no_auth_headers = probe.materialize_headers()
+    headers = probe.materialize_headers(auth_token="sk-fixture")
+    body = probe.materialize_body(model="fixture-model", nonce="nonce-123")
+    header_copy = probe.headers_template.copy()
+
+    assert "Authorization" not in no_auth_headers
+    assert headers["Authorization"] == "Bearer sk-fixture"
+    assert body == {
+        "model": "fixture-model",
+        "messages": [{"role": "user", "content": "nonce-123"}],
+        "stream": False,
+        "max_tokens": 1,
+    }
+    assert type(header_copy) is dict
+
+    headers["Accept"] = "text/plain"
+    header_copy["Accept"] = "application/problem+json"
+    body["messages"][0]["role"] = "system"
+    body["messages"].append({"role": "user", "content": "second"})
+
+    assert probe.headers_template["Accept"] == "application/json"
+    assert probe.body_template["messages"][0]["role"] == "user"
+    assert len(probe.body_template["messages"]) == 1
+
+
 def test_litellm_probes_define_complete_request_and_success_contracts() -> None:
     probes = {probe.probe_id: probe for probe in LiteLLMProfile().probes()}
 
@@ -197,13 +227,55 @@ def test_parse_models_accepts_openai_and_explicit_litellm_shapes() -> None:
     assert litellm.model_ids == ("proxy-model",)
 
 
-def test_parse_models_rejects_generic_data_id_without_discriminators() -> None:
+def test_compatible_models_shape_is_parseable_but_not_single_response_success() -> None:
+    profile = LiteLLMProfile()
+    response = HttpObservation(
+        path="/v1/models",
+        status_code=200,
+        content_type="application/json",
+        body='{"data":[{"id":"looks-like-a-model"}]}',
+    )
+    probe = {probe.probe_id: probe for probe in profile.probes()}["v1_models"]
+
+    parsed = profile.parse_models(response)
+    classified = profile.classify_response(probe, response)
+
+    assert parsed.valid is True
+    assert parsed.schema_kind == "openai_models_compatible"
+    assert parsed.model_ids == ("looks-like-a-model",)
+    assert classified.valid is False
+    assert classified.category == "models_compatible"
+    assert classified.model_ids == parsed.model_ids
+    assert classified.reason == "compatible model shape requires auth diff"
+
+
+def test_strict_openai_models_shape_is_single_response_success() -> None:
+    profile = LiteLLMProfile()
+    probe = {probe.probe_id: probe for probe in profile.probes()}["v1_models"]
+    response = HttpObservation(
+        path=probe.path,
+        status_code=200,
+        content_type="application/json",
+        body=(
+            '{"object":"list","data":['
+            '{"id":"strict-model","object":"model"}]}'
+        ),
+    )
+
+    classified = profile.classify_response(probe, response)
+
+    assert classified.valid is True
+    assert classified.category == "models"
+    assert classified.model_ids == ("strict-model",)
+
+
+def test_compatible_models_shape_requires_exact_minimal_structure() -> None:
     parsed = LiteLLMProfile().parse_models(
         HttpObservation(
             path="/v1/models",
             status_code=200,
             content_type="application/json",
-            body='{"data":[{"id":"looks-like-a-model"}]}',
+            body='{"data":[{"id":"looks-like-a-model","extra":true}]}',
         )
     )
 

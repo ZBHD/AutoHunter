@@ -51,8 +51,8 @@ class FrozenDict(dict[_Key, _Value]):
     ) -> "FrozenDict[_Key, _Value]":
         return self
 
-    def copy(self) -> "FrozenDict[_Key, _Value]":
-        return self
+    def copy(self) -> dict[_Key, _Value]:
+        return cast(dict[_Key, _Value], materialize_template(self))
 
 
 class FrozenList(list[_Value]):
@@ -83,8 +83,8 @@ class FrozenList(list[_Value]):
     ) -> "FrozenList[_Value]":
         return self
 
-    def copy(self) -> "FrozenList[_Value]":
-        return self
+    def copy(self) -> list[_Value]:
+        return cast(list[_Value], materialize_template(self))
 
 
 def _deep_freeze(value: object) -> object:
@@ -102,6 +102,30 @@ def _deep_freeze(value: object) -> object:
     return value
 
 
+def materialize_template(
+    value: object,
+    replacements: dict[str, str] | None = None,
+) -> object:
+    """递归生成普通可变容器，并替换已提供的字符串占位符。"""
+
+    if isinstance(value, dict):
+        return {
+            key: materialize_template(child, replacements)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [materialize_template(child, replacements) for child in value]
+    if isinstance(value, str) and replacements:
+        materialized = value
+        for placeholder, replacement in replacements.items():
+            materialized = materialized.replace(
+                "{" + placeholder + "}",
+                replacement,
+            )
+        return materialized
+    return value
+
+
 class SuccessMatcher(StrEnum):
     EXACT_ALIVE_TEXT = "exact_alive_text"
     MODELS_JSON = "models_json"
@@ -113,12 +137,14 @@ class SuccessMatcher(StrEnum):
 class ModelSchemaKind(StrEnum):
     NONE = "none"
     OPENAI_MODELS = "openai_models"
+    OPENAI_MODELS_COMPATIBLE = "openai_models_compatible"
     LITELLM_MODEL_INFO = "litellm_model_info"
 
 
 class ResponseCategory(StrEnum):
     PUBLIC_BASELINE = "public_baseline"
     MODELS = "models"
+    MODELS_COMPATIBLE = "models_compatible"
     MODEL_INFO = "model_info"
     INFERENCE = "inference"
     MANAGEMENT = "management"
@@ -236,6 +262,36 @@ class ProbeSpec(GatewayValue):
 
         return self.expected_content_types
 
+    def materialize_headers(self, *, auth_token: str | None = None) -> dict[str, str]:
+        replacements = {"auth_token": auth_token} if auth_token is not None else {}
+        headers: dict[str, str] = {}
+        for name, template in self.headers_template.items():
+            if "{auth_token}" in template and auth_token is None:
+                continue
+            headers[name] = cast(
+                str,
+                materialize_template(template, replacements),
+            )
+        return headers
+
+    def materialize_body(
+        self,
+        *,
+        model: str | None = None,
+        nonce: str | None = None,
+    ) -> dict[str, JsonValue] | None:
+        if self.body_template is None:
+            return None
+        replacements = {
+            key: value
+            for key, value in {"model": model, "nonce": nonce}.items()
+            if value is not None
+        }
+        return cast(
+            dict[str, JsonValue],
+            materialize_template(self.body_template, replacements),
+        )
+
 
 class SecretPattern(GatewayValue):
     pattern_id: str
@@ -323,6 +379,7 @@ __all__ = [
     "HttpObservation",
     "JsonScalar",
     "JsonValue",
+    "materialize_template",
     "ModelParseResult",
     "ModelSchemaKind",
     "ProbeCategory",
