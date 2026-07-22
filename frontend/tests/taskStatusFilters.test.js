@@ -18,6 +18,7 @@ const tasks = [
 ];
 
 const taskView = readFileSync(new URL("../src/views/TasksView.vue", import.meta.url), "utf8");
+const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 
 test("task status filters keep the required display order", () => {
   assert.deepEqual(TASK_STATUS_FILTERS.map(({ key, label }) => [key, label]), [
@@ -55,4 +56,10 @@ test("task list renders status filters and filtered results", () => {
   assert.match(taskView, /:aria-pressed="statusFilter === filter\.key"/);
   assert.match(taskView, /v-for="t in filteredTasks"/);
   assert.match(taskView, /当前筛选下没有任务/);
+});
+
+test("task status filters have stable responsive controls", () => {
+  assert.match(style, /\.task-status-filters\s*\{[\s\S]*grid-template-columns:\s*repeat\(4,/);
+  assert.match(style, /\.task-status-filters button\.active/);
+  assert.match(style, /@media \(max-width:\s*640px\)[\s\S]*\.task-status-filters button[\s\S]*min-height:\s*44px/);
 });

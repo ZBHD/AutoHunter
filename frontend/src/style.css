@@ -599,6 +599,69 @@ main {
 }
 
 /* ---------- 任务列表 ---------- */
+.task-status-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.task-status-filters button {
+  position: relative;
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  overflow: hidden;
+  background: var(--surface);
+  letter-spacing: 0;
+}
+.task-status-filters button::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: var(--border);
+}
+.task-status-filters button:hover { background: var(--surface-2); }
+.task-status-filters button.active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.task-status-filters button.active::after { background: var(--accent); }
+.task-status-filters span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-status-filters button.active span { color: var(--ink); }
+.task-status-filters b {
+  flex: none;
+  color: var(--ink);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+@media (max-width: 640px) {
+  .task-status-filters { gap: 5px; margin-bottom: 10px; }
+  .task-status-filters button {
+    min-height: 44px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    padding: 5px 4px;
+  }
+  .task-status-filters span { font-size: 11.5px; }
+  .task-status-filters b { font-size: 12px; }
+}
 .task-list { display: grid; gap: 10px; }
 .task-card {
   position: relative;
