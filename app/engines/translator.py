@@ -69,6 +69,108 @@ def _join_parts(parts: list[str], joins: list[str], and_word: str, or_word: str)
     return "".join(output)
 
 
+def _render_parenthesized_query(
+    query: str,
+    token_pieces: list[str | None],
+    and_word: str,
+    or_word: str,
+) -> str | None:
+    """Render explicit FOFA parentheses without changing their precedence.
+
+    The legacy flat renderer intentionally remains the fast path for ordinary
+    queries.  This parser is used only when parentheses are present, where a
+    flat join can turn ``(a || b) && c`` into ``a || (b && c)``.
+    """
+    if "(" not in query and ")" not in query:
+        return None
+    matches = list(_TOKEN_RE.finditer((query or "").strip()))
+    if len(matches) != len(token_pieces):
+        return None
+
+    units: list[tuple[str, int | str]] = []
+    previous = 0
+    for index, match in enumerate(matches):
+        between = query[previous:match.start()]
+        cursor = 0
+        for separator in re.finditer(r"\s*(\&\&|\|\||[()])", between):
+            if between[cursor:separator.start()].strip():
+                return None
+            units.append(("op", separator.group(1)))
+            cursor = separator.end()
+        if between[cursor:].strip():
+            return None
+        units.append(("term", index))
+        previous = match.end()
+    tail = query[previous:]
+    cursor = 0
+    for separator in re.finditer(r"\s*(\&\&|\|\||[()])", tail):
+        if tail[cursor:separator.start()].strip():
+            return None
+        units.append(("op", separator.group(1)))
+        cursor = separator.end()
+    if tail[cursor:].strip():
+        return None
+
+    position = 0
+
+    def parse_primary():
+        nonlocal position
+        if position >= len(units):
+            return None
+        kind, value = units[position]
+        if kind == "term":
+            position += 1
+            return ("term", int(value))
+        if value != "(":
+            return None
+        position += 1
+        node = parse_or()
+        if position >= len(units) or units[position] != ("op", ")"):
+            return None
+        position += 1
+        return node
+
+    def parse_and():
+        nonlocal position
+        node = parse_primary()
+        while node is not None and position < len(units) and units[position] == ("op", "&&"):
+            position += 1
+            right = parse_primary()
+            if right is None:
+                return None
+            node = ("and", node, right)
+        return node
+
+    def parse_or():
+        nonlocal position
+        node = parse_and()
+        while node is not None and position < len(units) and units[position] == ("op", "||"):
+            position += 1
+            right = parse_and()
+            if right is None:
+                return None
+            node = ("or", node, right)
+        return node
+
+    tree = parse_or()
+    if tree is None or position != len(units):
+        return None
+
+    def render(node):
+        if node[0] == "term":
+            return token_pieces[node[1]]
+        left = render(node[1])
+        right = render(node[2])
+        if left is None:
+            return right
+        if right is None:
+            return left
+        word = or_word if node[0] == "or" else and_word
+        return f"({left} {word} {right})"
+
+    return render(tree)
+
+
 def _strip_domain_dot(value: str) -> str:
     return (value or "").strip().lstrip(".")
 
@@ -107,9 +209,11 @@ def fofa_to_quake(query: str) -> str:
 
     parts: list[str] = []
     kept_joins: list[str] = []
+    token_pieces: list[str | None] = []
     for index, t in enumerate(tokens):
         f = _FOFA_TO_QUAKE.get(t["field"], t["field"])
         if not f:
+            token_pieces.append(None)
             continue
         op = t["op"]
         v = t["value"]
@@ -123,11 +227,14 @@ def fofa_to_quake(query: str) -> str:
         elif op in ("!=", "!=~"):
             piece = f'NOT {f}:"{v}"'
         else:
+            token_pieces.append(None)
             continue
+        token_pieces.append(piece)
         if parts:
             kept_joins.append(joins[index - 1] if index - 1 < len(joins) else "&&")
         parts.append(piece)
-    return _join_parts(parts, kept_joins, "AND", "OR") or query
+    grouped = _render_parenthesized_query(query, token_pieces, "AND", "OR")
+    return grouped or _join_parts(parts, kept_joins, "AND", "OR") or query
 
 
 # FOFA 字段 → Hunter 字段映射
@@ -157,6 +264,7 @@ def fofa_to_hunter(query: str) -> str:
 
     parts: list[str] = []
     kept_joins: list[str] = []
+    token_pieces: list[str | None] = []
     for index, t in enumerate(tokens):
         f = _FOFA_TO_HUNTER.get(t["field"], t["field"])
         op = t["op"]
@@ -172,11 +280,14 @@ def fofa_to_hunter(query: str) -> str:
         elif op in ("!=", "!=~"):
             piece = f'{f}!="{v}"'
         else:
+            token_pieces.append(None)
             continue
+        token_pieces.append(piece)
         if parts:
             kept_joins.append(joins[index - 1] if index - 1 < len(joins) else "&&")
         parts.append(piece)
-    return _join_parts(parts, kept_joins, "&&", "||") or query
+    grouped = _render_parenthesized_query(query, token_pieces, "&&", "||")
+    return grouped or _join_parts(parts, kept_joins, "&&", "||") or query
 
 
 # FOFA 字段 → ZoomEye 字段映射
@@ -206,6 +317,7 @@ def fofa_to_zoomeye(query: str) -> str:
 
     parts: list[str] = []
     kept_joins: list[str] = []
+    token_pieces: list[str | None] = []
     for index, t in enumerate(tokens):
         f = _FOFA_TO_ZOOMEYE.get(t["field"], t["field"])
         op = t["op"]
@@ -221,11 +333,14 @@ def fofa_to_zoomeye(query: str) -> str:
         elif op in ("!=", "!=~"):
             piece = f'{f}!="{v}"'
         else:
+            token_pieces.append(None)
             continue
+        token_pieces.append(piece)
         if parts:
             kept_joins.append(joins[index - 1] if index - 1 < len(joins) else "&&")
         parts.append(piece)
-    return _join_parts(parts, kept_joins, "&&", "||") or query
+    grouped = _render_parenthesized_query(query, token_pieces, "&&", "||")
+    return grouped or _join_parts(parts, kept_joins, "&&", "||") or query
 
 
 # FOFA 字段 → Shodan 字段映射
@@ -256,11 +371,13 @@ def fofa_to_shodan(query: str) -> str:
         return query
 
     groups: list[list[str]] = [[]]
+    token_pieces: list[str | None] = []
     for index, t in enumerate(tokens):
         if index and joins[index - 1] == "||":
             groups.append([])
         f = _FOFA_TO_SHODAN.get(t["field"], t["field"])
         if not f:
+            token_pieces.append(None)
             continue
         op = t["op"]
         v = t["value"]
@@ -273,8 +390,13 @@ def fofa_to_shodan(query: str) -> str:
         elif op in ("!=", "!=~"):
             piece = f'-{f}:"{v}"'
         else:
+            token_pieces.append(None)
             continue
+        token_pieces.append(piece)
         groups[-1].append(piece)
+    grouped = _render_parenthesized_query(query, token_pieces, "", "OR")
+    if grouped:
+        return re.sub(r"\s{2,}", " ", grouped)
     rendered = [" ".join(group) for group in groups if group]
     return " OR ".join(rendered) or query
 
@@ -307,6 +429,7 @@ def fofa_to_censys(query: str) -> str:
 
     parts: list[str] = []
     kept_joins: list[str] = []
+    token_pieces: list[str | None] = []
     for index, t in enumerate(tokens):
         f = _FOFA_TO_CENSYS.get(t["field"], t["field"])
         op = t["op"]
@@ -321,11 +444,14 @@ def fofa_to_censys(query: str) -> str:
         elif op in ("!=", "!=~"):
             piece = f'not {f}:"{v}"'
         else:
+            token_pieces.append(None)
             continue
+        token_pieces.append(piece)
         if parts:
             kept_joins.append(joins[index - 1] if index - 1 < len(joins) else "&&")
         parts.append(piece)
-    return _join_parts(parts, kept_joins, "and", "or") or query
+    grouped = _render_parenthesized_query(query, token_pieces, "and", "or")
+    return grouped or _join_parts(parts, kept_joins, "and", "or") or query
 
 
 # ── 引擎分发表 ────────────────────────────────────────────────

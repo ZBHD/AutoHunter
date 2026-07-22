@@ -187,6 +187,36 @@ def test_old_task_and_target_tables_gain_auth_columns_without_data_loss() -> Non
     asyncio.run(scenario())
 
 
+def test_auth_context_migration_removes_legacy_target_secret_snapshots() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                session = AsyncSession(bind=conn, expire_on_commit=False)
+                session.add(Task(
+                    id="auth-task", name="Auth task", target_source="manual",
+                ))
+                session.add(Target(
+                    id="auth-target", task_id="auth-task",
+                    url="https://portal.example", host="portal.example",
+                    auth_context={"password": "legacy-secret"},
+                ))
+                await session.flush()
+                await session.close()
+
+                await _auto_migrate(conn)
+
+                row = await conn.exec_driver_sql(
+                    "SELECT auth_context FROM targets WHERE id='auth-target'"
+                )
+                assert row.scalar_one() is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_system_settings_table_gains_provider_pool_column() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

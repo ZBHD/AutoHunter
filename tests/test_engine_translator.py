@@ -62,6 +62,20 @@ def test_shodan_and_censys_use_native_filters() -> None:
 
 
 @pytest.mark.parametrize(
+    "translator",
+    [fofa_to_quake, fofa_to_hunter, fofa_to_zoomeye, fofa_to_shodan, fofa_to_censys],
+)
+def test_translation_preserves_explicit_boolean_grouping(translator) -> None:
+    translated = translator(
+        '(domain="in-scope.example" || domain="other.example") && title="portal"'
+    )
+
+    assert translated.startswith("(")
+    assert translated.count("(") >= 2
+    assert translated.count("(") == translated.count(")")
+
+
+@pytest.mark.parametrize(
     ("engine", "native"),
     [
         ("quake", 'title:"already quake" AND port:80'),

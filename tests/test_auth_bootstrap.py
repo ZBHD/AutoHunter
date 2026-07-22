@@ -224,7 +224,7 @@ def test_bootstrap_without_credentials_makes_no_request_and_event_is_redacted() 
     assert "secret-token" not in repr(event)
 
 
-def test_manual_target_is_enqueued_with_matching_auth_context() -> None:
+def test_manual_target_does_not_duplicate_task_auth_context() -> None:
     async def scenario() -> None:
         from app.agents import collector
 
@@ -256,12 +256,7 @@ def test_manual_target_is_enqueued_with_matching_auth_context() -> None:
                         select(Target).where(Target.task_id == task.id)
                     )
                 ).scalar_one()
-                assert target.auth_context["matched_by"] == "url"
-                assert target.auth_context["binding_target"] == (
-                    "https://portal.example/login"
-                )
-                assert target.auth_context["username"] == "alice"
-                assert target.auth_context["password"] == "secret"
+                assert target.auth_context is None
         finally:
             await engine.dispose()
 

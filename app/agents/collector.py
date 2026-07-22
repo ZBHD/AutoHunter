@@ -441,9 +441,6 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
                 host=host,
                 source="manual",
                 status="queued",
-                auth_context=resolve_auth_context_for_target(
-                    task.auth_bindings, raw, task.manual_targets
-                ),
             ))
             added += 1
         task.manual_targets = []  # 消费掉，避免重复
@@ -506,9 +503,6 @@ async def _site_collect(session: AsyncSession, task: Task) -> int:
                 status="queued",
                 priority_score=route.priority,
                 priority_reason=site_collab.route_reason(route),
-                auth_context=resolve_auth_context_for_target(
-                    task.auth_bindings, raw, raw_targets
-                ),
             ))
             added += 1
     return added
@@ -545,6 +539,12 @@ async def _fofa_collect(
     cur_query = cfg.get("current_query", "")
     cursor = int(cfg.get("cursor", 0))
 
+    if cfg.get("engine_exhausted") and cur_query:
+        cfg["collector_phase"] = "query_exhausted"
+        cfg["collector_phase_text"] = "当前查询已耗尽，等待新查询"
+        task.fofa_config = {**cfg}
+        return 0
+
     # 当前语法翻完了（或还没语法）→ 换/生成新语法
     if not cur_query or cursor >= max_pages:
         new_q, reason = await _resolve_query(task, llm)
@@ -552,6 +552,8 @@ async def _fofa_collect(
             return 0
         cur_query = new_q
         cursor = 0
+        cfg.pop("engine_exhausted", None)
+        cfg.pop("engine_cursor", None)
         if new_q not in history:
             history.append(new_q)
 
@@ -796,6 +798,12 @@ async def _fofa_collect(
             cfg["engine_cursor"] = next_engine_cursor
         else:
             cfg.pop("engine_cursor", None)
+            if engine_name == "censys":
+                # Censys is cursor-based.  Without a next link, incrementing
+                # the generic page counter would issue another request without
+                # a cursor and restart at page one.
+                cursor = max_pages
+                cfg["engine_exhausted"] = True
         cfg["fofa_auth_fail_count"] = 0
         cfg["rate_limit_count"] = 0  # 成功请求重置限流计数
         cfg.pop("rate_limit_until", None)
@@ -983,9 +991,6 @@ async def _fofa_collect(
             school=c.get("school", ""),
             priority_score=score, priority_reason=reason,
             leaked_creds=c.get("leaked_creds") or None,
-            auth_context=resolve_auth_context_for_target(
-                task.auth_bindings, c["url"], task.manual_targets
-            ),
         ))
         if cluster_item:
             cluster_item["pending"] += 1

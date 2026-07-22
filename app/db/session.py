@@ -336,6 +336,20 @@ async def _run_schema_migrations(conn) -> None:
         """
     )
 
+    auth_snapshot_migration = "20260722_task_auth_single_source_v1"
+    auth_row = await conn.exec_driver_sql(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (auth_snapshot_migration,),
+    )
+    if auth_row.first() is None:
+        # auth_context used to duplicate task credentials on every target.
+        # Runtime now resolves from Task.auth_bindings at dispatch time.
+        await conn.exec_driver_sql("UPDATE targets SET auth_context = NULL")
+        await conn.exec_driver_sql(
+            "INSERT INTO schema_migrations (name) VALUES (?)",
+            (auth_snapshot_migration,),
+        )
+
     migration = "20260714_killsweep_operations_v1"
     row = await conn.exec_driver_sql(
         "SELECT 1 FROM schema_migrations WHERE name = ?", (migration,)

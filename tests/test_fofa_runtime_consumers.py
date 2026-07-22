@@ -495,6 +495,53 @@ def test_collector_translates_non_fofa_query_and_persists_engine_cursor(monkeypa
     asyncio.run(scenario())
 
 
+def test_censys_without_next_cursor_exhausts_current_query(monkeypatch):
+    async def scenario():
+        from app.agents import collector
+
+        calls = []
+
+        class Engine:
+            display_name = "Censys"
+
+            async def search(
+                self, key, query, page, page_size, base_url=None, cursor=None
+            ):
+                calls.append({"page": page, "cursor": cursor})
+                return SimpleNamespace(fields=["host"], results=[], next_cursor=None)
+
+        monkeypatch.setattr(collector, "get_engine", lambda name: Engine())
+        monkeypatch.setattr(collector, "resolve_engine_config", lambda task: {
+            "engine": "censys",
+            "key": "censys-key",
+            "base_url": "https://search.censys.io",
+            "max_pages": 5,
+            "page_size": 10,
+        })
+        monkeypatch.setattr(collector, "_llm_for_task", lambda task: None)
+        task = SimpleNamespace(
+            id=1,
+            fofa_config={"current_query": 'domain="example.com"', "cursor": 0},
+            src_type="edusrc",
+            fofa_query='domain="example.com"',
+        )
+
+        await collector._fofa_collect(
+            SimpleNamespace(add=lambda obj: None), task, set(), {}, None
+        )
+
+        assert calls == [{"page": 1, "cursor": None}]
+        assert task.fofa_config["cursor"] == 5
+        assert "engine_cursor" not in task.fofa_config
+
+        await collector._fofa_collect(
+            SimpleNamespace(add=lambda obj: None), task, set(), {}, None
+        )
+        assert calls == [{"page": 1, "cursor": None}]
+
+    asyncio.run(scenario())
+
+
 def test_collector_terminal_pool_marker_is_safe(monkeypatch):
     async def scenario():
         from app.agents import collector

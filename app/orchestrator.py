@@ -1860,7 +1860,6 @@ class TaskRunner:
                         status="queued",
                         priority_score=float(spec.get("priority") or site_collab.FOCUSED_ROUTE.priority),
                         priority_reason=reason,
-                        auth_context=tgt.auth_context,
                     ))
             except IntegrityError:
                 # 并发：两条 discovery worker 同时派生撞了同一 site_f 编号，跳过，
@@ -1907,7 +1906,6 @@ class TaskRunner:
                         status="queued",
                         priority_score=troute.priority,
                         priority_reason=site_collab.route_reason(troute),
-                        auth_context=tgt.auth_context,
                     ))
             except IntegrityError:
                 # 并发：另一条 discovery worker 已派过同款主题路线，跳过。
@@ -2175,7 +2173,11 @@ class TaskRunner:
                     "source": tgt.source or "", "priority_reason": tgt.priority_reason or "",
                     "leaked_creds": tgt.leaked_creds or [],
                 }
-                auth_context = dict(tgt.auth_context or {}) or None
+                auth_context = resolve_auth_context_for_target(
+                    task_obj.auth_bindings if task_obj else [],
+                    tgt.url or url,
+                    task_obj.manual_targets if task_obj else [],
+                )
                 try:
                     plan = playbook_router.route_target(
                         url=tgt.url or url,
@@ -3907,11 +3909,6 @@ class TaskRunner:
                     source="killsweep", status="queued", is_edu=True,
                     killsweep_case_id=case_id,
                     priority_score=120.0, priority_reason="[通杀验证] 同款系统已实证中招，重点出货",
-                    auth_context=resolve_auth_context_for_target(
-                        task.auth_bindings if task else [],
-                        collector._ensure_url(host),
-                        task.manual_targets if task else [],
-                    ),
                 ))
         except IntegrityError:
             return False
