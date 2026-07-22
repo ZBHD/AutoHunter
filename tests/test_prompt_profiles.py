@@ -7,7 +7,7 @@ from app.agents.prompt_profiles import (
     normalize_prompt_version,
     trim_policy_text,
 )
-from app.agents.prompts import worker_system_prompt
+from app.agents.prompts import reviewer_system_prompt, worker_system_prompt
 from app.config import WorkerConfig
 
 
@@ -44,3 +44,18 @@ def test_reviewer_policy_trims_custom_rules_before_composition() -> None:
 
 def test_worker_runtime_default_uses_current_profile() -> None:
     assert WorkerConfig().prompt_version == "current"
+
+
+def test_write_actions_require_independent_readback_evidence() -> None:
+    policy_texts = (
+        worker_system_prompt("edusrc", "current"),
+        worker_system_prompt("enterprise", "current"),
+        reviewer_system_prompt("edusrc"),
+        reviewer_system_prompt("enterprise"),
+    )
+
+    for policy in policy_texts:
+        assert "侧面回读" in policy
+        assert "before" in policy.lower()
+        assert "after" in policy.lower()
+        assert "200/success" in policy
