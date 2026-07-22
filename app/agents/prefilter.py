@@ -1,7 +1,7 @@
 """机械预筛：在入队前过滤无挖掘价值的资产。
 
 只做确定性的机械判断（不耗 LLM）：
-0. 政府/政务 .gov 域名 → 跳过（不发起网络请求）
+0. 敏感域名（.gov / .mil / 军政政法关键词等）→ 跳过（不发起网络请求）
 1. CDN / 对象存储 / 云 WAF 域名特征 → 跳过
 2. 死链 / 连接超时 / 无响应 → 跳过
 3. 纯前端静态站（无任何后端交互特征，且是 SPA/静态托管）→ 跳过
@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 from urllib.parse import urlparse
 
 import httpx
@@ -26,7 +27,24 @@ _CDN_MARKERS = (
 # 纯静态托管 Server 头特征
 _STATIC_SERVERS = ("githubpages", "netlify", "vercel", "cloudflare", "amazons3", "aliyunoss")
 
+_SENSITIVE_PUBLIC_LABELS = frozenset({"gov", "mil"})
+_SENSITIVE_KEYWORDS = (
+    "gongan", "jiancha", "jiwei", "chinamil", "guofang", "wujing",
+    "mps.gov", "mod.gov", "court.gov", "spp.gov", "ccdi.gov",
+    "公安", "检察", "法院", "纪委", "国安", "国防", "武警", "军事",
+    "政法委", "人大常委会", "中央军委", "解放军",
+)
 _GOV_SKIP_REASON = "政府/政务域名（.gov），自动跳过"
+_SENSITIVE_SKIP_REASON = "敏感域名（政府/军政/政法等），自动跳过"
+
+
+def _extra_sensitive_suffixes() -> tuple[str, ...]:
+    raw = os.environ.get("AUTOHUNTER_SENSITIVE_HOSTS", "") or ""
+    return tuple(dict.fromkeys(
+        suffix
+        for part in raw.split(",")
+        if (suffix := part.strip().lower().lstrip("."))
+    ))
 
 
 def _host_only(host_or_url: str) -> str:
@@ -48,27 +66,47 @@ def _host_only(host_or_url: str) -> str:
     return value.rstrip(".")
 
 
-def is_gov_host(host_or_url: str) -> bool:
-    """识别 *.gov、*.gov.cn 和 *.gov.ac.uk 等政府域名。"""
-    host = _host_only(host_or_url)
-    if not host:
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return False
-    except ValueError:
-        pass
-    if host == "gov" or host.endswith(".gov"):
+def _has_public_label(host: str, label: str) -> bool:
+    if host == label or host.endswith(f".{label}"):
         return True
     parts = host.split(".")
     if (
         len(parts) >= 3
-        and parts[-2] == "gov"
+        and parts[-2] == label
         and parts[-1].isalpha()
         and 2 <= len(parts[-1]) <= 4
     ):
         return True
-    return len(parts) >= 4 and parts[-3] == "gov"
+    return len(parts) >= 4 and parts[-3] == label
+
+
+def _is_ip_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def is_gov_host(host_or_url: str) -> bool:
+    """识别 *.gov、*.gov.cn 和 *.gov.ac.uk 等政府域名。"""
+    host = _host_only(host_or_url)
+    return bool(host and not _is_ip_address(host) and _has_public_label(host, "gov"))
+
+
+def is_sensitive_host(host_or_url: str) -> bool:
+    """识别政府、军队、政法以及用户额外配置的敏感域名。"""
+    host = _host_only(host_or_url)
+    if not host or _is_ip_address(host):
+        return False
+    if any(_has_public_label(host, label) for label in _SENSITIVE_PUBLIC_LABELS):
+        return True
+    if any(keyword in host for keyword in _SENSITIVE_KEYWORDS):
+        return True
+    return any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _extra_sensitive_suffixes()
+    )
 
 
 def is_cdn_host(host: str) -> bool:
@@ -112,8 +150,8 @@ def should_skip(host: str, url: str) -> tuple[bool, str]:
 
 def should_skip_ex(host: str, url: str) -> tuple[bool, str, dict]:
     """同 should_skip，但额外返回首页探测信息(供评分复用，避免重复发包)。"""
-    if is_gov_host(host) or is_gov_host(url):
-        return True, _GOV_SKIP_REASON, {}
+    if is_sensitive_host(host) or is_sensitive_host(url):
+        return True, _SENSITIVE_SKIP_REASON, {}
     if is_cdn_host(host):
         return True, "CDN/对象存储/静态托管域名", {}
     info = probe(url)
