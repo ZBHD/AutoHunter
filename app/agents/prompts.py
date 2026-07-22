@@ -864,7 +864,13 @@ def normalize_src_type(src_type: str | bool | None) -> str:
     if isinstance(src_type, bool):
         return "enterprise" if src_type else "edusrc"
     value = (src_type or "edusrc").strip().lower()
+    if value == "litellm":
+        return "litellm"
     return "enterprise" if value in {"enterprise", "corp", "company", "企业", "企业src"} else "edusrc"
+
+
+def is_litellm_src(src_type: str | bool | None) -> bool:
+    return normalize_src_type(src_type) == "litellm"
 
 
 def is_enterprise_src(src_type: str | bool | None) -> bool:

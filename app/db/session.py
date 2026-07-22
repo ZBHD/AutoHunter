@@ -72,6 +72,7 @@ _MIGRATIONS = [
     ("system_settings", "fofa_keys", "JSON DEFAULT '[]'"),
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
     ("tasks", "hunt_direction", "TEXT DEFAULT ''"),
+    ("tasks", "mode_config", "JSON DEFAULT '{}'"),
     ("tasks", "search_enabled", "BOOLEAN DEFAULT 1"),
     ("targets", "killsweep_case_id", "VARCHAR(32)"),
     ("killsweeps", "automatic_verdict", "VARCHAR(20) DEFAULT 'pending_validation'"),

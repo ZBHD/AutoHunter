@@ -4,7 +4,7 @@
 
 Goal: 在现有 AutoHunter 24x7 任务编排中落地可扩展的 LiteLLM 网关发现、Secret 泄露识别、无 Key 调用验证和持续复查能力。
 
-Architecture: 新增 src_type=litemllm 和 mode_config，保留现有 Task、Target、Orchestrator、Review 主链路。LiteLLM 的查询、指纹、鉴权差异、Secret 提取、Provider 验证和推理验证放入 app/gateway_hunt/，通过 GatewayAsset、GatewaySecret、GatewayObservation 三张扩展表保存专项状态；LiteLLM Target 不进入通用 Worker。
+Architecture: 新增 src_type=litellm 和 mode_config，保留现有 Task、Target、Orchestrator、Review 主链路。LiteLLM 的查询、指纹、鉴权差异、Secret 提取、Provider 验证和推理验证放入 app/gateway_hunt/，通过 GatewayAsset、GatewaySecret、GatewayObservation 三张扩展表保存专项状态；LiteLLM Target 不进入通用 Worker。
 
 Tech Stack: Python 3.11、FastAPI、Pydantic v2、SQLAlchemy async + SQLite/aiosqlite、httpx、pytest、Vue 3、Vite、Node 内置测试运行器。
 
@@ -77,14 +77,14 @@ Files:
 - [ ] Step 1: 写失败测试
 
     def test_normalize_src_type_keeps_litellm():
-        assert normalize_src_type("litemllm") == "litemllm"
-        assert is_litellm_src("litemllm") is True
-        assert is_enterprise_src("litemllm") is False
+        assert normalize_src_type("litellm") == "litellm"
+        assert is_litellm_src("litellm") is True
+        assert is_enterprise_src("litellm") is False
 
     def test_global_mode_defaults_to_full_checks():
         req = CreateTaskRequest(
             name="lite",
-            src_type="litemllm",
+            src_type="litellm",
             target_source="fofa",
             mode_config={"scope_mode": "global"},
         )
@@ -95,7 +95,7 @@ Files:
         with pytest.raises(ValidationError):
             CreateTaskRequest(
                 name="lite",
-                src_type="litemllm",
+                src_type="litellm",
                 target_source="manual",
                 mode_config={"scope_mode": "targeted", "scope_anchors": []},
             )
@@ -104,13 +104,13 @@ Files:
 
     pytest tests/test_litellm_task_mode.py -q
 
-Expected: FAIL because litemllm normalization and mode_config DTO do not exist.
+Expected: FAIL because litellm normalization and mode_config DTO do not exist.
 
 - [ ] Step 3: 实现最小契约
 
-在 prompts.py 增加 is_litellm_src，normalize_src_type 明确保留 litemllm，不得落入 edusrc。dto.py 增加 LiteLlmChecksDTO、LiteLlmValidationDTO、LiteLlmModeConfigDTO，extra=forbid，校验范围锚点长度、验证预算和复查周期。
+在 prompts.py 增加 is_litellm_src，normalize_src_type 明确保留 litellm，不得落入 edusrc。dto.py 增加 LiteLlmChecksDTO、LiteLlmValidationDTO、LiteLlmModeConfigDTO，extra=forbid，校验范围锚点长度、验证预算和复查周期。
 
-CreateTaskRequest、UpdateTaskRequest、TaskResponse 增加 mode_config。服务端在 src_type=litemllm 时由 checks 生成固定专项 vuln_types，忽略通用 Web 漏洞类型；未知 Profile、非法 source、超限预算返回 400。Task 增加 mode_config JSON 列，旧任务默认空对象。
+CreateTaskRequest、UpdateTaskRequest、TaskResponse 增加 mode_config。服务端在 src_type=litellm 时由 checks 生成固定专项 vuln_types，忽略通用 Web 漏洞类型；未知 Profile、非法 source、超限预算返回 400。Task 增加 mode_config JSON 列，旧任务默认空对象。
 
 - [ ] Step 4: 运行通过测试
 
@@ -524,7 +524,7 @@ Files:
 - [ ] Step 1: 写失败测试
 
     def test_litellm_reviewer_requires_structured_evidence():
-        prompt = reviewer_system_prompt("litemllm")
+        prompt = reviewer_system_prompt("litellm")
         assert "鉴权对照" in prompt
         assert "Provider 验证" in prompt
         assert "公开健康检查" in prompt
@@ -567,7 +567,7 @@ Files:
         name: "lite",
         scopeMode: "global",
       });
-      expect(body.src_type).toBe("litemllm");
+      expect(body.src_type).toBe("litellm");
       expect(body.mode_config.validation.level).toBe("full");
       expect(body.mode_config.checks.anonymous_inference).toBe(true);
       expect(body.vuln_types).toEqual([]);
@@ -629,7 +629,7 @@ Expected: FAIL because API methods, views and panels do not exist.
 
 - [ ] Step 3: 实现 API 和面板
 
-api.js 增加 gatewaySummary、gatewayAssets、gatewaySecrets、gatewaySecretExport、gatewayAsset、gatewayObservations、recheckGatewayAsset、revalidateGatewaySecret。BoardView 只有 task.src_type=litemllm 且角色为 full/readonly 时显示网关资产、Secret、探测记录标签。Secret 面板默认显示原值，支持复制、状态筛选、重新验证、导出和加载/空/错误状态；observer 不渲染组件且不调用接口。
+api.js 增加 gatewaySummary、gatewayAssets、gatewaySecrets、gatewaySecretExport、gatewayAsset、gatewayObservations、recheckGatewayAsset、revalidateGatewaySecret。BoardView 只有 task.src_type=litellm 且角色为 full/readonly 时显示网关资产、Secret、探测记录标签。Secret 面板默认显示原值，支持复制、状态筛选、重新验证、导出和加载/空/错误状态；observer 不渲染组件且不调用接口。
 
 - [ ] Step 4: 运行通过测试
 
@@ -702,7 +702,7 @@ Expected: Python 测试、Node 内置测试、Vite build 和 compileall 全部 P
 ## 计划自检
 
 - 规格覆盖：Task/DTO、迁移、Profile、查询游标、指纹、鉴权差异、Secret、Provider 验证、推理、扫描服务、Finding/Review、API、权限、看板、持续复查、错误退避和测试均有对应任务。
-- 类型一致性：统一使用 litemllm、mode_config、GatewayAsset、GatewaySecret、GatewayObservation、scan_epoch、next_scan_at 和 validation_status。
+- 类型一致性：统一使用 litellm、mode_config、GatewayAsset、GatewaySecret、GatewayObservation、scan_epoch、next_scan_at 和 validation_status。
 - 幂等性：Asset、Secret、Observation 唯一约束和复查条件更新分别在 Task 2、6、8 覆盖。
 - 非目标：不改远端管理配置，不把健康接口单独算漏洞，不让 LiteLLM 进入通用 Worker，未扩展其他网关 Profile。
 - 运行策略：每个任务先写失败测试，再实现最小行为；每个任务使用中文提交信息，最后执行 Python、前端单测和构建回归。

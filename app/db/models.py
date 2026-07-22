@@ -56,6 +56,8 @@ class Task(Base):
     hunt_direction: Mapped[str] = mapped_column(Text, default="")
     manual_targets: Mapped[list] = mapped_column(JSON, default=list)
     model_config_json: Mapped[dict] = mapped_column("model_config", JSON, default=dict)
+    # 专项任务模式配置；旧任务通过迁移补列并默认为空对象。
+    mode_config_json: Mapped[dict] = mapped_column("mode_config", JSON, default=dict)
     fofa_config: Mapped[dict] = mapped_column(JSON, default=dict)       # keys/max_pages/page_size/cursor
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     engine: Mapped[str] = mapped_column(String(20), default="")         # 搜索引擎：fofa/quake/hunter/zoomeye/shodan/censys
