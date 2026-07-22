@@ -123,6 +123,13 @@ async def _stored_hunt_direction(session_maker, task_id: str) -> str:
         return task.hunt_direction
 
 
+async def _stored_auth_bindings(session_maker, task_id: str) -> list[dict]:
+    async with session_maker() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        return list(task.auth_bindings or [])
+
+
 async def _stored_fofa_config(session_maker, task_id: str) -> dict:
     async with session_maker() as session:
         task = await session.get(Task, task_id)
@@ -331,6 +338,39 @@ def test_create_task_persists_and_returns_global_pool_default(task_api) -> None:
     assert asyncio.run(_stored_model_config(session_maker, body["id"])) == {
         "use_global_pool": True
     }
+
+
+def test_task_api_persists_returns_and_updates_auth_bindings(task_api) -> None:
+    client, session_maker = task_api
+    initial = [{
+        "target": "portal.example",
+        "username": "alice",
+        "password": "secret-1",
+        "login_url": "https://portal.example/sign-in",
+    }]
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Authenticated task", "target_source": "manual", "auth_bindings": initial},
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    assert created.json()["auth_bindings"] == initial
+    assert asyncio.run(_stored_auth_bindings(session_maker, task_id)) == initial
+
+    updated = [{"target": "portal.example", "cookie": "sid=secret-2"}]
+    patched = client.patch(
+        f"/api/tasks/{task_id}", json={"auth_bindings": updated}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["auth_bindings"] == updated
+    assert asyncio.run(_stored_auth_bindings(session_maker, task_id)) == updated
+
+    observer = client.get(
+        f"/api/tasks/{task_id}", headers={"Authorization": "Bearer observer-token"}
+    )
+    assert observer.status_code == 200
+    assert observer.json()["auth_bindings"] == []
 
 
 def test_create_task_trims_and_persists_hunt_direction(task_api) -> None:

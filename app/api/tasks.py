@@ -18,7 +18,7 @@ from app.db.models import (
 from app.db.session import get_session
 from app.fofa.runtime import public_runtime_summary
 from app.llm.usage import usage_snapshot
-from app.orchestrator import manager
+from app.orchestrator import manager, public_worker_event
 from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import CaptureCleanupError, cleanup_evidence_spool
 from app.security import resolve_role, token_from_headers
@@ -44,7 +44,7 @@ _STREAM_IMPORTANT_KINDS = frozenset({
     "collector_phase",
     "fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked",
     "target_done", "target_requeued", "timeout", "auto_deepen", "salvage",
-    "coverage_reported", "site_followups_spawned",
+    "coverage_reported", "site_followups_spawned", "auth_status",
     "review_done", "review_deferred", "review_cancelled",
     "reclaim", "recover", "workers_cancelled", "quota_stop",
     "killsweep_done", "killsweep_dedup", "killsweep_error", "killsweep_cancelled",
@@ -251,6 +251,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         hunt_direction="" if observer else (t.hunt_direction or ""),
         src_rules="" if observer else (t.src_rules or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
+        auth_bindings=[] if observer else (t.auth_bindings or []),
         model_config_data=model_config,
         fofa_config=_observer_fofa_config(t) if observer else _public_fofa_config(t),
         search_enabled=bool(t.search_enabled),
@@ -346,6 +347,7 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
         src_rules=req.src_rules, target_source=req.target_source,
         engine=engine_name, fofa_query=req.fofa_query, hunt_direction=req.hunt_direction,
         manual_targets=req.manual_targets,
+        auth_bindings=req.auth_bindings,
         model_config_json=_new_task_model_config(req.model_config_data),
         fofa_config=fofa_cfg, concurrency=req.concurrency,
         status="created",
@@ -492,6 +494,8 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         task.engine = req.engine
     if req.manual_targets is not None:
         task.manual_targets = [t.strip() for t in req.manual_targets if str(t).strip()]
+    if req.auth_bindings is not None:
+        task.auth_bindings = [dict(item) for item in req.auth_bindings]
     if req.hunt_direction is not None:
         task.hunt_direction = req.hunt_direction
     if req.concurrency is not None:
@@ -744,6 +748,8 @@ def _target_dict(t: Target, observer: bool, finding_count: int = 0) -> dict:
         "queue_position": t.queue_position, "retry_count": t.retry_count,
         "deepen_count": t.deepen_count, "dead_reason": "" if observer else t.dead_reason,
         "last_error": "" if observer else t.last_error,
+        "auth_status": public_worker_event("auth_status", t.auth_status)
+        if t.auth_status else None,
         "finding_count": finding_count,
         "created_at": to_cst_iso(t.created_at),
         "updated_at": to_cst_iso(t.updated_at),

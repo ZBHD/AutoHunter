@@ -3,7 +3,9 @@ import { computed, reactive, ref, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "../components/VulnerabilityTypeSelector.vue";
+import AuthBindingsEditor from "../components/AuthBindingsEditor.vue";
 import { defaultVulnerabilityTypes } from "../vulnerabilityTypes.js";
+import { serializeAuthBindings, showAuthBindingsForSource } from "../authBindings.js";
 import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode } from "../taskSourceModes.js";
 
 const router = useRouter();
@@ -18,6 +20,7 @@ const form = reactive({
   fofa_query: "",
   intent_mode: "",
   manual_targets: "",
+  auth_bindings: [],
   src_rules: "",
   use_global_pool: true,
   base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
@@ -36,6 +39,7 @@ const isAutoMode = computed(() => isAutoSource(form.target_source));
 const isManualOnlyMode = computed(() => isManualOnly(form.target_source));
 const isFofaMode = computed(() => isFofaPoolMode(form.target_source, form.engine));
 const showManualTargets = computed(() => isManualOnlyMode.value || isSiteSource(form.target_source) || form.target_source === "both");
+const showAuthBindings = computed(() => showAuthBindingsForSource(form.target_source));
 
 function handleTargetSourceChange() {
   if (isSiteMode.value) form.site_recon_mode = "full";
@@ -84,6 +88,9 @@ async function submit() {
     fofa_query: isAutoMode.value || isSiteMode.value ? form.fofa_query : "",
     manual_targets: showManualTargets.value
       ? form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean)
+      : [],
+    auth_bindings: showAuthBindings.value
+      ? serializeAuthBindings(form.auth_bindings)
       : [],
     src_rules: form.src_rules,
     concurrency: parseInt(form.concurrency) || 3,
@@ -183,12 +190,13 @@ onMounted(async () => {
             ? (form.intent_mode === 'intent' ? '例：找某集团 OA/CRM/ERP/API/运维后台资产' : 'domain=&quot;example.com&quot; || cert=&quot;示例集团&quot; || org=&quot;示例集团&quot;')
             : (form.intent_mode === 'intent' ? '例：找全国高校的统一身份认证登录系统' : 'title=&quot;统一身份认证&quot; && domain=&quot;.edu.cn&quot;')" />
       </label>
-      <label v-else-if="isSiteMode">目标相关信息 / 协作重点 / 已有凭据
-        <textarea v-model="form.fofa_query" rows="4" placeholder="可写：重点方向、后台位置、以及【已有的登录凭据】。给了凭据 Agent 会先在前台测，再登录进系统内部深挖（越权/敏感数据/上传/写操作）。&#10;例：后台在 /admin，重点测 API、越权、上传。&#10;已有账号：test / Test@123&#10;或登录态：Cookie: JSESSIONID=xxxx（或 Authorization: Bearer xxxx）"></textarea>
+      <label v-else-if="isSiteMode">目标相关信息 / 协作重点
+        <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置和业务背景。例：后台在 /admin，重点测试 API、越权、上传和敏感写操作。"></textarea>
       </label>
       <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
         <textarea v-model="form.manual_targets" rows="3" :placeholder="isSiteMode ? 'https://target.example.com/' : 'http://target.example.com/'"></textarea>
       </label>
+      <AuthBindingsEditor v-if="showAuthBindings" v-model="form.auth_bindings" />
       <details :open="adv">
         <summary @click="adv = !adv">高级：模型{{ isFofaMode ? " / FOFA" : "" }} / 并发（留空用服务端默认）</summary>
         <div class="model-mode-switch" role="group" aria-label="任务模型来源">

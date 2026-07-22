@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime import COLLECTOR_IO_EXECUTOR
 from app.agents import collector_llm, playbook_router, prefilter, scorer, site_collab, target_filter
 from app.agents import target_cluster
+from app.agents.auth_bootstrap import resolve_auth_context_for_target
 from app.agents.prompts import is_enterprise_src
 from app.db.models import Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
@@ -434,8 +435,16 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
                     dead_reason=prefilter._SENSITIVE_SKIP_REASON,
                 ))
                 continue
-            session.add(Target(task_id=task.id, url=_ensure_url(host), host=host,
-                               source="manual", status="queued"))
+            session.add(Target(
+                task_id=task.id,
+                url=_ensure_url(host),
+                host=host,
+                source="manual",
+                status="queued",
+                auth_context=resolve_auth_context_for_target(
+                    task.auth_bindings, raw, task.manual_targets
+                ),
+            ))
             added += 1
         task.manual_targets = []  # 消费掉，避免重复
 
@@ -497,6 +506,9 @@ async def _site_collect(session: AsyncSession, task: Task) -> int:
                 status="queued",
                 priority_score=route.priority,
                 priority_reason=site_collab.route_reason(route),
+                auth_context=resolve_auth_context_for_target(
+                    task.auth_bindings, raw, raw_targets
+                ),
             ))
             added += 1
     return added
@@ -971,6 +983,9 @@ async def _fofa_collect(
             school=c.get("school", ""),
             priority_score=score, priority_reason=reason,
             leaked_creds=c.get("leaked_creds") or None,
+            auth_context=resolve_auth_context_for_target(
+                task.auth_bindings, c["url"], task.manual_targets
+            ),
         ))
         if cluster_item:
             cluster_item["pending"] += 1

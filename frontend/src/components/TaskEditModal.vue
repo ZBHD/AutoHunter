@@ -2,6 +2,12 @@
 import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "./VulnerabilityTypeSelector.vue";
+import AuthBindingsEditor from "./AuthBindingsEditor.vue";
+import {
+  hydrateAuthBindings,
+  serializeAuthBindings,
+  showAuthBindingsForSource,
+} from "../authBindings.js";
 import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode, fofaKeyPatch } from "../taskSourceModes.js";
 
 const props = defineProps({
@@ -57,6 +63,7 @@ const form = reactive({
   fofa_query: "",
   intent_mode: "",
   manual_targets: "",
+  auth_bindings: [],
   src_rules: "",
   use_global_pool: true,
   base_url: "",
@@ -88,6 +95,7 @@ const isAutoMode = computed(() => isAutoSource(form.target_source));
 const isManualOnlyMode = computed(() => isManualOnly(form.target_source));
 const isFofaMode = computed(() => isFofaPoolMode(form.target_source, form.engine));
 const showManualTargets = computed(() => isManualOnlyMode.value || isSiteSource(form.target_source) || form.target_source === "both");
+const showAuthBindings = computed(() => showAuthBindingsForSource(form.target_source));
 const dedicatedKeyRequired = computed(() => (
   !form.use_global_pool && (original.use_global_pool || !form.api_key_set)
 ));
@@ -120,6 +128,7 @@ function fill(task) {
   form.fofa_query = task.fofa_query || "";
   form.intent_mode = fofaCfg.intent_mode || "";
   form.manual_targets = (task.manual_targets || []).join("\n");
+  form.auth_bindings = hydrateAuthBindings(task.auth_bindings || []);
   form.src_rules = task.src_rules || "";
   form.use_global_pool = modelCfg.use_global_pool !== false;
   form.base_url = modelCfg.base_url || "";
@@ -204,6 +213,7 @@ async function save() {
     manual_targets: showManualTargets.value
       ? form.manual_targets.split("\n").map((s) => s.trim()).filter(Boolean)
       : [],
+    auth_bindings: serializeAuthBindings(form.auth_bindings),
     src_rules: form.src_rules,
     concurrency: parseInt(form.concurrency) || 3,
     model_config_data: modelConfig,
@@ -283,12 +293,13 @@ async function save() {
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
       </label>
         <label v-if="isAutoMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
-        <label v-else-if="isSiteMode">目标相关信息 / 协作重点 / 已有凭据
-        <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置，以及【已有的登录凭据】。给了凭据 Agent 会先前台测、再登录进系统内部深挖。&#10;例：后台在 /admin；已有账号 test / Test@123；或 Cookie: JSESSIONID=xxxx"></textarea>
+        <label v-else-if="isSiteMode">目标相关信息 / 协作重点
+        <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置和业务背景。例：后台在 /admin，重点测试 API、越权、上传和敏感写操作。"></textarea>
       </label>
         <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
         <textarea v-model="form.manual_targets" rows="3"></textarea>
       </label>
+      <AuthBindingsEditor v-if="showAuthBindings" v-model="form.auth_bindings" />
 
       <details open>
         <summary>高级：模型{{ isFofaMode ? " / FOFA" : "" }}</summary>
