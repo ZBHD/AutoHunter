@@ -55,6 +55,7 @@ class Task(Base):
     fofa_query: Mapped[str] = mapped_column(Text, default="")
     hunt_direction: Mapped[str] = mapped_column(Text, default="")
     manual_targets: Mapped[list] = mapped_column(JSON, default=list)
+    auth_bindings: Mapped[list] = mapped_column(JSON, default=list)
     model_config_json: Mapped[dict] = mapped_column("model_config", JSON, default=dict)
     fofa_config: Mapped[dict] = mapped_column(JSON, default=dict)       # keys/max_pages/page_size/cursor
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -105,6 +106,8 @@ class Target(Base):
     deepen_count: Mapped[int] = mapped_column(Integer, default=0)
     # 搜集阶段顺带查到的、过滤打分后的该域泄露凭证（喂给 worker 作额外攻击面）。
     leaked_creds: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    auth_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    auth_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # 通杀派生目标所属案例；人工否定时只取消该案例尚未执行的目标。
     killsweep_case_id: Mapped[str | None] = mapped_column(
         ForeignKey("killsweeps.id", ondelete="SET NULL"), nullable=True, index=True,

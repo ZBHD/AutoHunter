@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.dto import ModelConfigDTO, PartialModelConfigDTO
-from app.db.models import Base, Task
+from app.db.models import Base, Target, Task
 from app.db.session import get_session
 
 
@@ -121,6 +121,13 @@ async def _stored_hunt_direction(session_maker, task_id: str) -> str:
         task = await session.get(Task, task_id)
         assert task is not None
         return task.hunt_direction
+
+
+async def _stored_auth_bindings(session_maker, task_id: str) -> list[dict]:
+    async with session_maker() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        return list(task.auth_bindings or [])
 
 
 async def _stored_fofa_config(session_maker, task_id: str) -> dict:
@@ -331,6 +338,142 @@ def test_create_task_persists_and_returns_global_pool_default(task_api) -> None:
     assert asyncio.run(_stored_model_config(session_maker, body["id"])) == {
         "use_global_pool": True
     }
+
+
+def test_task_api_persists_returns_and_updates_auth_bindings(task_api) -> None:
+    client, session_maker = task_api
+    initial = [{
+        "target": "portal.example",
+        "username": "alice",
+        "password": "secret-1",
+        "login_url": "https://portal.example/sign-in",
+    }]
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Authenticated task", "target_source": "manual", "auth_bindings": initial},
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    assert created.json()["auth_bindings"] == initial
+    assert asyncio.run(_stored_auth_bindings(session_maker, task_id)) == initial
+
+    updated = [{"target": "portal.example", "cookie": "sid=secret-2"}]
+    patched = client.patch(
+        f"/api/tasks/{task_id}", json={"auth_bindings": updated}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["auth_bindings"] == updated
+    assert asyncio.run(_stored_auth_bindings(session_maker, task_id)) == updated
+
+    observer = client.get(
+        f"/api/tasks/{task_id}", headers={"Authorization": "Bearer observer-token"}
+    )
+    assert observer.status_code == 200
+    assert observer.json()["auth_bindings"] == []
+
+
+def test_readonly_task_api_does_not_return_auth_secrets(task_api, monkeypatch) -> None:
+    client, _session_maker = task_api
+    monkeypatch.setenv("AUTOHUNTER_READ_TOKEN", "readonly-token")
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Readonly redaction",
+            "target_source": "manual",
+            "auth_bindings": [{
+                "target": "portal.example",
+                "username": "alice",
+                "password": "secret-password",
+                "cookie": "sid=secret-cookie",
+                "authorization": "Bearer secret-token",
+                "raw": "raw-secret",
+            }],
+        },
+    ).json()
+
+    response = client.get(
+        f"/api/tasks/{created['id']}",
+        headers={"Authorization": "Bearer readonly-token"},
+    )
+
+    assert response.status_code == 200
+    serialized = response.text
+    for secret in (
+        "alice", "secret-password", "secret-cookie", "secret-token", "raw-secret"
+    ):
+        assert secret not in serialized
+    assert response.json()["auth_bindings"] == []
+
+
+def test_updating_auth_bindings_clears_legacy_target_snapshot(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Credential refresh",
+            "target_source": "manual",
+            "auth_bindings": [{"target": "portal.example", "password": "old-secret"}],
+        },
+    ).json()
+
+    async def add_target_with_snapshot() -> None:
+        async with session_maker() as session:
+            session.add(Target(
+                id="legacy-auth-snapshot",
+                task_id=created["id"],
+                url="https://portal.example",
+                host="portal.example",
+                auth_context={"password": "old-secret"},
+            ))
+            await session.commit()
+
+    asyncio.run(add_target_with_snapshot())
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"auth_bindings": [{"target": "portal.example", "password": "new-secret"}]},
+    )
+    assert response.status_code == 200
+
+    async def stored_snapshot():
+        async with session_maker() as session:
+            target = await session.get(Target, "legacy-auth-snapshot")
+            return target.auth_context
+
+    assert asyncio.run(stored_snapshot()) is None
+
+
+def test_query_only_patch_resets_collector_terminal_state(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={"name": "Query reset", "fofa_query": 'domain="old.example"'},
+    ).json()
+
+    async def mark_exhausted() -> None:
+        async with session_maker() as session:
+            task = await session.get(Task, created["id"])
+            task.fofa_config = {
+                "current_query": 'domain="old.example"',
+                "cursor": 20,
+                "engine_exhausted": True,
+                "engine_cursor": "old-cursor",
+            }
+            await session.commit()
+
+    asyncio.run(mark_exhausted())
+    response = client.patch(
+        f"/api/tasks/{created['id']}",
+        json={"fofa_query": 'domain="new.example"'},
+    )
+    assert response.status_code == 200, response.text
+
+    async def stored_config() -> dict:
+        async with session_maker() as session:
+            task = await session.get(Task, created["id"])
+            return dict(task.fofa_config or {})
+
+    assert asyncio.run(stored_config()) == {"cursor": 0, "history": []}
 
 
 def test_create_task_trims_and_persists_hunt_direction(task_api) -> None:

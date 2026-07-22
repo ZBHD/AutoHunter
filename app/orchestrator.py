@@ -29,6 +29,7 @@ from app.agents import playbook_router
 from app.agents import prefilter
 from app.agents import site_collab
 from app.agents import target_cluster
+from app.agents.auth_bootstrap import resolve_auth_context_for_target
 from app.agents.depth_policy import depth_policy_for
 from app.agents.prompts import is_enterprise_src, should_escalate
 from app.agents.reviewer import Reviewer
@@ -174,6 +175,29 @@ def _public_src_lead_summary(value: object) -> dict:
 
 def public_worker_event(kind: str, data: dict) -> dict:
     """Project private tool-capture events before they reach the live event bus."""
+    if kind == "auth_status":
+        payload = dict(data or {})
+        allowed_statuses = {"unused", "injected", "login_ok", "login_fail"}
+        allowed_kinds = {"cookie", "bearer", "password"}
+        status = str(payload.get("status") or "unused")
+        return {
+            "used": bool(payload.get("used")),
+            "matched": bool(payload.get("matched")),
+            "status": status if status in allowed_statuses else "unused",
+            "kinds": [
+                str(item) for item in (payload.get("kinds") or [])
+                if str(item) in allowed_kinds
+            ][:3],
+            "matched_by": str(payload.get("matched_by") or "")[:20],
+            "binding_target": str(payload.get("binding_target") or "")[:300],
+            "reason": str(payload.get("reason") or "")[:300],
+            "cookie_names": [
+                str(item)[:100] for item in (payload.get("cookie_names") or [])
+            ][:30],
+            "header_names": [
+                str(item)[:100] for item in (payload.get("header_names") or [])
+            ][:20],
+        }
     if kind != "tool_capture_private":
         return dict(data or {})
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
@@ -2019,6 +2043,10 @@ class TaskRunner:
                     st["site_route"] = data["site_route"]
                 if "site_recon_mode" in data:
                     st["site_recon_mode"] = data["site_recon_mode"]
+            elif kind == "auth_status":
+                st["auth_status"] = str(data.get("status") or "unused")
+                st["auth_kinds"] = list(data.get("kinds") or [])
+                st["action"] = f"登录状态：{st['auth_status']}"
 
         def emit(kind: str, data: dict):
             if kind == "tool_capture_private":
@@ -2064,6 +2092,30 @@ class TaskRunner:
                 if not cancel_event.is_set():
                     loop.call_soon_threadsafe(_publish_private_projection)
                 return
+            if kind == "auth_status":
+                data = public_worker_event(kind, data)
+                future = schedule_private_persistence(
+                    loop,
+                    self._persist_target_auth_status(task_id, target_id, data),
+                    private_persist_tasks,
+                    private_persist_lock,
+                )
+
+                def _auth_status_done(done) -> None:
+                    with private_persist_lock:
+                        private_persist_tasks.discard(done)
+                    try:
+                        exc = done.exception()
+                    except Exception:
+                        return
+                    if exc is not None:
+                        logger.warning(
+                            "auth status persistence failed target=%s: %r",
+                            target_id[:8],
+                            exc,
+                        )
+
+                future.add_done_callback(_auth_status_done)
             if cancel_event.is_set():
                 return
             # 线程内回调 → 投递到事件循环（更新活态 + 推送看板）
@@ -2098,6 +2150,7 @@ class TaskRunner:
         fofa_key = ""
         fofa_base_url = ""
         fofa_router = None
+        auth_context: dict | None = None
         async with SessionLocal() as session:
             tgt = await session.get(Target, target_id)
             task_obj = await session.get(Task, task_id)
@@ -2120,6 +2173,11 @@ class TaskRunner:
                     "source": tgt.source or "", "priority_reason": tgt.priority_reason or "",
                     "leaked_creds": tgt.leaked_creds or [],
                 }
+                auth_context = resolve_auth_context_for_target(
+                    task_obj.auth_bindings if task_obj else [],
+                    tgt.url or url,
+                    task_obj.manual_targets if task_obj else [],
+                )
                 try:
                     plan = playbook_router.route_target(
                         url=tgt.url or url,
@@ -2189,7 +2247,8 @@ class TaskRunner:
                             cancel_event=cancel_event, src_type=src_type,
                             fofa_key=fofa_key, fofa_base_url=fofa_base_url,
                             fofa_router=fofa_router,
-                            prompt_version=prompt_version)
+                            prompt_version=prompt_version,
+                            auth_context=auth_context)
             worker_holder["worker"] = worker
             try:
                 return worker.run().model_dump(mode="json")
@@ -2370,6 +2429,28 @@ class TaskRunner:
                 str(final_result.get("error") or ""),
                 signal_id=missed_signal_id,
             )
+
+    async def _persist_target_auth_status(
+        self,
+        task_id: str,
+        target_id: str,
+        data: dict,
+    ) -> None:
+        safe_status = public_worker_event("auth_status", data)
+        async with SessionLocal() as session:
+            target = await session.get(Target, target_id)
+            if target is None or target.task_id != task_id:
+                return
+            target.auth_status = safe_status
+            session.add(TaskEvent(
+                task_id=task_id,
+                agent="worker",
+                kind="auth_status",
+                level="warn" if safe_status["status"] == "login_fail" else "info",
+                message=f"目标登录状态：{safe_status['status']}",
+                payload={"target_id": target_id, **safe_status},
+            ))
+            await session.commit()
 
     async def _persist_worker_tool_event(
         self,
@@ -3820,6 +3901,7 @@ class TaskRunner:
         )).scalar_one_or_none()
         if exists:
             return False
+        task = await session.get(Task, task_id)
         try:
             async with session.begin_nested():
                 session.add(Target(

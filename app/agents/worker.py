@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlparse, urlsplit
 from pydantic import ValidationError
 
 from app.agents import site_collab
+from app.agents.auth_bootstrap import bootstrap_auth, user_auth_prompt_block
 from app.agents.history import bounded_tool_content, compact_messages
 from app.agents.src_leads import (
     Lead,
@@ -66,6 +67,7 @@ class Worker:
         fofa_base_url: str = "",
         fofa_router: FofaKeyRouter | None = None,
         prompt_version: str | None = None,
+        auth_context: Optional[dict] = None,
     ):
         self.target = target
         self.llm = llm
@@ -73,6 +75,7 @@ class Worker:
         self.src_type = src_type
         self._enterprise = is_enterprise_src(src_type)
         self.prompt_version = normalize_worker_prompt_version(prompt_version or worker_config.prompt_version)
+        self.auth_context = dict(auth_context or {}) or None
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
             enterprise=self._enterprise, fofa_key=fofa_key, fofa_base_url=fofa_base_url,
@@ -472,9 +475,16 @@ class Worker:
     def run(self) -> WorkerResult:
         start_event = {"target": self.target, "prompt_version": self.prompt_version}
         start_event.update(self._site_event_metadata())
+        auth_block = ""
+        if self.auth_context:
+            auth_attempt = bootstrap_auth(self.executor, self.auth_context, self.target)
+            auth_event = auth_attempt.as_event()
+            self._emit("auth_status", **auth_event)
+            auth_block = user_auth_prompt_block(self.auth_context, auth_event)
         if self.deepen_context:
             user_content = (
-                self._intel_block()
+                auth_block
+                + self._intel_block()
                 + self._duplicate_block()
                 + self._deepen_brief()
                 + self._hunt_direction_block()
@@ -482,7 +492,8 @@ class Worker:
             start_event["mode"] = "deepen"
         else:
             user_content = (
-                self._intel_block()
+                auth_block
+                + self._intel_block()
                 + self._duplicate_block()
                 + f"目标：{self.target}\n\n"
                 + self._hunt_direction_block()

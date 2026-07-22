@@ -11,6 +11,7 @@ from app.llm.protocols import (
     OpenAIResponsesAdapter,
     ToolCall,
     UsageInfo,
+    coerce_response_payload,
 )
 
 
@@ -131,6 +132,43 @@ def test_openai_chat_handles_missing_choices(choices) -> None:
     response = OpenAIChatAdapter().parse_response({"choices": choices})
 
     assert response == LLMResponse()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"choices":[{"message":{"content":"json text"}}]}', "json text"),
+        ("plain text", "plain text"),
+        (
+            'data: {"choices":[{"message":{"content":"sse text"}}]}\ndata: [DONE]',
+            "sse text",
+        ),
+    ],
+)
+def test_openai_chat_coerces_nonstandard_payloads(raw: str, expected: str) -> None:
+    normalized = coerce_response_payload(raw, "openai_chat")
+
+    assert OpenAIChatAdapter().parse_response(normalized).content == expected
+
+
+def test_openai_chat_coerces_content_blocks_and_object_arguments() -> None:
+    normalized = coerce_response_payload({
+        "choices": [{
+            "message": {
+                "content": [{"type": "text", "text": "checking"}],
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {"name": "lookup", "arguments": {"query": "alpha"}},
+                }],
+            },
+        }],
+    }, "openai_chat")
+    response = OpenAIChatAdapter().parse_response(normalized)
+
+    assert response.content == "checking"
+    assert response.tool_calls == [
+        ToolCall(id="call-1", name="lookup", arguments='{"query": "alpha"}')
+    ]
 
 
 def test_anthropic_uses_native_key_and_merges_adjacent_roles() -> None:

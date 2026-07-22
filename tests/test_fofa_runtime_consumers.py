@@ -430,6 +430,118 @@ def test_collector_transient_keeps_page_and_does_not_rotate(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_collector_translates_non_fofa_query_and_persists_engine_cursor(monkeypatch):
+    async def scenario():
+        from app.agents import collector
+
+        calls = []
+
+        class Engine:
+            display_name = "Hunter"
+
+            async def search(
+                self, key, query, page, page_size, base_url=None, cursor=None
+            ):
+                calls.append({
+                    "key": key,
+                    "query": query,
+                    "page": page,
+                    "page_size": page_size,
+                    "base_url": base_url,
+                    "cursor": cursor,
+                })
+                next_engine_cursor = "cursor-next" if len(calls) == 1 else None
+                return SimpleNamespace(
+                    fields=["host"], results=[], next_cursor=next_engine_cursor
+                )
+
+        monkeypatch.setattr(collector, "get_engine", lambda name: Engine())
+        monkeypatch.setattr(collector, "resolve_engine_config", lambda task: {
+            "engine": "hunter",
+            "key": "hunter-key",
+            "base_url": "https://hunter.example",
+            "max_pages": 5,
+            "page_size": 10,
+        })
+        monkeypatch.setattr(collector, "_llm_for_task", lambda task: None)
+        task = SimpleNamespace(
+            id=1,
+            fofa_config={
+                "current_query": 'domain=".example.com"',
+                "translated_query": 'domain.suffix="example.com"',
+                "engine_cursor": "cursor-current",
+                "cursor": 0,
+            },
+            src_type="edusrc",
+            fofa_query="",
+        )
+        session = SimpleNamespace(add=lambda obj: None)
+
+        await collector._fofa_collect(session, task, set(), {}, None)
+
+        assert calls[0]["query"] == 'domain.suffix="example.com"'
+        assert calls[0]["cursor"] == "cursor-current"
+        assert task.fofa_config["engine_cursor"] == "cursor-next"
+        assert task.fofa_config["translated_query"] == 'domain.suffix="example.com"'
+
+        task.fofa_config["current_query"] = 'title="portal"'
+        await collector._fofa_collect(session, task, set(), {}, None)
+
+        assert calls[1]["query"] == 'web.title="portal"'
+        assert calls[1]["cursor"] is None
+        assert "engine_cursor" not in task.fofa_config
+        assert task.fofa_config["translated_query"] == 'web.title="portal"'
+
+    asyncio.run(scenario())
+
+
+def test_censys_without_next_cursor_exhausts_current_query(monkeypatch):
+    async def scenario():
+        from app.agents import collector
+
+        calls = []
+
+        class Engine:
+            display_name = "Censys"
+
+            async def search(
+                self, key, query, page, page_size, base_url=None, cursor=None
+            ):
+                calls.append({"page": page, "cursor": cursor})
+                return SimpleNamespace(fields=["host"], results=[], next_cursor=None)
+
+        monkeypatch.setattr(collector, "get_engine", lambda name: Engine())
+        monkeypatch.setattr(collector, "resolve_engine_config", lambda task: {
+            "engine": "censys",
+            "key": "censys-key",
+            "base_url": "https://search.censys.io",
+            "max_pages": 5,
+            "page_size": 10,
+        })
+        monkeypatch.setattr(collector, "_llm_for_task", lambda task: None)
+        task = SimpleNamespace(
+            id=1,
+            fofa_config={"current_query": 'domain="example.com"', "cursor": 0},
+            src_type="edusrc",
+            fofa_query='domain="example.com"',
+        )
+
+        await collector._fofa_collect(
+            SimpleNamespace(add=lambda obj: None), task, set(), {}, None
+        )
+
+        assert calls == [{"page": 1, "cursor": None}]
+        assert task.fofa_config["cursor"] == 5
+        assert "engine_cursor" not in task.fofa_config
+
+        await collector._fofa_collect(
+            SimpleNamespace(add=lambda obj: None), task, set(), {}, None
+        )
+        assert calls == [{"page": 1, "cursor": None}]
+
+    asyncio.run(scenario())
+
+
 def test_collector_terminal_pool_marker_is_safe(monkeypatch):
     async def scenario():
         from app.agents import collector

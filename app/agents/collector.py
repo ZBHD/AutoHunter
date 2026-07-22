@@ -26,9 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime import COLLECTOR_IO_EXECUTOR
 from app.agents import collector_llm, playbook_router, prefilter, scorer, site_collab, target_filter
 from app.agents import target_cluster
+from app.agents.auth_bootstrap import resolve_auth_context_for_target
 from app.agents.prompts import is_enterprise_src
 from app.db.models import Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
+from app.engines.translator import translate_fofa_query
 from app.tools.leakcreds import query_leaked_creds
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.fofa.client import FofaError
@@ -433,8 +435,13 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
                     dead_reason=prefilter._SENSITIVE_SKIP_REASON,
                 ))
                 continue
-            session.add(Target(task_id=task.id, url=_ensure_url(host), host=host,
-                               source="manual", status="queued"))
+            session.add(Target(
+                task_id=task.id,
+                url=_ensure_url(host),
+                host=host,
+                source="manual",
+                status="queued",
+            ))
             added += 1
         task.manual_targets = []  # 消费掉，避免重复
 
@@ -532,6 +539,12 @@ async def _fofa_collect(
     cur_query = cfg.get("current_query", "")
     cursor = int(cfg.get("cursor", 0))
 
+    if cfg.get("engine_exhausted") and cur_query:
+        cfg["collector_phase"] = "query_exhausted"
+        cfg["collector_phase_text"] = "当前查询已耗尽，等待新查询"
+        task.fofa_config = {**cfg}
+        return 0
+
     # 当前语法翻完了（或还没语法）→ 换/生成新语法
     if not cur_query or cursor >= max_pages:
         new_q, reason = await _resolve_query(task, llm)
@@ -539,6 +552,8 @@ async def _fofa_collect(
             return 0
         cur_query = new_q
         cursor = 0
+        cfg.pop("engine_exhausted", None)
+        cfg.pop("engine_cursor", None)
         if new_q not in history:
             history.append(new_q)
 
@@ -698,8 +713,20 @@ async def _fofa_collect(
         _clear_fofa_error_diagnostics(cfg)
     try:
         if engine_name != "fofa":
-            res = await engine.search(key, cur_query, page=next_cursor, page_size=size,
-                                      base_url=base_url)
+            native_query = translate_fofa_query(cur_query, engine_name)
+            engine_cursor = cfg.get("engine_cursor") or None
+            if cfg.get("translated_query") != native_query:
+                engine_cursor = None
+                cfg.pop("engine_cursor", None)
+            cfg["translated_query"] = native_query
+            search_kwargs = {
+                "page": next_cursor,
+                "page_size": size,
+                "base_url": base_url,
+            }
+            if engine_cursor:
+                search_kwargs["cursor"] = engine_cursor
+            res = await engine.search(key, native_query, **search_kwargs)
     except QuakeRateLimitError as e:
         # Quake 专用限流异常
         err = f"{e}"[:300]
@@ -766,6 +793,17 @@ async def _fofa_collect(
         return 0
     cursor = next_cursor
     if engine_name != "fofa":
+        next_engine_cursor = getattr(res, "next_cursor", None)
+        if next_engine_cursor:
+            cfg["engine_cursor"] = next_engine_cursor
+        else:
+            cfg.pop("engine_cursor", None)
+            if engine_name == "censys":
+                # Censys is cursor-based.  Without a next link, incrementing
+                # the generic page counter would issue another request without
+                # a cursor and restart at page one.
+                cursor = max_pages
+                cfg["engine_exhausted"] = True
         cfg["fofa_auth_fail_count"] = 0
         cfg["rate_limit_count"] = 0  # 成功请求重置限流计数
         cfg.pop("rate_limit_until", None)

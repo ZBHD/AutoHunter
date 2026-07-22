@@ -128,6 +128,95 @@ def test_old_targets_table_gains_nullable_queue_position_without_data_loss() -> 
     asyncio.run(scenario())
 
 
+def test_old_task_and_target_tables_gain_auth_columns_without_data_loss() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                other_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name not in {"tasks", "targets"}
+                ]
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.create_all(
+                        sync_conn, tables=other_tables
+                    )
+                )
+                await conn.exec_driver_sql(
+                    "CREATE TABLE tasks (id VARCHAR(32) PRIMARY KEY, name VARCHAR(200) NOT NULL)"
+                )
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE targets (
+                        id VARCHAR(32) PRIMARY KEY,
+                        task_id VARCHAR(32) NOT NULL,
+                        url VARCHAR(500) NOT NULL,
+                        host VARCHAR(255) NOT NULL
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    "INSERT INTO tasks (id, name) VALUES ('legacy-auth-task', 'Legacy')"
+                )
+                await conn.exec_driver_sql(
+                    """INSERT INTO targets (id, task_id, url, host)
+                       VALUES ('legacy-auth-target', 'legacy-auth-task',
+                               'https://legacy.test', 'legacy.test')"""
+                )
+
+                await _auto_migrate(conn)
+
+                task_columns = await conn.exec_driver_sql("PRAGMA table_info(tasks)")
+                target_columns = await conn.exec_driver_sql("PRAGMA table_info(targets)")
+                assert "auth_bindings" in {row[1] for row in task_columns.fetchall()}
+                assert {"auth_context", "auth_status"} <= {
+                    row[1] for row in target_columns.fetchall()
+                }
+                task_row = await conn.exec_driver_sql(
+                    "SELECT id, auth_bindings FROM tasks WHERE id='legacy-auth-task'"
+                )
+                target_row = await conn.exec_driver_sql(
+                    "SELECT id, auth_context, auth_status FROM targets "
+                    "WHERE id='legacy-auth-target'"
+                )
+                assert task_row.one() == ("legacy-auth-task", "[]")
+                assert target_row.one() == ("legacy-auth-target", None, None)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_auth_context_migration_removes_legacy_target_secret_snapshots() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                session = AsyncSession(bind=conn, expire_on_commit=False)
+                session.add(Task(
+                    id="auth-task", name="Auth task", target_source="manual",
+                ))
+                session.add(Target(
+                    id="auth-target", task_id="auth-task",
+                    url="https://portal.example", host="portal.example",
+                    auth_context={"password": "legacy-secret"},
+                ))
+                await session.flush()
+                await session.close()
+
+                await _auto_migrate(conn)
+
+                row = await conn.exec_driver_sql(
+                    "SELECT auth_context FROM targets WHERE id='auth-target'"
+                )
+                assert row.scalar_one() is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_system_settings_table_gains_provider_pool_column() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

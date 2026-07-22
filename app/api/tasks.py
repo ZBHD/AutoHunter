@@ -18,7 +18,7 @@ from app.db.models import (
 from app.db.session import get_session
 from app.fofa.runtime import public_runtime_summary
 from app.llm.usage import usage_snapshot
-from app.orchestrator import manager
+from app.orchestrator import manager, public_worker_event
 from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import CaptureCleanupError, cleanup_evidence_spool
 from app.security import resolve_role, token_from_headers
@@ -44,7 +44,7 @@ _STREAM_IMPORTANT_KINDS = frozenset({
     "collector_phase",
     "fofa_key_rotated", "fofa_pool_waiting", "fofa_pool_blocked",
     "target_done", "target_requeued", "timeout", "auto_deepen", "salvage",
-    "coverage_reported", "site_followups_spawned",
+    "coverage_reported", "site_followups_spawned", "auth_status",
     "review_done", "review_deferred", "review_cancelled",
     "reclaim", "recover", "workers_cancelled", "quota_stop",
     "killsweep_done", "killsweep_dedup", "killsweep_error", "killsweep_cancelled",
@@ -62,6 +62,10 @@ def _stream_event_visible(kind: str, level: str) -> bool:
 
 def _is_observer(request: Request | None) -> bool:
     return bool(request and resolve_role(token_from_headers(request.headers)) == "observer")
+
+
+def _is_readonly(request: Request | None) -> bool:
+    return bool(request and resolve_role(token_from_headers(request.headers)) == "readonly")
 
 
 def _observer_model_config() -> dict:
@@ -240,7 +244,8 @@ def _public_fofa_config(task: Task) -> dict:
 
 
 def _task_to_dto(t: Task, stats: TaskStats | None = None,
-                 pending_user_review: int = 0, observer: bool = False) -> TaskResponse:
+                 pending_user_review: int = 0, observer: bool = False,
+                 redact_auth: bool = False) -> TaskResponse:
     model_config = _public_model_config(t)
     if observer:
         model_config = _observer_model_config()
@@ -251,6 +256,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         hunt_direction="" if observer else (t.hunt_direction or ""),
         src_rules="" if observer else (t.src_rules or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
+        auth_bindings=[] if observer or redact_auth else (t.auth_bindings or []),
         model_config_data=model_config,
         fofa_config=_observer_fofa_config(t) if observer else _public_fofa_config(t),
         search_enabled=bool(t.search_enabled),
@@ -346,6 +352,7 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
         src_rules=req.src_rules, target_source=req.target_source,
         engine=engine_name, fofa_query=req.fofa_query, hunt_direction=req.hunt_direction,
         manual_targets=req.manual_targets,
+        auth_bindings=req.auth_bindings,
         model_config_json=_new_task_model_config(req.model_config_data),
         fofa_config=fofa_cfg, concurrency=req.concurrency,
         status="created",
@@ -370,7 +377,15 @@ async def list_tasks(request: Request, session: AsyncSession = Depends(get_sessi
     for tid, cnt in pr_rows.all():
         pending_map[tid] = cnt
     observer = _is_observer(request)
-    return [_task_to_dto(t, pending_user_review=pending_map.get(t.id, 0), observer=observer) for t in tasks]
+    return [
+        _task_to_dto(
+            t,
+            pending_user_review=pending_map.get(t.id, 0),
+            observer=observer,
+            redact_auth=_is_readonly(request),
+        )
+        for t in tasks
+    ]
 
 
 @router.get("/hard-targets")
@@ -458,7 +473,9 @@ async def get_task(task_id: str, request: Request, session: AsyncSession = Depen
     if not task:
         raise HTTPException(404, "任务不存在")
     stats = await _compute_stats(session, task_id)
-    return _task_to_dto(task, stats, observer=_is_observer(request))
+    return _task_to_dto(
+        task, stats, observer=_is_observer(request), redact_auth=_is_readonly(request)
+    )
 
 
 @router.patch("/{task_id}", response_model=TaskResponse)
@@ -468,6 +485,7 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         raise HTTPException(404, "任务不存在")
 
     previous_target_source = task.target_source
+    auth_bindings_changed = False
     site_recon_mode_supplied = (
         req.fofa_config is not None
         and "site_recon_mode" in req.fofa_config.model_fields_set
@@ -492,6 +510,9 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         task.engine = req.engine
     if req.manual_targets is not None:
         task.manual_targets = [t.strip() for t in req.manual_targets if str(t).strip()]
+    if req.auth_bindings is not None:
+        task.auth_bindings = [dict(item) for item in req.auth_bindings]
+        auth_bindings_changed = True
     if req.hunt_direction is not None:
         task.hunt_direction = req.hunt_direction
     if req.concurrency is not None:
@@ -529,10 +550,17 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         if "site_recon_mode" in patch and patch["site_recon_mode"] is not None:
             cfg["site_recon_mode"] = patch["site_recon_mode"]
             cfg.pop("skip_site_recon", None)
-        if req.fofa_query is not None and req.fofa_query != old_query:
-            cfg.pop("current_query", None)
-            cfg["cursor"] = 0
-            cfg["history"] = []
+        task.fofa_config = cfg
+
+    if req.fofa_query is not None and req.fofa_query != old_query:
+        # Query changes must reset collector state even when the patch omits
+        # the optional engine/FOFA configuration object.
+        cfg = dict(task.fofa_config or {})
+        cfg.pop("current_query", None)
+        cfg.pop("engine_exhausted", None)
+        cfg.pop("engine_cursor", None)
+        cfg["cursor"] = 0
+        cfg["history"] = []
         task.fofa_config = cfg
 
     # Apply the engine-specific patch last so a new engine key wins over a
@@ -555,6 +583,15 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         cfg["site_recon_mode"] = site_collab.SITE_RECON_FULL
         cfg.pop("skip_site_recon", None)
         task.fofa_config = cfg
+
+    if auth_bindings_changed:
+        # Credentials are task-owned.  Clear legacy per-target snapshots so a
+        # queued target cannot retain a removed or replaced secret.
+        await session.execute(
+            update(Target)
+            .where(Target.task_id == task_id)
+            .values(auth_context=None)
+        )
 
     await session.commit()
     await session.refresh(task)
@@ -744,6 +781,8 @@ def _target_dict(t: Target, observer: bool, finding_count: int = 0) -> dict:
         "queue_position": t.queue_position, "retry_count": t.retry_count,
         "deepen_count": t.deepen_count, "dead_reason": "" if observer else t.dead_reason,
         "last_error": "" if observer else t.last_error,
+        "auth_status": public_worker_event("auth_status", t.auth_status)
+        if t.auth_status else None,
         "finding_count": finding_count,
         "created_at": to_cst_iso(t.created_at),
         "updated_at": to_cst_iso(t.updated_at),

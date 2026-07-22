@@ -14,6 +14,7 @@ class EngineResult:
     size: int = 0
     page: int = 1
     engine: str = ""
+    next_cursor: str | None = None
 
 
 class SearchEngine(ABC):
@@ -45,6 +46,7 @@ class SearchEngine(ABC):
         page: int = 1,
         page_size: int = 100,
         base_url: str | None = None,
+        cursor: str | None = None,
     ) -> EngineResult:
         """执行搜索，返回统一格式的 EngineResult。"""
         ...

@@ -59,6 +59,8 @@ _MIGRATIONS = [
     ("targets", "deepen_context", "JSON"),
     ("targets", "deepen_count", "INTEGER DEFAULT 0"),
     ("targets", "leaked_creds", "JSON"),
+    ("targets", "auth_context", "JSON"),
+    ("targets", "auth_status", "JSON"),
     ("targets", "dead_reason", "VARCHAR(300) DEFAULT ''"),
     ("targets", "last_error", "VARCHAR(500) DEFAULT ''"),
     ("targets", "school", "VARCHAR(200) DEFAULT ''"),
@@ -73,6 +75,7 @@ _MIGRATIONS = [
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
     ("tasks", "hunt_direction", "TEXT DEFAULT ''"),
     ("tasks", "search_enabled", "BOOLEAN DEFAULT 1"),
+    ("tasks", "auth_bindings", "JSON DEFAULT '[]'"),
     ("targets", "killsweep_case_id", "VARCHAR(32)"),
     ("killsweeps", "automatic_verdict", "VARCHAR(20) DEFAULT 'pending_validation'"),
     ("killsweeps", "manual_verdict", "VARCHAR(20)"),
@@ -332,6 +335,20 @@ async def _run_schema_migrations(conn) -> None:
         )
         """
     )
+
+    auth_snapshot_migration = "20260722_task_auth_single_source_v1"
+    auth_row = await conn.exec_driver_sql(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        (auth_snapshot_migration,),
+    )
+    if auth_row.first() is None:
+        # auth_context used to duplicate task credentials on every target.
+        # Runtime now resolves from Task.auth_bindings at dispatch time.
+        await conn.exec_driver_sql("UPDATE targets SET auth_context = NULL")
+        await conn.exec_driver_sql(
+            "INSERT INTO schema_migrations (name) VALUES (?)",
+            (auth_snapshot_migration,),
+        )
 
     migration = "20260714_killsweep_operations_v1"
     row = await conn.exec_driver_sql(

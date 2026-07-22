@@ -1105,6 +1105,15 @@ function siteReconModeLabel(item) {
   if (item?.site_route !== "site_map") return "";
   return item.site_recon_mode === "light" ? "轻量入口盘点" : "完整入口盘点";
 }
+
+function authStatusLabel(status) {
+  return ({
+    injected: "会话已注入",
+    login_ok: "登录成功",
+    login_fail: "登录失败",
+    unused: "未使用凭据",
+  })[String(status || "")] || "";
+}
 </script>
 
 <template>
@@ -1363,6 +1372,8 @@ function siteReconModeLabel(item) {
           <div class="wc-top">
             <span class="wc-host">{{ w.host }}</span>
             <span v-if="siteReconModeLabel(w)" class="wc-recon-mode">{{ siteReconModeLabel(w) }}</span>
+            <span v-if="authStatusLabel(w.auth_status)" class="wc-auth-status"
+              :class="`is-${w.auth_status}`">{{ authStatusLabel(w.auth_status) }}</span>
             <span class="wc-meta">
               <span v-if="w.score > 0" class="wc-score" :title="w.score_reason">★{{ w.score }}</span>
               第 {{ w.round }} 轮 · {{ elapsed(w.started_at) }}
