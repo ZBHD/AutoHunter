@@ -50,7 +50,7 @@ def test_litellm_mode_rejects_unknown_fields_and_profiles() -> None:
 
 
 @pytest.fixture
-def task_api(tmp_path):
+def task_api(tmp_path, monkeypatch):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'tasks.db'}")
     session_maker = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
@@ -69,6 +69,7 @@ def task_api(tmp_path):
     app = FastAPI()
     app.include_router(tasks_api.router)
     app.dependency_overrides[get_session] = override_session
+    monkeypatch.setenv("AUTOHUNTER_OBSERVER_TOKEN", "observer-token")
 
     with TestClient(app) as client:
         yield client, session_maker
@@ -106,6 +107,69 @@ def test_create_litellm_task_uses_fixed_specialized_vuln_types(task_api) -> None
     config, src_type = asyncio.run(stored())
     assert config["scope_mode"] == "targeted"
     assert src_type == "litellm"
+
+
+def test_patch_litellm_checks_recomputes_specialized_vuln_types(task_api) -> None:
+    client, _session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "LiteLLM patch fixture",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {"scope_mode": "global"},
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    response = client.patch(
+        f"/api/tasks/{created.json()['id']}",
+        json={
+            "vuln_types": ["sqli", "xss"],
+            "mode_config": {
+                "scope_mode": "global",
+                "checks": {
+                    "key_leak": False,
+                    "env_leak": False,
+                    "management_exposure": False,
+                    "anonymous_models": True,
+                    "anonymous_inference": False,
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["vuln_types"] == [
+        "litellm_unauthenticated_model_list"
+    ]
+    assert response.json()["mode_config"]["checks"]["anonymous_models"] is True
+
+
+def test_observer_task_detail_hides_litellm_mode_config(task_api) -> None:
+    client, _session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Private LiteLLM scope",
+            "src_type": "litellm",
+            "target_source": "fofa",
+            "mode_config": {
+                "scope_mode": "targeted",
+                "scope_anchors": ["private.example"],
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    response = client.get(
+        f"/api/tasks/{created.json()['id']}",
+        headers={"x-autohunter-token": "observer-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["mode_config"] == {}
+    assert "private.example" not in response.text
 
 
 @pytest.mark.parametrize(
