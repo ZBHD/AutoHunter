@@ -110,30 +110,33 @@ def has_any_bindings(raw_list: Any) -> bool:
 
 
 def _parsed_url(value: str):
-    text = _strip(value)
-    if not text:
-        return urlparse("")
-    return urlparse(text if "://" in text else f"http://{text}")
+    from app.urlnorm import safe_urlparse
+    return safe_urlparse(_strip(value))
 
 
 def _normalized_url(value: str) -> str:
+    from app.urlnorm import safe_hostname
     parsed = _parsed_url(value)
-    if not parsed.hostname:
+    if not safe_hostname(parsed):
         return ""
     path = parsed.path.rstrip("/")
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
 
 
 def _host(value: str) -> str:
-    return (_parsed_url(value).hostname or "").lower()
+    from app.urlnorm import safe_hostname
+    return safe_hostname(_parsed_url(value))
 
 
 def _hostport(value: str) -> str:
+    from app.urlnorm import is_bare_ipv6, safe_hostname, safe_port
     parsed = _parsed_url(value)
-    host = (parsed.hostname or "").lower()
+    host = safe_hostname(parsed)
     if not host:
         return ""
-    return f"{host}:{parsed.port}" if parsed.port else host
+    display = f"[{host}]" if is_bare_ipv6(host) else host
+    port = safe_port(parsed)
+    return f"{display}:{port}" if port else display
 
 
 @dataclass
@@ -264,21 +267,18 @@ class AuthAttemptResult:
 
 
 def _same_origin(left: str, right: str) -> bool:
+    from app.urlnorm import has_invalid_port, safe_hostname, safe_port
     a, b = _parsed_url(left), _parsed_url(right)
-    if not a.hostname or not b.hostname:
+    if has_invalid_port(a) or has_invalid_port(b):
+        return False
+    a_host, b_host = safe_hostname(a), safe_hostname(b)
+    if not a_host or not b_host:
         return False
 
     def port(parsed):
-        return parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        return safe_port(parsed) or (443 if parsed.scheme.lower() == "https" else 80)
 
-    try:
-        return (
-            a.scheme.lower(), a.hostname.lower(), port(a)
-        ) == (
-            b.scheme.lower(), b.hostname.lower(), port(b)
-        )
-    except ValueError:
-        return False
+    return (a.scheme.lower(), a_host, port(a)) == (b.scheme.lower(), b_host, port(b))
 
 
 def _extract_login_form(html: str, page_url: str) -> dict[str, Any] | None:

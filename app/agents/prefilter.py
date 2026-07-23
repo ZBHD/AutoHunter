@@ -150,6 +150,9 @@ def should_skip(host: str, url: str) -> tuple[bool, str]:
 
 def should_skip_ex(host: str, url: str) -> tuple[bool, str, dict]:
     """同 should_skip，但额外返回首页探测信息(供评分复用，避免重复发包)。"""
+    from app.urlnorm import is_unusable_host
+    if is_unusable_host(host) or is_unusable_host(url):
+        return True, "无效主机（畸形 IPv6/无法解析），自动跳过", {}
     if is_sensitive_host(host) or is_sensitive_host(url):
         return True, _SENSITIVE_SKIP_REASON, {}
     if is_cdn_host(host):

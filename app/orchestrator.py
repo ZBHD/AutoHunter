@@ -96,9 +96,11 @@ def _public_src_url(value: object) -> str:
         if not parsed.netloc:
             path, _, query = text.partition("?")
             return path[:240] + (f"?{urlencode([(name, '') for name, _ in parse_qsl(query, keep_blank_values=True)])}" if query else "")
-        host = parsed.hostname or ""
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
+        from app.urlnorm import bracket_ipv6_host, safe_hostname, safe_port
+        host = bracket_ipv6_host(safe_hostname(parsed))
+        port = safe_port(parsed)
+        if port is not None:
+            host = f"{host}:{port}"
         query = urlencode([(name, "") for name, _ in parse_qsl(parsed.query, keep_blank_values=True)])
         return urlunparse((parsed.scheme.lower(), host, parsed.path, "", query, ""))[:500]
     except (TypeError, ValueError):
@@ -597,11 +599,14 @@ def _log_bg_task_exc(task: asyncio.Future, label: str) -> None:
                      exc_info=(type(exc), exc, exc.__traceback__))
 
 
+def _bracket_ipv6_host(host: str) -> str:
+    from app.urlnorm import bracket_ipv6_host
+    return bracket_ipv6_host(host)
+
+
 def _with_scheme(url_or_host: str) -> str:
-    s = (url_or_host or "").strip()
-    if not s:
-        return ""
-    return s if "://" in s else f"http://{s}"
+    from app.urlnorm import ensure_scheme
+    return ensure_scheme(url_or_host)
 
 
 def _swap_url_scheme(url: str) -> str:
@@ -1830,7 +1835,7 @@ class TaskRunner:
         # follow-up 自己也会上报 coverage，避免无限派生。
         if (tgt.source or "").startswith("site_f"):
             return 0
-        base_url = tgt.url or (f"https://{tgt.host}" if tgt.host else "")
+        base_url = tgt.url or (f"https://{_bracket_ipv6_host(tgt.host)}" if tgt.host else "")
         specs = site_collab.followup_specs_from_coverage(coverage_items, base_url=base_url, max_specs=8)
         if not specs:
             return 0
@@ -3893,6 +3898,9 @@ class TaskRunner:
             return False
         host = collector.normalize_host(url)
         if not host or host == collector.normalize_host(origin):
+            return False
+        from app.urlnorm import is_unusable_host
+        if is_unusable_host(url) or is_unusable_host(host):
             return False
         if prefilter.is_sensitive_host(host) or prefilter.is_sensitive_host(url):
             return False

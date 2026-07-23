@@ -119,15 +119,14 @@ def _clear_fofa_error_diagnostics(cfg: dict) -> None:
 
 
 def normalize_host(url_or_host: str) -> str:
-    """归一化为 host（去协议、去末尾/、小写）。"""
-    s = url_or_host.strip()
-    if "://" not in s:
-        s = "http://" + s
-    parsed = urlparse(s)
-    host = (parsed.hostname or "").lower()
-    if parsed.port and parsed.port not in (80, 443):
-        host = f"{host}:{parsed.port}"
-    return host
+    """归一化为 host，并对裸/畸形 IPv6 保持非抛异常。"""
+    from app.urlnorm import normalize_host as _normalize
+    return _normalize(url_or_host)
+
+
+def _is_unusable_host(value: str) -> bool:
+    from app.urlnorm import is_unusable_host
+    return is_unusable_host(value)
 
 
 def _is_edusrc_intent_task(task: Task, raw: str, is_intent: bool) -> bool:
@@ -269,7 +268,8 @@ def _with_scope_anchors(query: str, anchors: dict[str, list[str]]) -> str:
 
 
 def _ensure_url(host: str) -> str:
-    return host if host.startswith("http") else f"http://{host}"
+    from app.urlnorm import ensure_scheme
+    return ensure_scheme(host)
 
 
 async def _existing_hosts(session: AsyncSession, task_id: str) -> set[str]:
@@ -421,7 +421,7 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
     if task.target_source in ("manual", "both") and task.manual_targets:
         for raw in task.manual_targets:
             host = normalize_host(raw)
-            if not host or host in seen:
+            if not host or host in seen or _is_unusable_host(raw) or _is_unusable_host(host):
                 continue
             seen.add(host)
             if prefilter.is_sensitive_host(host) or prefilter.is_sensitive_host(raw):
@@ -465,7 +465,7 @@ async def _site_collect(session: AsyncSession, task: Task) -> int:
     added = 0
     for raw in raw_targets:
         host = normalize_host(raw)
-        if not host:
+        if not host or _is_unusable_host(raw) or _is_unusable_host(host):
             continue
         if prefilter.is_sensitive_host(host) or prefilter.is_sensitive_host(raw):
             existing = (await session.execute(
@@ -827,8 +827,12 @@ async def _fofa_collect(
     dropped_oos = 0
     for row in res.results:
         rec = dict(zip(fields, row)) if isinstance(row, list) else row
-        host = normalize_host(rec.get("host") or rec.get("domain") or rec.get("ip") or "")
+        raw_host = rec.get("host") or rec.get("domain") or rec.get("ip") or ""
+        host = normalize_host(raw_host)
         if not host or host in seen:
+            continue
+        if _is_unusable_host(raw_host) or _is_unusable_host(host):
+            seen.add(host)
             continue
         if scope_domains and target_cluster.root_domain(host) not in scope_domains:
             dropped_oos += 1

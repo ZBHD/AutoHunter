@@ -92,19 +92,8 @@ def pending_limit_reason(state: dict[str, int], limit: int | None = None) -> str
 
 
 def _host_only(host_or_url: str) -> str:
-    raw = (host_or_url or "").strip().lower()
-    if not raw:
-        return ""
-    if "://" not in raw:
-        raw = "http://" + raw
-    try:
-        parsed = urlparse(raw)
-    except Exception:
-        return raw.strip("/")
-    host = parsed.hostname or ""
-    if parsed.port and parsed.port not in (80, 443):
-        return f"{host}:{parsed.port}"
-    return host
+    from app.urlnorm import normalize_host
+    return normalize_host(host_or_url)
 
 
 def _norm(value: str) -> str:

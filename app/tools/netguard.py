@@ -47,11 +47,14 @@ def assert_safe_outbound_url(url: str, *, allow_extra_hosts: set[str] | None = N
     raw = str(url or "").strip()
     if not raw:
         raise SsrfBlocked("空 URL")
-    parsed = urlparse(raw)
+    from app.urlnorm import has_invalid_port, safe_hostname, safe_port, safe_urlparse
+    parsed = safe_urlparse(raw)
+    if has_invalid_port(parsed):
+        raise SsrfBlocked("URL 端口无效")
     scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_SCHEMES:
         raise SsrfBlocked(f"不允许的协议: {scheme or '(空)'}")
-    host = (parsed.hostname or "").strip().lower()
+    host = safe_hostname(parsed).strip().lower()
     if not host:
         raise SsrfBlocked("URL 缺少主机名")
 
@@ -73,7 +76,7 @@ def assert_safe_outbound_url(url: str, *, allow_extra_hosts: set[str] | None = N
 
     # 逐个解析出的 IP 校验（含 IPv6、DNS 到内网的情形）。
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, safe_port(parsed) or (443 if scheme == "https" else 80), proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise SsrfBlocked(f"主机解析失败: {host}") from exc
 
