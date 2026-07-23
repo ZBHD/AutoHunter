@@ -15,7 +15,8 @@ _JSON_ASSIGNMENT = re.compile(
     r'"(?P<value>(?:\\.|[^"\\])*)"'
 )
 _LINE_ASSIGNMENT = re.compile(
-    r"^\s*(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"^\s*(?:(?:export\s+)?(?:const|let|var)\s+|export\s+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"
     r"(?:=|:)\s*(?P<value>.*?)\s*$",
     re.IGNORECASE,
 )
@@ -38,6 +39,14 @@ _SENSITIVE_CONTEXT_VALUE = re.compile(
     r"(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION|DATABASE_URL|REDIS_URL)"
     r"[\"']?\s*(?:=|:)\s*)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,}]+)"
+)
+_BARE_PATTERNS = (
+    ("anthropic", "sk-ant-[A-Za-z0-9_-]{20,}", "provider_key"),
+    ("gemini", "AIza[A-Za-z0-9_-]{20,}", "provider_key"),
+    ("openai", "sk-(?:proj-)?[A-Za-z0-9_-]{20,}", "provider_key"),
+    ("bedrock", "AKIA[A-Z0-9]{16}", "provider_key"),
+    ("unknown", r"postgres(?:ql)?://[^\s'\"<>]+", "database_dsn"),
+    ("unknown", r"redis://[^\s'\"<>]+", "redis_url"),
 )
 
 
@@ -110,6 +119,25 @@ def _spec_for(name: str) -> _SecretSpec | None:
     return _SPECS.get(name.upper())
 
 
+def _inferred_spec(name: str, value: str) -> _SecretSpec | None:
+    """Infer only a provider category from an explicit field name or key format."""
+
+    known = _spec_for(name)
+    if known is not None:
+        return known
+    lowered = name.lower()
+    value_lower = value.lower()
+    if "anthropic" in lowered or value.startswith("sk-ant-"):
+        return _SecretSpec("provider_key", "anthropic")
+    if "gemini" in lowered or "google" in lowered or value.startswith("AIza"):
+        return _SecretSpec("provider_key", "gemini")
+    if "openai" in lowered or "apikey" in lowered or value.startswith("sk-"):
+        return _SecretSpec("provider_key", "openai")
+    if "azure" in lowered:
+        return _SecretSpec("provider_key", "azure_openai")
+    return None
+
+
 def _decode_json_string(value: str) -> str:
     try:
         decoded = json.loads(f'"{value}"')
@@ -179,26 +207,28 @@ def _collect_candidates(text: str) -> list[_Candidate]:
 
         json_names: set[str] = set()
         for match in _JSON_ASSIGNMENT.finditer(line):
-            name = match.group("name").upper()
-            spec = _spec_for(name)
+            name = match.group("name")
+            value = _decode_json_string(match.group("value"))
+            spec = _inferred_spec(name, value)
             if spec is None:
                 continue
-            value = _decode_json_string(match.group("value"))
             if _is_placeholder(name, value):
                 continue
-            json_names.add(name)
+            json_names.add(name.lower())
             candidates.append(_Candidate(name, value, line_number, block_number, spec))
 
         assignment = _LINE_ASSIGNMENT.match(line)
         if assignment is not None:
-            name = assignment.group("name").upper()
-            spec = _spec_for(name)
-            if spec is not None and name not in json_names:
+            name = assignment.group("name")
+            spec = _inferred_spec(name, "")
+            if spec is not None and name.lower() not in json_names:
                 value = _clean_assignment_value(assignment.group("value"))
+                spec = _inferred_spec(name, value)
                 if not _is_placeholder(name, value):
-                    candidates.append(
-                        _Candidate(name, value, line_number, block_number, spec)
-                    )
+                    if spec is not None:
+                        candidates.append(
+                            _Candidate(name, value, line_number, block_number, spec)
+                        )
 
         for match in _BEARER.finditer(line):
             value = _clean_assignment_value(match.group("value"))
@@ -213,6 +243,35 @@ def _collect_candidates(text: str) -> list[_Candidate]:
                     _SecretSpec("provider_key", _provider_for_bearer(value)),
                 )
             )
+    named_values = {candidate.value for candidate in candidates}
+    bare_values: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        for provider, pattern, secret_type in _BARE_PATTERNS:
+            for match in re.finditer(pattern, line):
+                value = match.group(0)
+                if (
+                    value in named_values
+                    or value in bare_values
+                    or _is_placeholder("detected", value)
+                ):
+                    continue
+                if provider == "openai" and value.startswith("sk-ant-"):
+                    continue
+                if provider == "unknown" and (
+                    "localhost" in value.lower() or "127.0.0.1" in value.lower()
+                ):
+                    continue
+                digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+                candidates.append(
+                    _Candidate(
+                        f"detected_{provider}_{digest}",
+                        value,
+                        line_number,
+                        block_number=line_number,
+                        spec=_SecretSpec(secret_type, provider),
+                    )
+                )
+                bare_values.add(value)
     return candidates
 
 
@@ -273,12 +332,23 @@ def extract_secrets(
         return ()
     collected = _collect_candidates(text)
     unique: list[_Candidate] = []
-    seen: set[tuple[str, str]] = set()
+    seen: dict[tuple[str, str], int] = {}
+    seen_values: dict[str, int] = {}
     for candidate in collected:
         identity = (candidate.name, candidate.value)
         if identity in seen:
             continue
-        seen.add(identity)
+        value_index = seen_values.get(candidate.value)
+        if value_index is not None:
+            # A canonical environment variable beats an inferred JS/bare name.
+            if _spec_for(candidate.name) is not None and _spec_for(
+                unique[value_index].name
+            ) is None:
+                unique[value_index] = candidate
+            seen[identity] = value_index
+            continue
+        seen[identity] = len(unique)
+        seen_values[candidate.value] = len(unique)
         unique.append(candidate)
 
     groups: dict[tuple[str, int], list[_Candidate]] = {}
@@ -317,7 +387,9 @@ def extract_secrets(
                 provider=candidate.spec.provider,
                 source_url=source_url,
                 source_location=(
-                    source_location or f"line:{candidate.line_number}"
+                    source_location
+                    if not candidate.name.startswith("detected_")
+                    else f"{source_location or 'text'}:line:{candidate.line_number}"
                 ),
                 context=_redacted_context(candidate, lines, all_values),
                 credential_group_id=group[0] if group is not None else None,

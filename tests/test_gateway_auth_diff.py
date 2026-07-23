@@ -74,6 +74,55 @@ def test_candidate_is_valid_only_when_business_schema_differs_from_controls() ->
     assert control_also_valid.kind == "anonymous_models"
 
 
+def test_identical_json_auth_rejections_allow_a_valid_candidate() -> None:
+    rejected = _sample(401, '{"error":"invalid api key"}')
+    candidate = _sample(
+        200,
+        '{"object":"list","data":[{"id":"gpt","object":"model"}]}',
+    )
+
+    result = compare_auth_variants(
+        no_auth=rejected,
+        invalid_auth=rejected,
+        candidate=candidate,
+        public_by_design=False,
+    )
+
+    assert result.kind == "candidate_valid"
+    assert result.control_catchall is False
+
+
+@pytest.mark.parametrize(
+    ("control", "content_type"),
+    [
+        ("<html><h1>Welcome</h1></html>", "text/html"),
+        ("request blocked by web application firewall", "text/plain"),
+        ('{"detail":"Not Found"}', "application/json"),
+        ("<!doctype html><div id=\"root\"></div>", "text/html"),
+    ],
+)
+def test_identical_control_catchalls_override_a_valid_candidate(
+    control: str,
+    content_type: str,
+) -> None:
+    status_code = 404 if "Not Found" in control else 200
+    candidate = _sample(
+        200,
+        '{"object":"list","data":[{"id":"gpt","object":"model"}]}',
+    )
+
+    result = compare_auth_variants(
+        no_auth=_sample(status_code, control, content_type),
+        invalid_auth=_sample(status_code, control, content_type),
+        candidate=candidate,
+        public_by_design=False,
+    )
+
+    assert result.kind == "inconclusive"
+    assert result.control_catchall is True
+    assert result.body_similarity == pytest.approx(1.0)
+
+
 def test_auth_failures_are_protected_but_missing_routes_are_inconclusive() -> None:
     protected = compare_auth_variants(
         no_auth=_sample(401, '{"error":"missing"}'),
@@ -90,6 +139,7 @@ def test_auth_failures_are_protected_but_missing_routes_are_inconclusive() -> No
 
     assert protected.kind == "protected"
     assert absent.kind == "inconclusive"
+    assert absent.control_catchall is True
     assert absent.body_similarity == pytest.approx(1.0)
     assert absent.content_type_changed is False
 

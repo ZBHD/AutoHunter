@@ -5,7 +5,7 @@ import json
 from difflib import SequenceMatcher
 
 from app.gateway_hunt.profiles.litellm import LiteLLMProfile
-from app.gateway_hunt.profiles.response_matchers import response_content_type
+from app.gateway_hunt.profiles.response_matchers import WAF_MARKERS, response_content_type
 from app.gateway_hunt.schemas import (
     AuthDiffResult,
     AuthSchemaKind,
@@ -82,6 +82,16 @@ def _similarity(left: str, right: str) -> float:
     ).ratio()
 
 
+def _is_control_catchall(sample: ResponseSample) -> bool:
+    """识别统一错误页、WAF 或缺失路由，不把它当作鉴权差异。"""
+
+    body = sample.body.strip().lower()
+    content_type = sample.content_type.partition(";")[0].strip().lower()
+    if content_type == "text/html" or sample.status_code == 404:
+        return True
+    return any(marker in body for marker in WAF_MARKERS)
+
+
 def compare_auth_variants(
     *,
     no_auth: ResponseSample,
@@ -107,6 +117,11 @@ def compare_auth_variants(
         "status_changed": no_auth.status_code != invalid_auth.status_code,
         "content_type_changed": no_content_type != invalid_content_type,
         "body_similarity": _similarity(no_auth.body, invalid_auth.body),
+        "control_catchall": (
+            _is_control_catchall(no_auth)
+            and _is_control_catchall(invalid_auth)
+            and _similarity(no_auth.body, invalid_auth.body) >= 0.99
+        ),
     }
 
     if public_by_design:
@@ -127,6 +142,12 @@ def compare_auth_variants(
         return AuthDiffResult(
             kind="anonymous_inference",
             reason="no-auth response matches the OpenAI chat schema",
+            **common,
+        )
+    if common["control_catchall"]:
+        return AuthDiffResult(
+            kind="inconclusive",
+            reason="both control responses are an identical catch-all page",
             **common,
         )
     if (

@@ -158,3 +158,96 @@ def test_context_redacts_untracked_adjacent_sensitive_values() -> None:
     assert len(artifacts) == 1
     assert "must-not-enter-context" not in artifacts[0].context
     assert "UNTRACKED_SECRET" in artifacts[0].context
+
+
+def test_extractor_supports_javascript_assignments_and_preserves_names() -> None:
+    text = "\n".join(
+        [
+            'const apiKey = "sk-proj-abcdefghijklmnopqrstuv";',
+            "let anthropicToken = 'sk-ant-api03-abcdefghijklmnopqrstuv';",
+            'var geminiCredential = "AIzaabcdefghijklmnopqrstuvwx";',
+        ]
+    )
+
+    artifacts = _by_name(text)
+
+    assert artifacts["apiKey"].provider == "openai"
+    assert artifacts["anthropicToken"].provider == "anthropic"
+    assert artifacts["geminiCredential"].provider == "gemini"
+
+
+def test_extractor_supports_nonstandard_json_keys_and_preserves_standard_case() -> None:
+    text = (
+        '{"apiKey":"sk-proj-zyxwvutsrqponmlkjihg",'
+        '"token":"sk-ant-api03-zyxwvutsrqponmlkjihg",'
+        '"openai_api_key":"sk-short-but-standard"}'
+    )
+
+    artifacts = _by_name(text)
+
+    assert artifacts["apiKey"].provider == "openai"
+    assert artifacts["token"].provider == "anthropic"
+    assert artifacts["openai_api_key"].value == "sk-short-but-standard"
+
+
+def test_extractor_detects_bare_provider_formats_with_stable_synthetic_metadata() -> None:
+    text = "\n".join(
+        [
+            "anthropic failed: sk-ant-api03-abcdefghijklmnopqrstuv",
+            "gemini failed: AIzaabcdefghijklmnopqrstuvwx",
+            "openai failed: sk-proj-abcdefghijklmnopqrstuv",
+            "aws failed: AKIAABCDEFGHIJKLMNOP",
+            "db failed: postgresql://user:pass@db.internal/app",
+            "cache failed: redis://:pass@redis.internal:6379/0",
+        ]
+    )
+
+    first = extract_secrets(text, source_location="error.body")
+    second = extract_secrets(text, source_location="error.body")
+
+    assert len(first) == 6
+    assert {(item.provider, item.secret_type) for item in first} == {
+        ("anthropic", "provider_key"),
+        ("gemini", "provider_key"),
+        ("openai", "provider_key"),
+        ("bedrock", "provider_key"),
+        ("unknown", "database_dsn"),
+        ("unknown", "redis_url"),
+    }
+    assert [(item.name, item.source_location) for item in first] == [
+        (item.name, item.source_location) for item in second
+    ]
+    assert all(item.name.startswith("detected_") for item in first)
+    assert all(item.source_location.startswith("error.body:line:") for item in first)
+
+
+def test_standard_named_secret_wins_over_format_duplicates() -> None:
+    value = "sk-proj-abcdefghijklmnopqrstuv"
+    artifacts = extract_secrets(
+        f"OPENAI_API_KEY={value}\n"
+        f'const apiKey = "{value}";\n'
+        f"log leaked {value}"
+    )
+
+    matches = [item for item in artifacts if item.value == value]
+    assert [(item.name, item.provider) for item in matches] == [
+        ("OPENAI_API_KEY", "openai")
+    ]
+
+
+def test_bare_format_detection_rejects_short_and_placeholder_values() -> None:
+    text = "\n".join(
+        [
+            "sk-short",
+            "AIza-short",
+            "AKIA_TEST",
+            "postgresql://localhost/app",
+            "redis://localhost:6379/0",
+            "sk-example-abcdefghijklmnopqrstuv",
+            "sk-dummy-abcdefghijklmnopqrstuv",
+            "sk-***********************",
+            "${OPENAI_API_KEY}",
+        ]
+    )
+
+    assert extract_secrets(text) == ()

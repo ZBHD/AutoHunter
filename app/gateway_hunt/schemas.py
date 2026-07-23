@@ -195,6 +195,7 @@ class AuthDiffResult(GatewayValue):
     status_changed: bool = False
     content_type_changed: bool = False
     body_similarity: float = Field(ge=0, le=1)
+    control_catchall: bool = False
     model_ids: tuple[str, ...] = ()
     reason: str = ""
 
