@@ -30,7 +30,7 @@ from app.agents import prefilter
 from app.agents import site_collab
 from app.agents import target_cluster
 from app.agents.depth_policy import depth_policy_for
-from app.agents.prompts import is_enterprise_src, should_escalate
+from app.agents.prompts import is_enterprise_src, is_litellm_src, should_escalate
 from app.agents.reviewer import Reviewer
 from app.agents.worker import Worker
 from app.agent_runtime import (
@@ -39,7 +39,7 @@ from app.agent_runtime import (
 )
 from app.db.models import (
     CST, EscalationAttempt, Finding, Killsweep, KillsweepAttempt, MissedSignal,
-    Review, Target, Task, TaskEvent,
+    Review, GatewayAsset, Target, Task, TaskEvent,
 )
 from app.db.session import SessionLocal
 from app.deepen_context import handoff_audit_metadata
@@ -82,6 +82,8 @@ from app.missed_signals import (
 from app.queue_targets import queue_dispatch_order
 from app.raw_evidence import import_capture
 from app.tools.src_toolkit import SRC_TOOL_NAMES
+from app.gateway_hunt import service as gateway_service
+from app.gateway_hunt.client import LiteLLMScanClient
 
 logger = logging.getLogger("autohunter.orchestrator")
 
@@ -653,6 +655,7 @@ class TaskRunner:
         self._auto_drained = False
         self._drain_lifecycle_lock = asyncio.Lock()
         self._active_workers: dict[str, asyncio.Task] = {}
+        self._gateway_tasks: dict[str, asyncio.Task] = {}
         self._worker_cancel_events: dict[str, threading.Event] = {}
         self._worker_executor_started: set[str] = set()
         self._cancelled_targets: set[str] = set()
@@ -693,6 +696,7 @@ class TaskRunner:
             "task_id": self.task_id,
             "stopped": self._stop.is_set(),
             "active_workers": len(self._active_workers),
+            "gateway_tasks": len(self._gateway_tasks),
             "worker_cancel_events": len(self._worker_cancel_events),
             "worker_executor_started": len(self._worker_executor_started),
             "review_inflight": len(self._review_inflight),
@@ -830,6 +834,10 @@ class TaskRunner:
             if self._stop.is_set() or not task or task.status in ("paused", "stopped"):
                 return
             self._is_enterprise = is_enterprise_src(task.src_type)
+            is_gateway_task = is_litellm_src(task.src_type)
+
+            if is_gateway_task:
+                await self._requeue_due_gateway_assets(session)
 
             # 1. 队列水位低 → 补目标
             async def collector_progress(phase: str, text: str, payload: dict) -> None:
@@ -891,6 +899,7 @@ class TaskRunner:
 
             # 2. 派发前先回收：清理已完成 task + 抢救心跳超时的僵尸目标
             self._reap_workers()
+            self._reap_gateway_tasks()
             await self._reclaim_stale(session)
             if self._stop.is_set():
                 return
@@ -898,9 +907,13 @@ class TaskRunner:
             # WORKER_MAX_CONCURRENCY 封顶。这里按两者取小来决定本轮 spawn 多少，避免多起
             # 的协程只是白白阻塞在 worker_sem.acquire()（表现为"配了 N 并发但没那么多在跑"）。
             effective_cap = min(task.concurrency, WORKER_MAX_CONCURRENCY)
-            free = effective_cap - len(self._active_workers)
+            free = effective_cap - len(self._active_workers) - len(self._gateway_tasks)
             for _ in range(max(0, free)):
-                target = await self._pop_queued(session)
+                target = (
+                    await self._pop_gateway_queued(session)
+                    if is_gateway_task
+                    else await self._pop_queued(session)
+                )
                 if self._stop.is_set():
                     # _pop_queued durably marks the selected target assigned before
                     # returning.  A concurrent stop may already have snapshotted the
@@ -916,7 +929,10 @@ class TaskRunner:
                     return
                 if not target:
                     break
-                self._spawn_worker(task, target)
+                if is_gateway_task:
+                    self._spawn_gateway_asset(task, target)
+                else:
+                    self._spawn_worker(task, target)
 
             if self._stop.is_set():
                 return
@@ -944,12 +960,13 @@ class TaskRunner:
             inflight = await self._count_inflight(session)
             busy = (
                 bool(self._active_workers)
+                or bool(self._gateway_tasks)
                 or bool(self._killsweep_tasks)
                 or bool(self._escalation_tasks)
                 or inflight > 0
             )
             drain_busy = busy or bool(self._review_tasks)
-            if not task.search_enabled and queued == 0 and not drain_busy:
+            if not is_gateway_task and not task.search_enabled and queued == 0 and not drain_busy:
                 async with self._drain_lifecycle_lock:
                     has_runnable_target = select(Target.id).where(
                         Target.task_id == self.task_id,
@@ -997,7 +1014,10 @@ class TaskRunner:
                         exc_info=True,
                     )
                 return
-            if queued == 0 and not busy and task.status == "running":
+            if is_gateway_task and task.status == "idle":
+                task.status = "running"
+                await session.commit()
+            elif not is_gateway_task and queued == 0 and not busy and task.status == "running":
                 if task.status != "idle":
                     task.status = "idle"
                     await session.commit()
@@ -1021,6 +1041,173 @@ class TaskRunner:
                 Target.task_id == self.task_id,
                 Target.status.in_(("assigned", "scanning")))
         )).scalar() or 0
+
+    async def _requeue_due_gateway_assets(
+        self,
+        session: AsyncSession,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Atomically return due gateway assets to the Target queue."""
+        current = now or _now()
+        rows = (await session.execute(
+            select(GatewayAsset, Target)
+            .join(Target, Target.id == GatewayAsset.target_id)
+            .where(
+                GatewayAsset.task_id == self.task_id,
+                GatewayAsset.next_scan_at.is_not(None),
+                GatewayAsset.next_scan_at <= current,
+                Target.status.in_(("done", "dead", "skipped")),
+            )
+        )).all()
+        queued = 0
+        for asset, target in rows:
+            if target.id in self._gateway_tasks and not self._gateway_tasks[target.id].done():
+                continue
+            changed = await session.execute(
+                update(Target)
+                .where(
+                    Target.id == target.id,
+                    Target.task_id == self.task_id,
+                    Target.status.in_(("done", "dead", "skipped")),
+                )
+                .values(
+                    status="queued",
+                    verdict="",
+                    assigned_worker="",
+                    heartbeat_at=None,
+                    last_error="",
+                    dead_reason="",
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if changed.rowcount != 1:
+                continue
+            asset.scan_state = "discovered"
+            asset.last_error_kind = ""
+            asset.last_error = ""
+            queued += 1
+        if queued:
+            await session.commit()
+            self.invalidate_queue()
+        return queued
+
+    async def _pop_gateway_queued(self, session: AsyncSession) -> Target | None:
+        """Claim one LiteLLM Target without ordinary liveness/prefilter logic."""
+        row = await session.scalar(
+            select(Target)
+            .join(GatewayAsset, GatewayAsset.target_id == Target.id)
+            .where(
+                Target.task_id == self.task_id,
+                Target.status == "queued",
+                GatewayAsset.scan_state.in_(("discovered", "scheduled_recheck")),
+            )
+            .order_by(*queue_dispatch_order())
+        )
+        if row is None:
+            return None
+        claimed = await session.execute(
+            update(Target)
+            .where(Target.id == row.id, Target.task_id == self.task_id, Target.status == "queued")
+            .values(
+                status="assigned",
+                assigned_worker=f"gw-{row.id[:8]}",
+                heartbeat_at=_now(),
+                last_error="",
+                dead_reason="",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            await session.rollback()
+            return None
+        await session.commit()
+        await session.refresh(row)
+        return row
+
+    def _spawn_gateway_asset(self, task: Task, target: Target) -> None:
+        existing = self._gateway_tasks.get(target.id)
+        if existing is not None and not existing.done():
+            return
+        # Relationship may not be loaded after the claim; the coroutine resolves it by target.
+        asset_id = ""
+        self._gateway_tasks[target.id] = asyncio.create_task(
+            self._run_gateway_asset(task.id, target.id, asset_id)
+        )
+
+    def _reap_gateway_tasks(self) -> None:
+        done = [tid for tid, task in self._gateway_tasks.items() if task.done()]
+        for tid in done:
+            task = self._gateway_tasks.pop(tid, None)
+            if task is None:
+                continue
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                exc = None
+            if exc is not None:
+                logger.error(
+                    "TaskRunner[%s] gateway coroutine died target=%s: %r",
+                    self.task_id, tid[:8], exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+    async def _gateway_scan_client(self, task: Task | None = None) -> LiteLLMScanClient:
+        return LiteLLMScanClient()
+
+    async def _run_gateway_asset(self, task_id: str, target_id: str, asset_id: str = "") -> None:
+        """Run deterministic LiteLLM scanning and close the Target state."""
+        async with SessionLocal() as session:
+            target = await session.get(Target, target_id)
+            task = await session.get(Task, task_id)
+            if target is None or task is None:
+                return
+            if not asset_id:
+                asset = await session.scalar(
+                    select(GatewayAsset).where(
+                        GatewayAsset.task_id == task_id,
+                        GatewayAsset.target_id == target_id,
+                    )
+                )
+                asset_id = asset.id if asset is not None else ""
+            if not asset_id:
+                target.status = "dead"
+                target.verdict = "error"
+                target.dead_reason = "LiteLLM GatewayAsset missing"
+                await session.commit()
+                return
+            target.status = "scanning"
+            target.heartbeat_at = _now()
+            await session.commit()
+            try:
+                config = dict(task.mode_config_json or {})
+                validation = dict(config.get("validation") or {})
+                client = await self._gateway_scan_client(task)
+                result = await gateway_service.scan_asset(
+                    asset_id=asset_id,
+                    session=session,
+                    client=client,
+                    max_requests=int(validation.get("max_requests_per_asset_epoch") or 24),
+                )
+                target.status = "done"
+                target.verdict = "found" if getattr(result, "findings", ()) else "no_vuln"
+                target.heartbeat_at = None
+                target.last_error = ""
+                await session.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                target.status = "dead"
+                target.verdict = "error"
+                target.heartbeat_at = None
+                target.last_error = str(exc)[:500]
+                target.dead_reason = "LiteLLM scan failed"
+                asset = await session.get(GatewayAsset, asset_id)
+                if asset is not None:
+                    asset.last_error_kind = "scan_error"
+                    asset.last_error = str(exc)[:500]
+                    asset.consecutive_failures = int(asset.consecutive_failures or 0) + 1
+                await session.commit()
 
     async def _pop_queued(self, session: AsyncSession) -> Target | None:
         queue_revision = self._queue_revision
@@ -1414,7 +1601,7 @@ class TaskRunner:
         )).scalars().all()
         reclaimed = 0
         for tgt in rows:
-            if tgt.id in self._active_workers:
+            if tgt.id in self._active_workers or tgt.id in self._gateway_tasks:
                 continue  # 仍有活跃协程在跑，不动（协程自带墙钟超时）
             hb = tgt.heartbeat_at
             if hb is not None and hb.tzinfo is None:
@@ -1426,7 +1613,8 @@ class TaskRunner:
                 logger.warning(
                     "[reclaim] target=%s host=%s hb_age=%s in_active=%s active_total=%d",
                     tgt.id[:8], (tgt.url or "")[:40], hb_age,
-                    tgt.id in self._active_workers, len(self._active_workers),
+                    tgt.id in self._active_workers or tgt.id in self._gateway_tasks,
+                    len(self._active_workers) + len(self._gateway_tasks),
                 )
                 if self._queue_or_dead_after_attempt(tgt, "僵尸目标回收：worker 协程已不存在"):
                     reclaimed += 1
@@ -1439,6 +1627,7 @@ class TaskRunner:
         """暂停调度，收回 worker，并将正在执行的扩大危害 attempt 重新排队。"""
         self._escalation_dispatch_paused = True
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
+        await self._cancel_gateway_tasks(reason)
         await self._cancel_escalation_tasks(reason)
 
     def resume(self) -> None:
@@ -1450,6 +1639,7 @@ class TaskRunner:
         self._stop.set()
         self._escalation_dispatch_paused = True
         await self._cancel_active_workers(f"{reason}：运行中 worker 已取消并回队")
+        await self._cancel_gateway_tasks(reason)
         await self._cancel_review_tasks(reason)
         await self._cancel_killsweep_tasks(reason)
         await self._cancel_escalation_tasks(reason)
@@ -1500,6 +1690,30 @@ class TaskRunner:
         for tid in target_ids:
             self._active_workers.pop(tid, None)
             self._worker_cancel_events.pop(tid, None)
+
+    async def _cancel_gateway_tasks(self, reason: str) -> None:
+        target_ids = list(self._gateway_tasks)
+        tasks = [task for task in self._gateway_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if not target_ids:
+            return
+        async with SessionLocal() as session:
+            rows = (await session.execute(
+                select(Target).where(Target.task_id == self.task_id, Target.id.in_(target_ids))
+            )).scalars().all()
+            for target in rows:
+                if target.status in ("assigned", "scanning"):
+                    target.status = "queued"
+                    target.verdict = ""
+                    target.assigned_worker = ""
+                    target.heartbeat_at = None
+                    target.last_error = reason[:500]
+                    target.dead_reason = ""
+            await session.commit()
+        self._gateway_tasks.clear()
 
     async def _cancel_review_tasks(self, reason: str) -> None:
         tasks = list(self._review_tasks.values())

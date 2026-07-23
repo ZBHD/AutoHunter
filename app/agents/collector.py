@@ -18,7 +18,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime import COLLECTOR_IO_EXECUTOR
 from app.agents import collector_llm, playbook_router, prefilter, scorer, site_collab, target_filter
 from app.agents import target_cluster
-from app.agents.prompts import is_enterprise_src
-from app.db.models import Target, Task
+from app.agents.prompts import is_enterprise_src, is_litellm_src
+from app.db.models import GatewayAsset, Target, Task
 from app.engines import get_engine, EngineResult, QuakeRateLimitError
+from app.gateway_hunt.fingerprinter import (
+    gateway_target_source,
+    normalize_base_url,
+    normalize_mount_path,
+    origin_key,
+)
+from app.gateway_hunt.query_planner import QueryPlanner
 from app.tools.leakcreds import query_leaked_creds
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
 from app.fofa.client import FofaError
@@ -394,6 +401,9 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
     if queued >= low_watermark:
         return 0
 
+    if is_litellm_src(task.src_type):
+        return await _litellm_collect(session, task)
+
     async def progress(phase: str, text: str, **payload) -> None:
         cfg = dict(task.fofa_config or {})
         cfg.update(
@@ -430,6 +440,144 @@ async def refill(session: AsyncSession, task: Task, low_watermark: int = 5,
     # 2) FOFA 智能搜集
     if task.target_source in ("fofa", "both") and task.search_enabled:
         added += await _fofa_collect(session, task, seen, cluster_state, progress)
+
+    await session.commit()
+    return added
+
+
+def _gateway_candidate_url(raw: object) -> str:
+    """Extract a stable absolute URL from an engine row or manual value."""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    try:
+        return normalize_base_url(value)
+    except ValueError:
+        return ""
+
+
+async def _ensure_litellm_asset(
+    session: AsyncSession,
+    task: Task,
+    raw_url: object,
+    *,
+    title: str = "",
+    organization: str = "",
+    source_engine: str = "manual",
+) -> int:
+    canonical = _gateway_candidate_url(raw_url)
+    if not canonical:
+        return 0
+    key = origin_key(canonical)
+    existing = await session.scalar(
+        select(GatewayAsset).where(
+            GatewayAsset.task_id == task.id,
+            GatewayAsset.origin_key == key,
+        )
+    )
+    if existing is not None:
+        return 0
+    parsed = urlsplit(canonical)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return 0
+    source = gateway_target_source(key)
+    target = await session.scalar(
+        select(Target).where(Target.task_id == task.id, Target.source == source)
+    )
+    if target is None:
+        target = Target(
+            task_id=task.id,
+            url=canonical,
+            host=host,
+            ip="",
+            title=str(title or "")[:500],
+            org=str(organization or "")[:300],
+            source=source,
+            status="queued",
+            priority_score=0.0,
+            priority_reason=f"LiteLLM {source_engine} candidate",
+        )
+        session.add(target)
+        await session.flush()
+    session.add(
+        GatewayAsset(
+            task_id=task.id,
+            target_id=target.id,
+            profile_id="litellm",
+            profile_version=str(
+                ((task.mode_config_json or {}).get("profile_versions") or {}).get("litellm") or "1"
+            ),
+            canonical_base_url=canonical,
+            origin_key=key,
+            mount_path=normalize_mount_path(parsed.path),
+            scan_state="discovered",
+        )
+    )
+    return 1
+
+
+async def _litellm_collect(session: AsyncSession, task: Task) -> int:
+    """Collect LiteLLM manual and search-engine candidates without web prefilters."""
+    added = 0
+    raw_manual = [str(value).strip() for value in (task.manual_targets or []) if str(value).strip()]
+    for value in raw_manual:
+        added += await _ensure_litellm_asset(session, task, value)
+    if raw_manual:
+        task.manual_targets = []
+
+    config = dict(task.mode_config_json or {})
+    if task.target_source in {"fofa", "both"} and config.get("scope_mode", "targeted") == "global" or (
+        task.target_source in {"fofa", "both"} and config.get("scope_anchors")
+    ):
+        engine_name = str(task.engine or "fofa").strip().lower() or "fofa"
+        engine = get_engine(engine_name)
+        key = str((task.fofa_config or {}).get("key") or "").strip()
+        if engine is not None and key:
+            state = dict(config.get("collection_state") or {})
+            anchors = list(config.get("scope_anchors") or [])
+            try:
+                plans = QueryPlanner().plan(
+                    scope_mode=str(config.get("scope_mode") or "global"),
+                    anchors=anchors,
+                    engine=engine_name,
+                    profile_id="litellm",
+                    state=state,
+                )
+                if plans:
+                    plan = plans[0]
+                    result = await engine.search(
+                        key,
+                        plan.query,
+                        page=plan.cursor,
+                        page_size=int((task.fofa_config or {}).get("page_size") or 100),
+                        base_url=(task.fofa_config or {}).get("base_url"),
+                    )
+                    fields = [str(field).lower() for field in (result.fields or [])]
+                    for row in result.results or []:
+                        values = dict(zip(fields, row))
+                        host = str(values.get("host") or values.get("domain") or "").strip()
+                        if not host:
+                            continue
+                        port = str(values.get("port") or "").strip()
+                        scheme = "https" if port in {"443", "8443"} else "http"
+                        candidate = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+                        added += await _ensure_litellm_asset(
+                            session,
+                            task,
+                            candidate,
+                            title=str(values.get("title") or ""),
+                            organization=str(values.get("org") or ""),
+                            source_engine=engine_name,
+                        )
+                    state[plan.cursor_key] = plan.next_state.model_dump(mode="json")
+                    config["collection_state"] = state
+                    task.mode_config_json = config
+            except Exception as exc:
+                config["last_collection_error"] = str(exc)[:300]
+                task.mode_config_json = config
 
     await session.commit()
     return added
