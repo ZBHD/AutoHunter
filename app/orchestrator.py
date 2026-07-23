@@ -792,8 +792,10 @@ class TaskRunner:
         for tgt in rows:
             if self._queue_or_dead_after_attempt(tgt, "进程重启恢复：运行中目标回队重试"):
                 recovered += 1
+                recovered_target_ids.add(tgt.id)
             else:
                 killed += 1
+        await self._reset_gateway_assets_for_targets(session, recovered_target_ids)
         await session.commit()
         await self._log(
             session, "orchestrator", "recover",
@@ -1092,6 +1094,27 @@ class TaskRunner:
             self.invalidate_queue()
         return queued
 
+    async def _reset_gateway_assets_for_targets(
+        self,
+        session: AsyncSession,
+        target_ids: set[str] | list[str],
+    ) -> None:
+        if not target_ids:
+            return
+        assets = list(
+            await session.scalars(
+                select(GatewayAsset).where(
+                    GatewayAsset.task_id == self.task_id,
+                    GatewayAsset.target_id.in_(target_ids),
+                )
+            )
+        )
+        for asset in assets:
+            asset.scan_state = "discovered"
+            asset.next_scan_at = None
+            asset.last_error_kind = ""
+            asset.last_error = ""
+
     async def _pop_gateway_queued(self, session: AsyncSession) -> Target | None:
         """Claim one LiteLLM Target without ordinary liveness/prefilter logic."""
         row = await session.scalar(
@@ -1153,7 +1176,14 @@ class TaskRunner:
                 )
 
     async def _gateway_scan_client(self, task: Task | None = None) -> LiteLLMScanClient:
-        return LiteLLMScanClient()
+        mode_config = dict(task.mode_config_json or {}) if task is not None else {}
+        validation = dict(mode_config.get("validation") or {})
+        return LiteLLMScanClient(
+            validate_credentials=str(validation.get("level") or "full") == "full",
+            max_credential_validations=int(
+                validation.get("max_provider_validations_per_cycle") or 20
+            ),
+        )
 
     async def _run_gateway_asset(self, task_id: str, target_id: str, asset_id: str = "") -> None:
         """Run deterministic LiteLLM scanning and close the Target state."""
@@ -1600,6 +1630,7 @@ class TaskRunner:
             )
         )).scalars().all()
         reclaimed = 0
+        reclaimed_target_ids: list[str] = []
         for tgt in rows:
             if tgt.id in self._active_workers or tgt.id in self._gateway_tasks:
                 continue  # 仍有活跃协程在跑，不动（协程自带墙钟超时）
@@ -1618,7 +1649,9 @@ class TaskRunner:
                 )
                 if self._queue_or_dead_after_attempt(tgt, "僵尸目标回收：worker 协程已不存在"):
                     reclaimed += 1
+                    reclaimed_target_ids.append(tgt.id)
         if reclaimed:
+            await self._reset_gateway_assets_for_targets(session, reclaimed_target_ids)
             await session.commit()
             await self._log(session, "orchestrator", "reclaim",
                             f"抢救 {reclaimed} 个僵尸目标回退队列", level="warn", reclaimed=reclaimed)
@@ -1704,6 +1737,7 @@ class TaskRunner:
             rows = (await session.execute(
                 select(Target).where(Target.task_id == self.task_id, Target.id.in_(target_ids))
             )).scalars().all()
+            requeued_target_ids: list[str] = []
             for target in rows:
                 if target.status in ("assigned", "scanning"):
                     target.status = "queued"
@@ -1712,6 +1746,8 @@ class TaskRunner:
                     target.heartbeat_at = None
                     target.last_error = reason[:500]
                     target.dead_reason = ""
+                    requeued_target_ids.append(target.id)
+            await self._reset_gateway_assets_for_targets(session, requeued_target_ids)
             await session.commit()
         self._gateway_tasks.clear()
 

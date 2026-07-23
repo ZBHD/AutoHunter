@@ -1,6 +1,7 @@
 """受 Gateway Profile 约束的 LiteLLM 异步扫描客户端。"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
@@ -9,6 +10,8 @@ import httpx
 
 from app.db.models import GatewayAsset
 from app.gateway_hunt.auth_diff import compare_auth_variants
+from app.gateway_hunt.credential_validators import get_validator
+from app.gateway_hunt.credential_validators.base import HttpxTransport, ValidationContext
 from app.gateway_hunt.registry import get_profile
 from app.gateway_hunt.schemas import HttpObservation, ProbeSpec, ResponseSample, SecretArtifact
 from app.gateway_hunt.secret_extractor import extract_secrets
@@ -17,6 +20,11 @@ from app.gateway_hunt.service import GatewayProbeResult, GatewayScanInput
 
 _INVALID_TOKEN = "litellm-invalid-control-token"
 _MAX_RESPONSE_CHARS = 512_000
+_PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com",
+}
 
 
 @dataclass(slots=True)
@@ -57,9 +65,69 @@ class LiteLLMScanClient:
         *,
         http_client: httpx.AsyncClient | None = None,
         timeout: httpx.Timeout | None = None,
+        credential_transport: object | None = None,
+        validation_base_urls: dict[str, str] | None = None,
+        validate_credentials: bool = True,
+        max_credential_validations: int = 20,
     ) -> None:
         self._http_client = http_client
         self._timeout = timeout or httpx.Timeout(15.0, connect=5.0)
+        self._credential_transport = credential_transport or HttpxTransport()
+        self._validation_base_urls = dict(validation_base_urls or {})
+        self._validate_credentials = validate_credentials
+        self._max_credential_validations = max(0, int(max_credential_validations))
+
+    def _validation_base_url(self, asset: GatewayAsset, artifact: SecretArtifact) -> str:
+        configured = self._validation_base_urls.get(artifact.provider)
+        if configured:
+            return configured
+        if artifact.provider == "litellm":
+            return asset.canonical_base_url
+        endpoint = artifact.validation_context.get("endpoint")
+        if isinstance(endpoint, str) and endpoint.strip():
+            return endpoint.strip()
+        return _PROVIDER_BASE_URLS.get(artifact.provider, "")
+
+    async def _validate_secrets(
+        self,
+        asset: GatewayAsset,
+        secrets: dict[str, SecretArtifact],
+        budget: _Budget,
+    ) -> None:
+        if not self._validate_credentials or not secrets:
+            return
+        validated = 0
+        for digest, artifact in list(secrets.items()):
+            if validated >= self._max_credential_validations:
+                break
+            base_url = self._validation_base_url(asset, artifact)
+            if not base_url:
+                continue
+            try:
+                validator = get_validator(artifact.provider)
+            except KeyError:
+                continue
+            # Built-in validators issue at most one enumeration and one minimal
+            # inference request. Reserve both before leaving the async scanner.
+            if not budget.take(2):
+                break
+            result = await asyncio.to_thread(
+                validator.validate,
+                artifact,
+                ValidationContext(
+                    base_url=base_url,
+                    transport=self._credential_transport,
+                    timeout=self._timeout,
+                ),
+            )
+            context = {
+                **artifact.validation_context,
+                "validation_status": str(result.status),
+                "validated_models": list(result.model_ids),
+                "validation_detail": result.detail[:500],
+            }
+            secrets[digest] = artifact.model_copy(update={"validation_context": context})
+            validated += 1
 
     async def _request(
         self,
@@ -332,6 +400,8 @@ class LiteLLMScanClient:
                     observations.append(
                         self._result(asset, scan_epoch, probe, "none", no_auth, result, "exposure_scanning")
                     )
+
+                await self._validate_secrets(asset, secrets, budget)
 
             return GatewayScanInput(
                 fingerprint_status=str(fingerprint.status),

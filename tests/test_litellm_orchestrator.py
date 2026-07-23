@@ -96,6 +96,103 @@ def test_due_gateway_assets_are_requeued_atomically(tmp_path) -> None:
     _run(scenario())
 
 
+def test_litellm_restart_recovery_resets_interrupted_asset_for_dispatch(tmp_path) -> None:
+    async def scenario() -> None:
+        engine, sessions = await _db(tmp_path)
+        try:
+            async with sessions() as session:
+                task = Task(
+                    id="task-litellm-restart",
+                    name="restart",
+                    src_type="litellm",
+                    status="running",
+                )
+                target = Target(
+                    id="target-litellm-restart",
+                    task_id=task.id,
+                    url="https://gateway.test",
+                    host="gateway.test",
+                    source="gw:llm:restart",
+                    status="scanning",
+                    assigned_worker="gw-restart",
+                )
+                asset = GatewayAsset(
+                    id="asset-litellm-restart",
+                    task_id=task.id,
+                    target_id=target.id,
+                    canonical_base_url=target.url,
+                    origin_key=target.url,
+                    scan_state="credential_validating",
+                    scan_epoch=2,
+                )
+                session.add_all([task, target, asset])
+                await session.commit()
+
+                runner = orchestrator.TaskRunner(task.id)
+                await runner.recover(session)
+
+                await session.refresh(target)
+                await session.refresh(asset)
+                assert target.status == "queued"
+                assert asset.scan_state == "discovered"
+                claimed = await runner._pop_gateway_queued(session)
+                assert claimed is not None and claimed.id == target.id
+        finally:
+            await engine.dispose()
+
+    _run(scenario())
+
+
+def test_litellm_cancel_resets_interrupted_asset_for_dispatch(tmp_path, monkeypatch) -> None:
+    async def scenario() -> None:
+        engine, sessions = await _db(tmp_path)
+        try:
+            async with sessions() as session:
+                task = Task(
+                    id="task-litellm-cancel",
+                    name="cancel",
+                    src_type="litellm",
+                    status="running",
+                )
+                target = Target(
+                    id="target-litellm-cancel",
+                    task_id=task.id,
+                    url="https://gateway.test",
+                    host="gateway.test",
+                    source="gw:llm:cancel",
+                    status="scanning",
+                    assigned_worker="gw-cancel",
+                )
+                asset = GatewayAsset(
+                    id="asset-litellm-cancel",
+                    task_id=task.id,
+                    target_id=target.id,
+                    canonical_base_url=target.url,
+                    origin_key=target.url,
+                    scan_state="inference_validating",
+                    scan_epoch=4,
+                )
+                session.add_all([task, target, asset])
+                await session.commit()
+
+            runner = orchestrator.TaskRunner(task.id)
+            blocker = asyncio.Event()
+            gateway_task = asyncio.create_task(blocker.wait())
+            runner._gateway_tasks[target.id] = gateway_task
+            monkeypatch.setattr(orchestrator, "SessionLocal", sessions)
+            await runner._cancel_gateway_tasks("任务暂停")
+
+            async with sessions() as session:
+                stored_target = await session.get(Target, target.id)
+                stored_asset = await session.get(GatewayAsset, asset.id)
+                assert stored_target is not None and stored_target.status == "queued"
+                assert stored_asset is not None and stored_asset.scan_state == "discovered"
+        finally:
+            await engine.dispose()
+
+    _run(scenario())
+
+
 def test_litellm_dispatch_uses_gateway_scan_and_never_worker(tmp_path, monkeypatch) -> None:
     async def scenario() -> None:
         engine, sessions = await _db(tmp_path)

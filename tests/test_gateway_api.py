@@ -4,13 +4,14 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db.models import Base, GatewayAsset, GatewayObservation, GatewaySecret, Target, Task
 from app.db.session import get_session
-from app.main import app
+from app.api import gateway_hunt
 
 
 def _engine(tmp_path):
@@ -105,11 +106,13 @@ def gateway_api(tmp_path, monkeypatch):
         async with session_maker() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_session
-    with TestClient(app) as client:
+    test_app = FastAPI()
+    test_app.include_router(gateway_hunt.router)
+    test_app.dependency_overrides[get_session] = override_session
+    with TestClient(test_app) as client:
         client._session_maker = session_maker
         yield client
-    app.dependency_overrides.clear()
+    test_app.dependency_overrides.clear()
     asyncio.run(engine.dispose())
 
 
