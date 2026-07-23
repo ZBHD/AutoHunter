@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api import (
-    findings, intel, killsweeps, missed_signals, runtime_logs, settings, stream, tasks, vulns,
+    findings, gateway_hunt, intel, killsweeps, missed_signals, runtime_logs, settings, stream, tasks, vulns,
 )
 from app.db.session import init_db
 from app.ds2api_proxy import ENABLED as DS2API_ENABLED, router as ds2api_router
@@ -173,6 +173,7 @@ async def security_middleware(request: Request, call_next):
     return response
 
 app.include_router(tasks.router)
+app.include_router(gateway_hunt.router)
 app.include_router(findings.router)
 app.include_router(missed_signals.router)
 app.include_router(killsweeps.router)
