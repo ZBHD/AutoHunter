@@ -77,21 +77,21 @@ def _normalize_host(url_or_host: str, *, include_port: bool = True) -> str:
     s = (url_or_host or "").strip()
     if not s:
         return ""
+    from app.urlnorm import is_bare_ipv6, safe_hostname, safe_port, safe_urlparse
     try:
         return _normalize_ip_address(s.strip("[]"))
     except ValueError:
         pass
-    if "://" not in s:
-        s = "http://" + s
-    try:
-        p = urlparse(s)
-    except Exception:
+    parsed = safe_urlparse(s)
+    host = _normalize_hostname(safe_hostname(parsed))
+    if not host:
         return s.lower().strip("/")
-    host = _normalize_hostname(p.hostname or "")
-    if include_port and p.port and p.port not in (80, 443):
-        authority_host = f"[{host}]" if ":" in host else host
-        host = f"{authority_host}:{p.port}"
-    return host
+    if include_port:
+        port = safe_port(parsed)
+        if port and port not in (80, 443):
+            authority_host = f"[{host}]" if is_bare_ipv6(host) else host
+            return f"{authority_host}:{port}"
+    return f"[{host}]" if is_bare_ipv6(host) else host
 
 
 def _canonical_http_url(value: str) -> str:

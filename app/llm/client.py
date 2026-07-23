@@ -25,6 +25,73 @@ logger = logging.getLogger("autohunter.llm")
 _SECRET_RE = re.compile(r"\b(sk-[A-Za-z0-9_-]{8,})\b")
 _REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "120"))
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _default_ua_for_model(model: str, base_url: str = "") -> str:
+    model_name = (model or "").lower()
+    families = (
+        (("deepseek",), "DeepSeek/1.0 (compatible)"),
+        (("claude", "anthropic"), "Anthropic/Python 0.39.0"),
+        (("gpt", "o1", "o3", "o4", "openai"), "OpenAI/Python 1.51.0"),
+        (("glm", "zhipu", "chatglm"), "zhipuai/2.1.0"),
+        (("qwen", "qianwen", "dashscope", "tongyi"), "dashscope/1.20.0 python"),
+        (("kimi", "moonshot"), "moonshot/1.0 python"),
+        (("gemini", "google"), "google-genai/0.8.0"),
+        (("grok", "xai"), "xai-sdk/0.1.0"),
+    )
+    for markers, user_agent in families:
+        if any(marker in model_name for marker in markers):
+            return user_agent
+    return _BROWSER_UA
+
+
+def _resolve_user_agent(model: str, base_url: str = "") -> str:
+    explicit = (os.environ.get("LLM_USER_AGENT", "") or "").strip()
+    if not explicit or explicit.lower() in {"auto", "model"}:
+        return _default_ua_for_model(model, base_url)
+    if explicit.lower() in {"browser", "chrome"}:
+        return _BROWSER_UA
+    return explicit
+
+
+def _stainless_omit_value():
+    try:
+        from openai import Omit  # type: ignore
+        return Omit()
+    except Exception:  # pragma: no cover - older SDKs
+        return ""
+
+
+def _llm_default_headers(model: str, base_url: str = "") -> dict[str, Any]:
+    """Headers compatible with OpenAI SDK relays that reject SDK fingerprints."""
+    omit = _stainless_omit_value()
+    headers: dict[str, Any] = {"User-Agent": _resolve_user_agent(model, base_url)}
+    for name in (
+        "X-Stainless-Lang", "X-Stainless-Package-Version", "X-Stainless-OS",
+        "X-Stainless-Arch", "X-Stainless-Runtime", "X-Stainless-Runtime-Version",
+        "X-Stainless-Async", "X-Stainless-Retry-Count", "X-Stainless-Read-Timeout",
+    ):
+        headers[name] = omit
+    return headers
+
+
+def _per_request_omit_headers() -> dict[str, Any]:
+    omit = _stainless_omit_value()
+    if omit == "":
+        return {}
+    return {"X-Stainless-Retry-Count": omit, "X-Stainless-Read-Timeout": omit}
+
+
+def _decorate_payload_headers(payload, model: str, base_url: str) -> None:
+    payload.headers["User-Agent"] = _resolve_user_agent(model, base_url)
+    for name in list(payload.headers):
+        if str(name).lower().startswith("x-stainless-"):
+            payload.headers.pop(name, None)
+
 
 class LLMError(RuntimeError):
     """归一化 LLM 错误。"""
@@ -265,6 +332,7 @@ class LLMClient:
             temperature=temp,
             max_tokens=mt,
         )
+        _decorate_payload_headers(payload, self.config.model, self.config.base_url)
 
         try:
             resp = self._send(payload)
@@ -292,6 +360,7 @@ class LLMClient:
                 temperature=temp,
                 max_tokens=mt,
             )
+            _decorate_payload_headers(fallback, self.config.model, self.config.base_url)
             resp = self._send(fallback)
 
         try:
