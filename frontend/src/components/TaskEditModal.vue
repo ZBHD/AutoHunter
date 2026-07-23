@@ -3,6 +3,11 @@ import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 import VulnerabilityTypeSelector from "./VulnerabilityTypeSelector.vue";
 import { isAutoSource, isManualOnly, isSiteSource, isFofaPoolMode, fofaKeyPatch } from "../taskSourceModes.js";
+import {
+  buildLiteLlmTaskPayload,
+  litellmFormFromTask,
+  validateLiteLlmForm,
+} from "../litellmTaskMode.js";
 
 const props = defineProps({
   open: Boolean,
@@ -14,6 +19,7 @@ const models = ref([]);            // 拉取到的可用模型列表
 const modelsLoading = ref(false);
 const modelsError = ref("");
 const useCustomModel = ref(false); // 列表外手输模式
+const formError = ref("");
 
 async function loadModels() {
   if (form.use_global_pool) {
@@ -73,6 +79,7 @@ const form = reactive({
   page_size: 100,
   concurrency: 3,
   site_recon_mode: "full",
+  ...litellmFormFromTask({}),
 });
 const original = reactive({
   use_global_pool: true,
@@ -84,6 +91,7 @@ const original = reactive({
   fofa_is_fofa: true,
 });
 const isSiteMode = computed(() => form.target_source === "site");
+const isLiteLlmMode = computed(() => form.src_type === "litellm");
 const isAutoMode = computed(() => isAutoSource(form.target_source));
 const isManualOnlyMode = computed(() => isManualOnly(form.target_source));
 const isFofaMode = computed(() => isFofaPoolMode(form.target_source, form.engine));
@@ -94,6 +102,13 @@ const dedicatedKeyRequired = computed(() => (
 
 function handleTargetSourceChange() {
   if (isSiteMode.value) form.site_recon_mode = "full";
+}
+
+function handleTaskModeChange() {
+  formError.value = "";
+  if (isLiteLlmMode.value && form.target_source === "site") {
+    form.target_source = "fofa";
+  }
 }
 
 function handleEngineChange() {
@@ -137,6 +152,7 @@ function fill(task) {
   form.max_pages = fofaCfg.max_pages ?? 20;
   form.page_size = fofaCfg.page_size ?? 100;
   form.concurrency = task.concurrency || 3;
+  Object.assign(form, litellmFormFromTask(task));
   original.use_global_pool = form.use_global_pool;
   original.intent_mode = form.intent_mode;
   original.fofa_base_url = form.fofa_base_url;
@@ -148,6 +164,7 @@ function fill(task) {
   models.value = [];
   modelsError.value = "";
   useCustomModel.value = false;
+  formError.value = "";
 }
 
 watch(() => props.task, fill, { immediate: true });
@@ -159,6 +176,12 @@ watch(() => props.open, (open) => {
 });
 
 async function save() {
+  formError.value = "";
+  const liteValidation = isLiteLlmMode.value ? validateLiteLlmForm(form) : null;
+  if (liteValidation && !liteValidation.valid) {
+    formError.value = liteValidation.errors[0];
+    return;
+  }
   const modelConfig = {
     use_global_pool: form.use_global_pool,
     prompt_version: form.prompt_version,
@@ -193,7 +216,7 @@ async function save() {
   }
   if (isSiteMode.value) fofaConfig.site_recon_mode = form.site_recon_mode;
 
-  const updated = await api.updateTask(props.task.id, {
+  const body = {
     name: form.name,
     src_type: form.src_type,
     vuln_types: [...form.vuln_types],
@@ -209,7 +232,11 @@ async function save() {
     model_config_data: modelConfig,
     fofa_config: fofaConfig,
     engine_config: engineConfig,
-  });
+  };
+  if (isLiteLlmMode.value) {
+    Object.assign(body, buildLiteLlmTaskPayload(form));
+  }
+  const updated = await api.updateTask(props.task.id, body);
   emit("saved", updated);
 }
 </script>
@@ -229,9 +256,10 @@ async function save() {
         <label>任务名称 <input v-model="form.name" required /></label>
         <label>worker 并发 <input v-model="form.concurrency" type="number" min="1" max="20" /></label>
         <label>任务模式
-          <select v-model="form.src_type">
+          <select v-model="form.src_type" @change="handleTaskModeChange">
             <option value="edusrc">EduSRC（教育行业）</option>
             <option value="enterprise">企业SRC</option>
+            <option value="litellm">LiteLLM（专项网关巡检）</option>
           </select>
         </label>
         <label>目标来源
@@ -239,7 +267,7 @@ async function save() {
             <option value="fofa">FOFA 自动搜</option>
             <option value="manual">手动清单</option>
             <option value="both">两者</option>
-            <option value="site">单站协作</option>
+            <option v-if="!isLiteLlmMode" value="site">单站协作</option>
           </select>
         </label>
         <div v-if="isSiteMode" class="site-recon-mode full">
@@ -268,7 +296,7 @@ async function save() {
             <option value="censys">Censys</option>
           </select>
         </label>
-        <label v-if="isFofaMode">搜集方式
+        <label v-if="isFofaMode && !isLiteLlmMode">搜集方式
           <select v-model="form.intent_mode">
             <option value="">自动判断</option>
             <option value="syntax">FOFA 语法</option>
@@ -277,16 +305,70 @@ async function save() {
         </label>
       </div>
 
-      <VulnerabilityTypeSelector v-model="form.vuln_types" />
-      <label>指定挖掘方向（可选）
+      <section v-if="isLiteLlmMode" class="litellm-mode-panel">
+        <header>
+          <h3>LiteLLM 专项检测</h3>
+          <span>PROFILE v1</span>
+        </header>
+        <div class="model-mode-switch" role="group" aria-label="LiteLLM 巡检范围">
+          <button type="button" :class="{ active: form.scopeMode === 'targeted' }"
+            :aria-pressed="form.scopeMode === 'targeted'" @click="form.scopeMode = 'targeted'">
+            定向巡检
+          </button>
+          <button type="button" :class="{ active: form.scopeMode === 'global' }"
+            :aria-pressed="form.scopeMode === 'global'" @click="form.scopeMode = 'global'; form.target_source = 'fofa'">
+            全网巡检
+          </button>
+        </div>
+        <label v-if="form.scopeMode === 'targeted'">范围锚点（每行一个）
+          <textarea v-model="form.scopeAnchors" rows="3" placeholder="example.com&#10;org:Example Corp&#10;cert:Example Gateway"></textarea>
+        </label>
+        <fieldset class="litellm-checks">
+          <legend>检测项</legend>
+          <label><input v-model="form.checks.key_leak" type="checkbox" /> Key 泄露</label>
+          <label><input v-model="form.checks.env_leak" type="checkbox" /> 环境配置泄露</label>
+          <label><input v-model="form.checks.management_exposure" type="checkbox" /> 管理接口暴露</label>
+          <label><input v-model="form.checks.anonymous_models" type="checkbox" /> 匿名模型列表</label>
+          <label><input v-model="form.checks.anonymous_inference" type="checkbox" /> 匿名最小推理</label>
+        </fieldset>
+        <div class="litellm-settings-grid">
+          <label>验证级别
+            <select v-model="form.validationLevel">
+              <option value="basic">基础验证</option>
+              <option value="full">完整验证</option>
+            </select>
+          </label>
+          <label>单资产请求预算
+            <input v-model="form.maxRequestsPerAssetEpoch" type="number" min="1" max="10000" />
+          </label>
+          <label>每轮凭据验证上限
+            <input v-model="form.maxProviderValidationsPerCycle" type="number" min="0" max="10000" />
+          </label>
+          <label>最小推理 Token
+            <input v-model="form.maxTokens" type="number" min="1" max="8" />
+          </label>
+          <label>已确认复查（小时）
+            <input v-model="form.confirmedRecheckHours" type="number" min="0" max="720" />
+          </label>
+          <label>已保护复查（小时）
+            <input v-model="form.protectedRecheckHours" type="number" min="0" max="720" />
+          </label>
+          <label>不可达复查（小时）
+            <input v-model="form.unreachableRecheckHours" type="number" min="0" max="720" />
+          </label>
+        </div>
+      </section>
+
+      <VulnerabilityTypeSelector v-model="form.vuln_types" v-if="!isLiteLlmMode" />
+      <label v-if="!isLiteLlmMode">指定挖掘方向（可选）
         <textarea v-model="form.hunt_direction" rows="3" maxlength="2000"
           placeholder="例：重点测试后台 API 的水平/垂直越权、批量导出和敏感写操作；优先关注 object_id、user_id 等对象参数。"></textarea>
       </label>
-        <label v-if="isAutoMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
+        <label v-if="isAutoMode && !isLiteLlmMode">FOFA 语法 / 搜集意图 <input v-model="form.fofa_query" /></label>
         <label v-else-if="isSiteMode">目标相关信息 / 协作重点 / 已有凭据
         <textarea v-model="form.fofa_query" rows="4" placeholder="可写重点方向、后台位置，以及【已有的登录凭据】。给了凭据 Agent 会先前台测、再登录进系统内部深挖。&#10;例：后台在 /admin；已有账号 test / Test@123；或 Cookie: JSESSIONID=xxxx"></textarea>
       </label>
-        <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : "手动目标清单（每行一个）" }}
+        <label v-if="showManualTargets">{{ isSiteMode ? "主目标 URL（每行一个，会自动拆成多条协作路线）" : (isLiteLlmMode ? "LiteLLM 网关 URL（每行一个）" : "手动目标清单（每行一个）") }}
         <textarea v-model="form.manual_targets" rows="3"></textarea>
       </label>
 
@@ -377,9 +459,11 @@ async function save() {
         </div>
       </details>
 
-      <label>SRC 规则
+      <label v-if="!isLiteLlmMode">SRC 规则
         <textarea v-model="form.src_rules" rows="3"></textarea>
       </label>
+
+      <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
 
       <footer>
         <button type="button" @click="emit('close')">取消</button>

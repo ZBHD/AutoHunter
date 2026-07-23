@@ -1879,6 +1879,86 @@ main {
   margin-top: 0;
 }
 
+.litellm-mode-panel {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.litellm-mode-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.litellm-mode-panel > header h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+}
+.litellm-mode-panel > header span {
+  flex: none;
+  color: var(--accent-ink);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 700;
+}
+.litellm-mode-panel .model-mode-switch { margin-top: 0; }
+.litellm-checks {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+}
+.litellm-checks legend {
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.form .litellm-checks label,
+.task-edit-modal .litellm-checks label {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+.litellm-checks input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+.litellm-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+.form .litellm-settings-grid label,
+.task-edit-modal .litellm-settings-grid label {
+  margin: 0;
+}
+.form-error {
+  margin: 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--danger);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 @media (max-width: 860px) {
   .provider-row {
     grid-template-columns: 34px minmax(0, 1fr);
@@ -1981,6 +2061,9 @@ main {
   }
   .model-mode-switch,
   .task-model-grid {
+    grid-template-columns: 1fr;
+  }
+  .litellm-settings-grid {
     grid-template-columns: 1fr;
   }
   .task-model-grid .full {
