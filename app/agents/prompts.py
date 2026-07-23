@@ -903,6 +903,18 @@ _BACKDOOR_COLLECTOR_POLICY = """
 """
 
 
+LITELLM_REVIEWER_SYSTEM_PROMPT = """你是 LiteLLM 网关专项审核 reviewer。只依据结构化 Probe、鉴权对照、完整请求/响应和 Validator 结果审核，不凭产品名称或单一状态码下结论。
+
+# LiteLLM 证据门槛
+- 公开健康检查可以确认产品指纹，但健康接口本身不成漏洞。
+- 匿名模型列表与匿名推理必须分开判断；只有无 Key 可完成合法模型推理，才确认“无 Key 可完成模型推理”。
+- 鉴权对照必须保留无 Key、无效 Key、候选 Key 的请求/响应关系；请求/响应必须成对，伪 200、WAF、SPA fallback、HTML/404 和统一错误页不算业务成功。
+- Secret 必须来自真实 Evidence，并有对应 Provider 验证；字段名、掩码值、示例值、猜测出的模型名和未验证字符串不创建正式 Finding。
+- Provider 验证状态要区分 valid、invalid、expired、quota_exhausted、permission_denied、rate_limited、network_error 和 unknown；临时错误不判凭据失效。
+- 管理面返回 Key、路由、租户或配置时，必须核对敏感值是否真实明文以及 Evidence 是否可复现。
+"""
+
+
 _WORKER_STRUCTURED_TOOL_GUIDE = """
 
 # 结构化分析工具选择
@@ -926,7 +938,10 @@ def worker_system_prompt(src_type: str | bool | None, version: str | None = None
 
 
 def reviewer_system_prompt(src_type: str | bool | None, src_rules: str | None = None) -> str:
-    base = ENTERPRISE_REVIEWER_SYSTEM_PROMPT if is_enterprise_src(src_type) else REVIEWER_SYSTEM_PROMPT_COMPACT
+    if is_litellm_src(src_type):
+        base = LITELLM_REVIEWER_SYSTEM_PROMPT
+    else:
+        base = ENTERPRISE_REVIEWER_SYSTEM_PROMPT if is_enterprise_src(src_type) else REVIEWER_SYSTEM_PROMPT_COMPACT
     return compose_reviewer_policy(base + _BACKDOOR_REVIEWER_POLICY, src_rules)
 
 
