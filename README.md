@@ -60,6 +60,8 @@ Docker 镜像内包含以下主要工具：
 
 扫描器命中只作为候选线索，不能替代真实请求、响应和影响证据。企业 SRC 模式会限制自动化漏洞扫描器；Nuclei 和 Dalfox 不会作为企业模式的可用结构化工具，命令执行同样受企业策略检查。
 
+Worker 以单个目标为边界，按 `recon → locate → verify → evidence` 分阶段工作。SRC CLI 输出是**候选地图而不是漏洞**：实时看板用 `tool_src_cli_started` 记录工具、轮次和阶段，用 `tool_src_cli_result` 记录执行、解析状态和脱敏摘要。工具和 HTTP 请求只跟随**同主机重定向**，跨主机地址仅记录，不自动跟随。
+
 
 | 场景 | 首选链路 | 结束条件 |
 | --- | --- | --- |
@@ -69,6 +71,8 @@ Docker 镜像内包含以下主要工具：
 | API 文档 | `http_request → analyze_api_schema → http_request` | 高风险接口的鉴权和对象边界已经验证 |
 | 登录与越权 | `http_request → analyze_auth_material → session_set → compare_http_responses` | 不同身份或对象的响应差异已经验证 |
 | 企业 SRC | `crawl_endpoints → discover_parameters → http_request` | 通过有界侦察、单请求和本地分析完成取证 |
+
+企业 SRC **严禁使用** Nuclei、Dalfox 等自动化漏洞扫描器。项目策略同时禁止破坏性写入、删除、密码重置、批量导出、全端口宽扫和压力测试。
 
 
 ## 快速部署

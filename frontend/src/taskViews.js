@@ -3,6 +3,9 @@ export const TASK_VIEWS = Object.freeze({
   scanned: { key: "scanned", label: "已扫" },
   findings: { key: "findings", label: "原始发现" },
   killsweeps: { key: "killsweeps", label: "通杀" },
+  "gateway-assets": { key: "gateway-assets", label: "网关资产" },
+  "gateway-secrets": { key: "gateway-secrets", label: "Secret" },
+  "gateway-observations": { key: "gateway-observations", label: "探测记录" },
 });
 
 export function normalizeTaskView(view) {
@@ -24,6 +27,9 @@ const SENSITIVE_TASK_VIEWS = new Set([
   "rejected",
   "archived",
   "queued",
+  "gateway-assets",
+  "gateway-secrets",
+  "gateway-observations",
 ]);
 
 export function taskViewForRole(view, role) {

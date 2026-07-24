@@ -13,6 +13,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.agents.prompts import is_litellm_src
+
 
 LLMProtocol = Literal["openai_chat", "anthropic_messages", "openai_responses"]
 
@@ -36,6 +38,33 @@ def _validated_http_url(value: str) -> str:
         or bool(parsed.fragment)
     ):
         raise ValueError("must be an absolute HTTP(S) URL without credentials or query")
+    return normalized
+
+
+def validate_litellm_manual_target_url(value: str) -> str:
+    """校验 LiteLLM 手动资产 URL；路径和 query 可作为网关挂载线索。"""
+
+    normalized = str(value or "").strip()
+    try:
+        parsed = urlparse(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "LiteLLM manual target must be an absolute HTTP(S) URL "
+            "without credentials or fragment"
+        ) from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or (port is not None and not 1 <= port <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+        or "#" in normalized
+    ):
+        raise ValueError(
+            "LiteLLM manual target must be an absolute HTTP(S) URL "
+            "without credentials or fragment"
+        )
     return normalized
 
 
@@ -77,6 +106,90 @@ class EngineConfigDTO(BaseModel):
     base_url: str = ""
 
 
+class LiteLlmChecksDTO(BaseModel):
+    """LiteLLM 专项检查开关。
+
+    这些开关只影响服务端生成的专项漏洞类型，不接受客户端直接注入通用
+    Web 漏洞类型。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_leak: bool = True
+    env_leak: bool = True
+    management_exposure: bool = True
+    anonymous_models: bool = True
+    anonymous_inference: bool = True
+
+
+class LiteLlmValidationDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    level: Literal["basic", "full"] = "full"
+    max_tokens: int = Field(default=1, ge=1, le=8)
+    max_provider_validations_per_cycle: int = Field(default=20, ge=0, le=10000)
+    max_requests_per_asset_epoch: int = Field(default=24, ge=1, le=10000)
+
+
+class LiteLlmRecheckIntervalsDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed_seconds: int = Field(default=21600, ge=0, le=2_592_000)
+    protected_seconds: int = Field(default=86400, ge=0, le=2_592_000)
+    unreachable_seconds: int = Field(default=3600, ge=0, le=2_592_000)
+
+
+class LiteLlmModeConfigDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_mode: Literal["targeted", "global"] = "targeted"
+    scope_anchors: list[str] = Field(default_factory=list, max_length=100)
+    enabled_profiles: list[str] = Field(
+        default_factory=lambda: ["litellm"], max_length=10
+    )
+    profile_versions: dict[str, str] = Field(
+        default_factory=lambda: {"litellm": "1"}
+    )
+    checks: LiteLlmChecksDTO = Field(default_factory=LiteLlmChecksDTO)
+    validation: LiteLlmValidationDTO = Field(default_factory=LiteLlmValidationDTO)
+    recheck_intervals: LiteLlmRecheckIntervalsDTO = Field(
+        default_factory=LiteLlmRecheckIntervalsDTO
+    )
+    collection_state: dict = Field(default_factory=dict)
+
+    @field_validator("scope_anchors")
+    @classmethod
+    def _scope_anchors(cls, values: list[str]) -> list[str]:
+        normalized = [str(value or "").strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("scope_anchors must not contain empty values")
+        if any(len(value) > 255 for value in normalized):
+            raise ValueError("scope_anchors entries must be at most 255 characters")
+        return normalized
+
+    @field_validator("enabled_profiles")
+    @classmethod
+    def _enabled_profiles(cls, values: list[str]) -> list[str]:
+        normalized = [str(value or "").strip().lower() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("enabled_profiles must not contain empty values")
+        return normalized
+
+    @field_validator("profile_versions")
+    @classmethod
+    def _profile_versions(cls, values: dict[str, str]) -> dict[str, str]:
+        return {
+            str(profile or "").strip().lower(): str(version or "").strip()
+            for profile, version in values.items()
+        }
+
+
+# 保留两种 Python 类名写法，JSON/API 标识统一使用 litellm。
+LiteLLMChecksDTO = LiteLlmChecksDTO
+LiteLLMValidationDTO = LiteLlmValidationDTO
+LiteLLMModeConfigDTO = LiteLlmModeConfigDTO
+
+
 class CreateTaskRequest(BaseModel):
     name: str
     src_type: str = "edusrc"
@@ -92,11 +205,32 @@ class CreateTaskRequest(BaseModel):
     fofa_config: FofaConfigDTO = Field(default_factory=FofaConfigDTO)
     engine_config: EngineConfigDTO = Field(default_factory=EngineConfigDTO)  # 引擎 Key/URL
     concurrency: int = 3
+    mode_config: LiteLlmModeConfigDTO | None = None
 
     @field_validator("hunt_direction", mode="before")
     @classmethod
     def _hunt_direction(cls, value: str) -> str:
         return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def _validate_litellm_mode(self):
+        if is_litellm_src(self.src_type):
+            if self.mode_config is None:
+                self.mode_config = LiteLlmModeConfigDTO()
+            self.manual_targets = [
+                validate_litellm_manual_target_url(target)
+                for target in self.manual_targets
+            ]
+            if (
+                self.target_source in {"fofa", "manual", "both"}
+                and self.mode_config.scope_mode == "targeted"
+                and not self.mode_config.scope_anchors
+                and not self.manual_targets
+            ):
+                raise ValueError(
+                    "targeted LiteLLM tasks require scope_anchors or manual_targets"
+                )
+        return self
 
 
 class PartialModelConfigDTO(BaseModel):
@@ -153,11 +287,25 @@ class UpdateTaskRequest(BaseModel):
     fofa_config: Optional[PartialFofaConfigDTO] = None
     engine_config: Optional[PartialEngineConfigDTO] = None
     concurrency: Optional[int] = None
+    mode_config: Optional[LiteLlmModeConfigDTO] = None
 
     @field_validator("hunt_direction", mode="before")
     @classmethod
     def _hunt_direction(cls, value: str | None) -> str | None:
         return None if value is None else str(value).strip()
+
+    @model_validator(mode="after")
+    def _validate_explicit_litellm_targets(self):
+        if (
+            self.src_type is not None
+            and is_litellm_src(self.src_type)
+            and self.manual_targets is not None
+        ):
+            self.manual_targets = [
+                validate_litellm_manual_target_url(target)
+                for target in self.manual_targets
+            ]
+        return self
 
 
 class TaskStats(BaseModel):
@@ -198,6 +346,7 @@ class TaskResponse(BaseModel):
     src_rules: str = ""
     manual_targets: list[str] = Field(default_factory=list)
     auth_bindings: list[dict] = Field(default_factory=list)
+    mode_config: dict = Field(default_factory=dict)
     model_config_data: dict = Field(default_factory=dict)
     fofa_config: dict = Field(default_factory=dict)
     search_enabled: bool = True

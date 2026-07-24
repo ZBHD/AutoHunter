@@ -6,10 +6,11 @@ from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dto import (
-    CreateTaskRequest, QueueOrderRequest, TaskResponse, TaskStats, UpdateTaskRequest,
+    CreateTaskRequest, LiteLlmModeConfigDTO, QueueOrderRequest, TaskResponse,
+    TaskStats, UpdateTaskRequest, validate_litellm_manual_target_url,
 )
 from app.agents import site_collab
-from app.agents.prompts import normalize_src_type
+from app.agents.prompts import is_litellm_src, normalize_src_type
 from app.db.models import (
     EscalationAttempt, Finding, Killsweep, KillsweepAttempt, KillsweepEvent, KillsweepReanalysisBatch,
     MissedSignal, MissedSignalDraft, MissedSignalEvent, MissedSignalEvidence,
@@ -36,6 +37,113 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 _TASK_LLM_PROVIDER_FIELDS = (
     "base_url", "api_key", "model", "protocol", "temperature",
 )
+
+_LITELLM_ALLOWED_PROFILES = frozenset({"litellm"})
+_LITELLM_TARGET_SOURCES = frozenset({"fofa", "manual", "both"})
+_LITELLM_MAX_PROVIDER_VALIDATIONS = 100
+_LITELLM_MAX_REQUESTS_PER_ASSET_EPOCH = 200
+_LITELLM_VULN_TYPES_BY_CHECK = {
+    "key_leak": (
+        "litellm_master_key_leak",
+        "litellm_virtual_key_leak",
+        "provider_api_key_leak",
+    ),
+    "env_leak": (
+        "litellm_env_exposure",
+        "litellm_database_dsn_exposure",
+        "litellm_sensitive_config_exposure",
+    ),
+    "management_exposure": ("litellm_management_api_exposure",),
+    "anonymous_models": ("litellm_unauthenticated_model_list",),
+    "anonymous_inference": ("litellm_unauthenticated_inference",),
+}
+
+
+def _litellm_vuln_types(mode_config) -> list[str]:
+    config = mode_config
+    if not isinstance(config, LiteLlmModeConfigDTO):
+        config = LiteLlmModeConfigDTO.model_validate(config or {})
+    checks = config.checks.model_dump()
+    return [
+        vuln_type
+        for check_name, vuln_types in _LITELLM_VULN_TYPES_BY_CHECK.items()
+        if checks.get(check_name, False)
+        for vuln_type in vuln_types
+    ]
+
+
+def _merge_litellm_mode_config(
+    current: dict | None,
+    patch: LiteLlmModeConfigDTO,
+) -> LiteLlmModeConfigDTO:
+    merged = LiteLlmModeConfigDTO.model_validate(current or {}).model_dump()
+    patch_data = patch.model_dump(exclude_unset=True)
+    for key, value in patch_data.items():
+        if (
+            key in {"checks", "validation", "recheck_intervals"}
+            and isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return LiteLlmModeConfigDTO.model_validate(merged)
+
+
+def _litellm_scope_signature(
+    config: LiteLlmModeConfigDTO,
+    target_source: str,
+    manual_targets: list[str] | None,
+) -> tuple:
+    return (
+        config.scope_mode,
+        tuple(sorted(set(config.scope_anchors))),
+        tuple(sorted(set(config.enabled_profiles))),
+        tuple(sorted(config.profile_versions.items())),
+        str(target_source or "").strip().lower(),
+        tuple(sorted({str(target or "").strip() for target in manual_targets or []})),
+    )
+
+
+def _validate_litellm_request(
+    mode_config,
+    target_source: str,
+    manual_targets: list[str] | None,
+) -> LiteLlmModeConfigDTO:
+    config = (
+        mode_config
+        if isinstance(mode_config, LiteLlmModeConfigDTO)
+        else LiteLlmModeConfigDTO.model_validate(mode_config or {})
+    )
+    profiles = set(config.enabled_profiles)
+    versions = set(config.profile_versions)
+    if profiles != _LITELLM_ALLOWED_PROFILES:
+        raise HTTPException(400, "enabled_profiles 仅支持 litellm Profile")
+    if versions != profiles or any(
+        not str(version or "").strip() for version in config.profile_versions.values()
+    ):
+        raise HTTPException(400, "profile_versions 必须与 enabled_profiles 一致且版本非空")
+    if target_source not in _LITELLM_TARGET_SOURCES:
+        raise HTTPException(400, "LiteLLM target_source 必须是 fofa/manual/both")
+    try:
+        for target in manual_targets or []:
+            validate_litellm_manual_target_url(target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if config.scope_mode == "global" and target_source not in {"fofa", "both"}:
+        raise HTTPException(400, "LiteLLM 全网发现必须使用 fofa 或 both source")
+    if (
+        config.scope_mode == "targeted"
+        and not config.scope_anchors
+        and not [target for target in (manual_targets or []) if str(target).strip()]
+    ):
+        raise HTTPException(400, "LiteLLM 定向发现需要范围锚点或手动目标")
+    validation = config.validation
+    if validation.max_provider_validations_per_cycle > _LITELLM_MAX_PROVIDER_VALIDATIONS:
+        raise HTTPException(400, "单轮 Provider 验证预算超出上限")
+    if validation.max_requests_per_asset_epoch > _LITELLM_MAX_REQUESTS_PER_ASSET_EPOCH:
+        raise HTTPException(400, "单资产请求预算超出上限")
+    return config
 
 
 # Activity Stream 历史回放：过滤高频低价值事件（与前端 BoardView 规则对齐）。
@@ -257,6 +365,7 @@ def _task_to_dto(t: Task, stats: TaskStats | None = None,
         src_rules="" if observer else (t.src_rules or ""),
         manual_targets=[] if observer else (t.manual_targets or []),
         auth_bindings=[] if observer or redact_auth else (t.auth_bindings or []),
+        mode_config={} if observer else dict(t.mode_config_json or {}),
         model_config_data=model_config,
         fofa_config=_observer_fofa_config(t) if observer else _public_fofa_config(t),
         search_enabled=bool(t.search_enabled),
@@ -339,6 +448,15 @@ async def _compute_stats(session: AsyncSession, task_id: str) -> TaskStats:
 async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(get_session)):
     if req.target_source not in {"fofa", "manual", "both", "site"}:
         raise HTTPException(400, "target_source 必须是 fofa/manual/both/site")
+    normalized_src_type = normalize_src_type(req.src_type)
+    mode_config = {}
+    vuln_types = req.vuln_types
+    if is_litellm_src(normalized_src_type):
+        validated_mode = _validate_litellm_request(
+            req.mode_config, req.target_source, req.manual_targets
+        )
+        mode_config = validated_mode.model_dump()
+        vuln_types = _litellm_vuln_types(validated_mode)
     engine_name = req.engine or ""
     # 引擎配置：合并 engine_config 和向后兼容的 fofa_config
     fofa_cfg = req.fofa_config.model_dump(exclude_defaults=True) if req.fofa_config else {}
@@ -348,12 +466,13 @@ async def create_task(req: CreateTaskRequest, session: AsyncSession = Depends(ge
     if eng_cfg.get("base_url"):
         fofa_cfg["base_url"] = eng_cfg["base_url"]
     task = Task(
-        name=req.name, src_type=normalize_src_type(req.src_type), vuln_types=req.vuln_types,
+        name=req.name, src_type=normalized_src_type, vuln_types=vuln_types,
         src_rules=req.src_rules, target_source=req.target_source,
         engine=engine_name, fofa_query=req.fofa_query, hunt_direction=req.hunt_direction,
         manual_targets=req.manual_targets,
         auth_bindings=req.auth_bindings,
         model_config_json=_new_task_model_config(req.model_config_data),
+        mode_config_json=mode_config,
         fofa_config=fofa_cfg, concurrency=req.concurrency,
         status="created",
     )
@@ -492,12 +611,52 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         and req.fofa_config.site_recon_mode is not None
     )
 
+    effective_src_type = normalize_src_type(req.src_type) if req.src_type is not None else task.src_type
+    effective_target_source = req.target_source or task.target_source
+    effective_manual_targets = (
+        req.manual_targets if req.manual_targets is not None else (task.manual_targets or [])
+    )
+    validated_mode_config: LiteLlmModeConfigDTO | None = None
+    if is_litellm_src(effective_src_type):
+        current_mode_config = LiteLlmModeConfigDTO.model_validate(
+            task.mode_config_json or {}
+        )
+        effective_mode_config = (
+            _merge_litellm_mode_config(task.mode_config_json, req.mode_config)
+            if req.mode_config is not None
+            else current_mode_config
+        )
+        if (
+            task.status == "running"
+            and is_litellm_src(task.src_type)
+            and (
+                req.mode_config is not None
+                or req.target_source is not None
+                or req.manual_targets is not None
+            )
+            and _litellm_scope_signature(
+                current_mode_config, task.target_source, task.manual_targets
+            )
+            != _litellm_scope_signature(
+                effective_mode_config,
+                effective_target_source,
+                effective_manual_targets,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="运行中的 LiteLLM 任务需暂停后修改范围或 Profile",
+            )
+        validated_mode_config = _validate_litellm_request(
+            effective_mode_config, effective_target_source, effective_manual_targets
+        )
+
     if req.name is not None:
         task.name = req.name.strip() or task.name
     if req.src_type is not None:
         if task.status == "running":
             raise HTTPException(status_code=409, detail="运行中的任务需暂停后切换 SRC 模式")
-        task.src_type = normalize_src_type(req.src_type)
+        task.src_type = effective_src_type
     if req.vuln_types is not None:
         task.vuln_types = [v.strip() for v in req.vuln_types if str(v).strip()]
     if req.src_rules is not None:
@@ -527,6 +686,17 @@ async def update_task(task_id: str, req: UpdateTaskRequest, session: AsyncSessio
         task.model_config_json = _patch_task_model_config(
             task.model_config_json, patch
         )
+
+    if is_litellm_src(effective_src_type):
+        # LiteLLM 漏洞类型由检查开关决定，忽略请求中的通用 Web 类型。
+        task.mode_config_json = (
+            validated_mode_config.model_dump()
+            if validated_mode_config is not None
+            else {}
+        )
+        task.vuln_types = _litellm_vuln_types(validated_mode_config)
+    elif req.src_type is not None:
+        task.mode_config_json = {}
 
     if req.fofa_config is not None:
         patch = req.fofa_config.model_dump(exclude_unset=True)

@@ -12,6 +12,9 @@ import ScannedTargetsPanel from "../components/task/ScannedTargetsPanel.vue";
 import RawFindingsPanel from "../components/task/RawFindingsPanel.vue";
 import TaskKillsweepPanel from "../components/task/TaskKillsweepPanel.vue";
 import QueuedTargetsPanel from "../components/task/QueuedTargetsPanel.vue";
+import LiteLlmAssetsPanel from "../components/task/LiteLlmAssetsPanel.vue";
+import LiteLlmSecretsPanel from "../components/task/LiteLlmSecretsPanel.vue";
+import LiteLlmObservationsPanel from "../components/task/LiteLlmObservationsPanel.vue";
 import { cooldownLabel } from "../fofaKeys.js";
 import { collectorViewModel, formatFofaCollectorEvent, mergeCollectorEvent } from "../collectorStatus.js";
 import {
@@ -26,7 +29,10 @@ import {
 const props = defineProps({ id: String });
 const route = useRoute();
 const router = useRouter();
-const requestedQueryView = ["scanned", "findings"].includes(String(route.query.view || ""))
+const QUERY_TASK_VIEWS = new Set([
+  "scanned", "findings", "gateway-assets", "gateway-secrets", "gateway-observations",
+]);
+const requestedQueryView = QUERY_TASK_VIEWS.has(String(route.query.view || ""))
   ? String(route.query.view)
   : "board";
 const queryView = taskViewForRole(requestedQueryView, authRoleRef.value);
@@ -85,7 +91,7 @@ function selectTaskView(view) {
 
 function syncTaskViewQuery(view) {
   const query = { ...route.query };
-  const next = ["scanned", "findings"].includes(view) ? view : "";
+  const next = QUERY_TASK_VIEWS.has(view) ? view : "";
   if (next) query.view = next;
   else delete query.view;
   if (String(route.query.view || "") === next) return;
@@ -683,9 +689,9 @@ watch(archivedDownloadStatus, () => {
 });
 
 watch(() => route.query.view, (value) => {
-  const requested = ["scanned", "findings"].includes(String(value || "")) ? String(value) : "board";
+  const requested = QUERY_TASK_VIEWS.has(String(value || "")) ? String(value) : "board";
   const next = taskViewForRole(requested, authRoleRef.value);
-  if (tab.value !== next && ["board", "scanned", "findings"].includes(tab.value)) tab.value = next;
+  if (tab.value !== next && (tab.value === "board" || QUERY_TASK_VIEWS.has(tab.value))) tab.value = next;
 });
 
 watch(authRoleRef, (role) => {
@@ -997,7 +1003,8 @@ const cacheHitRate = computed(() => {
   return Math.round((hit / base) * 100);
 });
 const isEnterpriseTask = computed(() => task.value?.src_type === "enterprise");
-const taskModeName = computed(() => isEnterpriseTask.value ? "企业SRC" : "EduSRC");
+const isLiteLlmTask = computed(() => task.value?.src_type === "litellm");
+const taskModeName = computed(() => isLiteLlmTask.value ? "LiteLLM 专项" : (isEnterpriseTask.value ? "企业SRC" : "EduSRC"));
 const targetSourceName = computed(() => (({
   fofa: "FOFA",
   manual: "手动清单",
@@ -1021,6 +1028,7 @@ const missionScopeText = computed(() => {
 });
 const missionEyebrow = computed(() => {
   if (task.value?.target_source === "site") return "COOPERATIVE SINGLE-SITE OPERATION";
+  if (isLiteLlmTask.value) return "LITELLM GATEWAY CONTINUOUS INSPECTION";
   return isEnterpriseTask.value ? "AUTONOMOUS ENTERPRISE SRC OPERATION" : "AUTONOMOUS EDU SRC OPERATION";
 });
 const searchPlaceholder = computed(() =>
@@ -1310,6 +1318,20 @@ function authStatusLabel(status) {
       <button type="button" role="tab" :aria-selected="tab === 'board'" :class="{ active: tab === 'board' }" @click="tab = 'board'">
         <span class="tab-long">实时看板</span><span class="tab-short">看板</span>
       </button>
+      <template v-if="isLiteLlmTask && authRoleRef !== 'observer'">
+      <button type="button" role="tab" :aria-selected="tab === 'gateway-assets'" :class="{ active: tab === 'gateway-assets' }"
+        @click="selectTaskView('gateway-assets')">
+        <span class="tab-long">网关资产</span><span class="tab-short">资产</span>
+      </button>
+      <button type="button" role="tab" :aria-selected="tab === 'gateway-secrets'" :class="{ active: tab === 'gateway-secrets' }"
+        @click="selectTaskView('gateway-secrets')">
+        <span class="tab-long">Secrets</span><span class="tab-short">Secret</span>
+      </button>
+      <button type="button" role="tab" :aria-selected="tab === 'gateway-observations'" :class="{ active: tab === 'gateway-observations' }"
+        @click="selectTaskView('gateway-observations')">
+        <span class="tab-long">探测记录</span><span class="tab-short">探测</span>
+      </button>
+      </template>
       <template v-if="authRoleRef !== 'observer'">
       <button type="button" role="tab" :aria-selected="tab === 'review'" :class="{ active: tab === 'review' }" @click="tab = 'review'">
         <span class="tab-long">复审队列</span><span class="tab-short">复审</span>
@@ -1408,6 +1430,12 @@ function authStatusLabel(status) {
       :task-id="props.id" @open-finding="openRawFinding" />
     <RawFindingsPanel v-if="authRoleRef !== 'observer' && tab === 'findings'" :task-id="props.id"
       @open-finding="openRawFinding" @toast="toast" />
+    <LiteLlmAssetsPanel v-if="isLiteLlmTask && authRoleRef !== 'observer'"
+      v-show="tab === 'gateway-assets'" :task-id="props.id" :active="tab === 'gateway-assets'" :readonly="readonly" />
+    <LiteLlmSecretsPanel v-if="isLiteLlmTask && authRoleRef !== 'observer'"
+      v-show="tab === 'gateway-secrets'" :task-id="props.id" :active="tab === 'gateway-secrets'" :readonly="readonly" @toast="toast" />
+    <LiteLlmObservationsPanel v-if="isLiteLlmTask && authRoleRef !== 'observer'"
+      v-show="tab === 'gateway-observations'" :task-id="props.id" :active="tab === 'gateway-observations'" />
 
     <!-- 复审队列 -->
     <div v-if="authRoleRef !== 'observer'" v-show="tab === 'review'" class="list-panel">
