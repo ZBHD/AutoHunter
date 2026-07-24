@@ -234,6 +234,20 @@ export const api = {
     req("PUT", `/api/tasks/${id}/queue-targets/order`, { target_ids: targetIds }),
   deleteQueuedTarget: (taskId, targetId) =>
     req("DELETE", `/api/tasks/${taskId}/queue-targets/${targetId}`),
+  gatewaySummary: (id) => req("GET", `/api/tasks/${id}/gateway/summary`),
+  gatewayAssets: (id, opts = {}) =>
+    req("GET", `/api/tasks/${id}/gateway/assets${qs(opts)}`),
+  gatewaySecrets: (id, opts = {}) =>
+    req("GET", `/api/tasks/${id}/gateway/secrets${qs(opts)}`),
+  gatewaySecretExport: (id, format = "json") =>
+    req("GET", `/api/tasks/${id}/gateway/secrets/export${qs({ format })}`),
+  gatewayAsset: (assetId) => req("GET", `/api/gateway/assets/${assetId}`),
+  gatewayObservations: (assetId, opts = {}) =>
+    req("GET", `/api/gateway/assets/${assetId}/observations${qs(opts)}`),
+  recheckGatewayAsset: (assetId) =>
+    req("POST", `/api/gateway/assets/${assetId}/recheck`),
+  revalidateGatewaySecret: (secretId) =>
+    req("POST", `/api/gateway/secrets/${secretId}/revalidate`),
   rawFindings: (id, opts = {}) =>
     req("GET", `/api/tasks/${id}/findings${qs({ compact: true, ...opts })}`),
   markFindingsDownloaded: (taskId, findingIds) =>

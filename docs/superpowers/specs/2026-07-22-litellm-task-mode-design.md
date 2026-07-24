@@ -12,7 +12,7 @@ LiteLLM Proxy 的有效资产可能只有 JSON API、公开健康检查或受保
 
 ## 已确认决策
 
-- 新任务类型为 `src_type=litemllm`。
+- 新任务类型为 `src_type=litellm`。
 - 同时支持定向发现和全网产品指纹发现，创建任务时选择。
 - 任务按现有 24x7 方式持续巡检，不在查询耗尽后自动结束。
 - 验证级别固定为完整验证：模型枚举后执行一次最小推理；发现的候选 Key 也执行有效性验证。
@@ -46,7 +46,7 @@ Task / Orchestrator
         |
         +-- edusrc / enterprise -> 现有 Collector -> Worker -> Reviewer
         |
-        +-- litemllm
+        +-- litellm
               |
               +-- Gateway Query Planner
               +-- Gateway Fingerprinter
@@ -197,7 +197,7 @@ LiteLLM 模式不向用户暴露自由编辑的产品指纹查询。高级区域
 
 `CreateTaskRequest`、`UpdateTaskRequest` 和 `TaskResponse` 增加对应 DTO。服务端拒绝未知字段、未知 Profile、负数周期和超出边界的请求预算。
 
-LiteLLM 任务的 `vuln_types` 不沿用通用 Web 漏洞列表。服务端根据 `mode_config.checks` 生成固定专项类型，忽略客户端夹带的 SQL 注入、XSS 等通用类型。`normalize_src_type` 明确接受 `litemllm`；未知值仍按现有兼容规则处理，但不得把 `litemllm` 归一化成 `edusrc`。
+LiteLLM 任务的 `vuln_types` 不沿用通用 Web 漏洞列表。服务端根据 `mode_config.checks` 生成固定专项类型，忽略客户端夹带的 SQL 注入、XSS 等通用类型。`normalize_src_type` 明确接受 `litellm`；未知值仍按现有兼容规则处理，但不得把 `litellm` 归一化成 `edusrc`。
 
 观摩角色收到空 `mode_config`，不暴露范围锚点、验证预算和查询状态。
 
@@ -455,7 +455,7 @@ discovered
 
 LiteLLM 使用现有任务循环和 Target 队列，但不进入通用 Worker：
 
-1. `collector.refill()` 在 `src_type=litemllm` 时委托 Gateway Query Planner 搜索。
+1. `collector.refill()` 在 `src_type=litellm` 时委托 Gateway Query Planner 搜索。
 2. 搜索候选或手动目标统一创建 `Target(status=queued)` 和 `GatewayAsset(scan_state=discovered)`。
 3. LiteLLM 候选跳过通用 `prefilter.should_skip_ex`、`scorer.score_target`、`target_filter.evaluate_target`、EduSRC 归属判断和同款站点冷却；改用 Fingerprinter 的产品置信度排序。
 4. Orchestrator 从 Target 队列取出目标后，按任务类型调用 `gateway_hunt.service.scan_asset()`，而不是 `Worker.run()`。

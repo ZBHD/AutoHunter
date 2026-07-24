@@ -8,8 +8,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, text,
+    JSON, Boolean, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
+    Integer, LargeBinary, String, Text, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -57,6 +57,8 @@ class Task(Base):
     manual_targets: Mapped[list] = mapped_column(JSON, default=list)
     auth_bindings: Mapped[list] = mapped_column(JSON, default=list)
     model_config_json: Mapped[dict] = mapped_column("model_config", JSON, default=dict)
+    # 专项任务模式配置；旧任务通过迁移补列并默认为空对象。
+    mode_config_json: Mapped[dict] = mapped_column("mode_config", JSON, default=dict)
     fofa_config: Mapped[dict] = mapped_column(JSON, default=dict)       # keys/max_pages/page_size/cursor
     search_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     engine: Mapped[str] = mapped_column(String(20), default="")         # 搜索引擎：fofa/quake/hunter/zoomeye/shodan/censys
@@ -67,6 +69,11 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     targets: Mapped[list["Target"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    gateway_assets: Mapped[list["GatewayAsset"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class Target(Base):
@@ -75,6 +82,8 @@ class Target(Base):
     # 目标库去重：普通搜集同一 source 下 host 唯一；单站协作可让同一 host 按不同路线并行。
     __table_args__ = (
         Index("ux_targets_task_host", "task_id", "host", "source", unique=True),
+        # LiteLLM 扩展表通过 (target_id, task_id) 复合外键锁定任务归属。
+        Index("ux_targets_id_task_id", "id", "task_id", unique=True),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
@@ -119,6 +128,13 @@ class Target(Base):
 
     task: Mapped["Task"] = relationship(back_populates="targets")
     findings: Mapped[list["Finding"]] = relationship(back_populates="target", cascade="all, delete-orphan")
+    gateway_asset: Mapped["GatewayAsset | None"] = relationship(
+        back_populates="target",
+        primaryjoin="Target.id == GatewayAsset.target_id",
+        foreign_keys="GatewayAsset.target_id",
+        uselist=False,
+        passive_deletes=True,
+    )
 
 
 class Finding(Base):
@@ -476,6 +492,167 @@ class RawEvidence(Base):
     spool_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class GatewayAsset(Base):
+    """LiteLLM 网关资产；作为 Target 的一对一专项扫描状态扩展。"""
+    __tablename__ = "gateway_assets"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["target_id", "task_id"],
+            ["targets.id", "targets.task_id"],
+            ondelete="CASCADE",
+        ),
+        Index("ux_gateway_asset_task_origin", "task_id", "origin_key", unique=True),
+        Index("ux_gateway_assets_id_task_id", "id", "task_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True,
+    )
+    target_id: Mapped[str] = mapped_column(String(32), unique=True)
+    profile_id: Mapped[str] = mapped_column(String(40), default="litellm")
+    profile_version: Mapped[str] = mapped_column(String(20), default="1")
+    canonical_base_url: Mapped[str] = mapped_column(String(700))
+    origin_key: Mapped[str] = mapped_column(String(500))
+    mount_path: Mapped[str] = mapped_column(String(300), default="")
+    fingerprint_status: Mapped[str] = mapped_column(String(20), default="probable")
+    fingerprint_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    fingerprint_signals: Mapped[list] = mapped_column(JSON, default=list)
+    detected_version: Mapped[str] = mapped_column(String(80), default="")
+    auth_state: Mapped[str] = mapped_column(String(20), default="unknown")
+    model_names: Mapped[list] = mapped_column(JSON, default=list)
+    model_count: Mapped[int] = mapped_column(Integer, default=0)
+    scan_state: Mapped[str] = mapped_column(String(40), default="discovered")
+    scan_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    last_error_kind: Mapped[str] = mapped_column(String(40), default="")
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_scan_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    task: Mapped["Task"] = relationship(back_populates="gateway_assets")
+    target: Mapped["Target"] = relationship(
+        back_populates="gateway_asset",
+        primaryjoin="GatewayAsset.target_id == Target.id",
+        foreign_keys=[target_id],
+    )
+    secrets: Mapped[list["GatewaySecret"]] = relationship(
+        back_populates="gateway_asset",
+        primaryjoin="GatewayAsset.id == GatewaySecret.gateway_asset_id",
+        foreign_keys="GatewaySecret.gateway_asset_id",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    observations: Mapped[list["GatewayObservation"]] = relationship(
+        back_populates="gateway_asset",
+        primaryjoin="GatewayAsset.id == GatewayObservation.gateway_asset_id",
+        foreign_keys="GatewayObservation.gateway_asset_id",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class GatewaySecret(Base):
+    """网关或其上游 Provider 暴露的凭据及验证状态。"""
+    __tablename__ = "gateway_secrets"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["gateway_asset_id", "task_id"],
+            ["gateway_assets.id", "gateway_assets.task_id"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ux_gateway_secret_asset_hash",
+            "gateway_asset_id", "secret_sha256",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True,
+    )
+    gateway_asset_id: Mapped[str] = mapped_column(String(32), index=True)
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True,
+    )
+    secret_type: Mapped[str] = mapped_column(String(40), default="other")
+    provider: Mapped[str] = mapped_column(String(40), default="unknown")
+    secret_name: Mapped[str] = mapped_column(String(160), default="")
+    secret_value: Mapped[str] = mapped_column(Text)
+    secret_sha256: Mapped[str] = mapped_column(String(64))
+    source_url: Mapped[str] = mapped_column(String(700), default="")
+    source_location: Mapped[str] = mapped_column(String(300), default="")
+    source_context: Mapped[str] = mapped_column(Text, default="")
+    credential_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    validation_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation_status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    validated_models: Mapped[list] = mapped_column(JSON, default=list)
+    validation_evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("raw_evidence.id", ondelete="SET NULL"), nullable=True,
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    gateway_asset: Mapped["GatewayAsset"] = relationship(
+        back_populates="secrets",
+        primaryjoin="GatewaySecret.gateway_asset_id == GatewayAsset.id",
+        foreign_keys=[gateway_asset_id],
+    )
+    finding: Mapped["Finding | None"] = relationship()
+    validation_evidence: Mapped["RawEvidence | None"] = relationship()
+
+
+class GatewayObservation(Base):
+    """专项 Probe 的轻量索引记录，完整请求与响应由 RawEvidence 保存。"""
+    __tablename__ = "gateway_observations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["gateway_asset_id", "task_id"],
+            ["gateway_assets.id", "gateway_assets.task_id"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ux_gateway_observation_probe",
+            "gateway_asset_id", "scan_epoch", "probe_id", "auth_variant",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), index=True,
+    )
+    gateway_asset_id: Mapped[str] = mapped_column(String(32), index=True)
+    gateway_secret_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gateway_secrets.id", ondelete="SET NULL"), nullable=True,
+    )
+    scan_epoch: Mapped[int] = mapped_column(Integer, default=0)
+    stage: Mapped[str] = mapped_column(String(40))
+    probe_id: Mapped[str] = mapped_column(String(120))
+    auth_variant: Mapped[str] = mapped_column(String(20), default="none")
+    result: Mapped[str] = mapped_column(String(20), default="inconclusive")
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    content_type: Mapped[str] = mapped_column(String(120), default="")
+    evidence_id: Mapped[str | None] = mapped_column(
+        ForeignKey("raw_evidence.id", ondelete="SET NULL"), nullable=True,
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+    gateway_asset: Mapped["GatewayAsset"] = relationship(
+        back_populates="observations",
+        primaryjoin="GatewayObservation.gateway_asset_id == GatewayAsset.id",
+        foreign_keys=[gateway_asset_id],
+    )
+    secret: Mapped["GatewaySecret | None"] = relationship()
+    evidence: Mapped["RawEvidence | None"] = relationship()
 
 
 class RawEvidenceChunk(Base):

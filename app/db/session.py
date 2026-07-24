@@ -74,6 +74,7 @@ _MIGRATIONS = [
     ("system_settings", "fofa_keys", "JSON DEFAULT '[]'"),
     ("tasks", "engine", "VARCHAR(20) DEFAULT ''"),
     ("tasks", "hunt_direction", "TEXT DEFAULT ''"),
+    ("tasks", "mode_config", "JSON DEFAULT '{}'"),
     ("tasks", "search_enabled", "BOOLEAN DEFAULT 1"),
     ("tasks", "auth_bindings", "JSON DEFAULT '[]'"),
     ("targets", "killsweep_case_id", "VARCHAR(32)"),
@@ -97,6 +98,21 @@ _MIGRATIONS = [
 # 唯一索引：目标库(host)/漏洞库(dedup_key)的 DB 级查重兜底。
 # 名字与 models.__table_args__ 保持一致；老库表已存在不会被 create_all 补，靠这里建。
 _UNIQUE_INDEXES = [
+    ("ux_targets_id_task_id",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_targets_id_task_id "
+     "ON targets(id, task_id)"),
+    ("ux_gateway_assets_id_task_id",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_assets_id_task_id "
+     "ON gateway_assets(id, task_id)"),
+    ("ux_gateway_asset_task_origin",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_asset_task_origin "
+     "ON gateway_assets(task_id, origin_key)"),
+    ("ux_gateway_observation_probe",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_observation_probe "
+     "ON gateway_observations(gateway_asset_id, scan_epoch, probe_id, auth_variant)"),
+    ("ux_gateway_secret_asset_hash",
+     "CREATE UNIQUE INDEX IF NOT EXISTS ux_gateway_secret_asset_hash "
+     "ON gateway_secrets(gateway_asset_id, secret_sha256)"),
     ("ux_targets_task_host",
      "CREATE UNIQUE INDEX IF NOT EXISTS ux_targets_task_host ON targets(task_id, host, source)"),
     ("ux_findings_dedup_global",
@@ -125,6 +141,26 @@ _UNIQUE_INDEXES = [
 # 普通索引：跨 host 查重按归一化类型别名集合做 IN 预筛时走索引，避免全表扫。
 # create_all 不会给已存在的老表补索引，这里显式建。
 _SECONDARY_INDEXES = [
+    ("ix_gateway_assets_task_id",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_assets_task_id ON gateway_assets(task_id)"),
+    ("ix_gateway_assets_next_scan_at",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_assets_next_scan_at ON gateway_assets(next_scan_at)"),
+    ("ix_gateway_secrets_task_id",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_secrets_task_id ON gateway_secrets(task_id)"),
+    ("ix_gateway_secrets_gateway_asset_id",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_secrets_gateway_asset_id "
+     "ON gateway_secrets(gateway_asset_id)"),
+    ("ix_gateway_secrets_validation_status",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_secrets_validation_status "
+     "ON gateway_secrets(validation_status)"),
+    ("ix_gateway_observations_task_id",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_observations_task_id ON gateway_observations(task_id)"),
+    ("ix_gateway_observations_gateway_asset_id",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_observations_gateway_asset_id "
+     "ON gateway_observations(gateway_asset_id)"),
+    ("ix_gateway_observations_observed_at",
+     "CREATE INDEX IF NOT EXISTS ix_gateway_observations_observed_at "
+     "ON gateway_observations(observed_at)"),
     ("ix_findings_vuln_type_status",
      "CREATE INDEX IF NOT EXISTS ix_findings_vuln_type_status ON findings(vuln_type, status)"),
     # 派发热点：_pop_queued 按 (task_id, status='queued') 过滤 + priority_score 排序。
@@ -270,14 +306,63 @@ async def _ensure_unique_indexes(conn) -> None:
         except Exception:
             pass
 
+    strict_index_shapes = {
+        "ux_targets_id_task_id": ("targets", ("id", "task_id")),
+        "ux_gateway_assets_id_task_id": ("gateway_assets", ("id", "task_id")),
+        "ux_gateway_asset_task_origin": ("gateway_assets", ("task_id", "origin_key")),
+        "ux_gateway_observation_probe": (
+            "gateway_observations",
+            ("gateway_asset_id", "scan_epoch", "probe_id", "auth_variant"),
+        ),
+        "ux_gateway_secret_asset_hash": (
+            "gateway_secrets",
+            ("gateway_asset_id", "secret_sha256"),
+        ),
+    }
+    table_rows = await conn.exec_driver_sql(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )
+    existing_tables = {row[0] for row in table_rows.fetchall()}
+
+    async def strict_index_shape(
+        table: str,
+        index: str,
+    ) -> tuple[bool, tuple[str, ...], bool] | None:
+        index_rows = await conn.exec_driver_sql(f'PRAGMA index_list("{table}")')
+        index_row = next((row for row in index_rows.fetchall() if row[1] == index), None)
+        if index_row is None:
+            return None
+        column_rows = await conn.exec_driver_sql(f'PRAGMA index_info("{index}")')
+        columns = tuple(row[2] for row in sorted(column_rows.fetchall(), key=lambda row: row[0]))
+        return bool(index_row[2]), columns, bool(index_row[4])
+
+    async def verify_strict_index(name: str, table: str, columns: tuple[str, ...]) -> bool:
+        shape = await strict_index_shape(table, name)
+        if shape is None:
+            return False
+        if shape != (True, columns, False):
+            raise RuntimeError(
+                f"数据库索引 {name} 形态错误：需要完整 UNIQUE{columns}，实际为 {shape}"
+            )
+        return True
+
     for name, sql in _UNIQUE_INDEXES:
+        strict_shape = strict_index_shapes.get(name)
+        if strict_shape is not None and strict_shape[0] not in existing_tables:
+            continue
+        if strict_shape is not None and await verify_strict_index(name, *strict_shape):
+            continue
         try:
             await conn.exec_driver_sql(sql)
         except Exception:
+            if strict_shape is not None:
+                raise
             try:
                 await conn.exec_driver_sql(sql.replace("UNIQUE INDEX", "INDEX"))
             except Exception:
                 pass
+        if strict_shape is not None:
+            await verify_strict_index(name, *strict_shape)
 
 
 async def _ensure_secondary_indexes(conn) -> None:
