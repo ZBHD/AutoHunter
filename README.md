@@ -6,16 +6,10 @@
 
 多 Agent 协同的 AI 漏洞挖掘与人工复审平台
 
-`锁定 · 侦察 · 出洞`
-
 **原作者：StanleyNull** · **Copyright (c) 2026 StanleyNull**<br>
 **许可证：[CC BY-NC 4.0](./LICENSE)** · **仅限非商业使用**
 
-原作者 EduSRC 主页：<https://src.sjtu.edu.cn/profile/46491/>
-
 原项目地址：[StanleyNull/AutoHunter](https://github.com/StanleyNull/AutoHunter)
-
-<img src="assets/proof-results.png" alt="项目成果截图" width="480">
 
 </div>
 
@@ -33,11 +27,7 @@ AutoHunter 原作由 **StanleyNull** 发布，版权归原作者所有。本仓�
 - 不得暗示原作者认可、担保或参与维护后的版本；
 - 不得用于商业销售、付费服务、付费分发或其他营利用途。
 
-> 修改声明：当前仓库属于基于原作的修改版本，并非未经改动的原始发行版。
-
 ## 项目现状
-
-它以任务为单位组织目标搜集、排队、AI 驱动的单目标分析、AI 初审、人工复审、通杀分析和报告整理，并把运行状态持久化到 SQLite。
 
 当前主流程：
 
@@ -56,46 +46,6 @@ Reviewer 初审：采纳 / 忽略 / 打回深挖
 ```
 
 
-## 已实现能力
-
-### 任务与目标
-
-- 支持 `EduSRC` 与 `企业SRC` 两种任务策略。
-- 目标来源支持 `FOFA 自动搜`、`手动清单`、`两者` 和 `单站协作`。
-- 自动搜集引擎包括 FOFA、360 Quake、Hunter、ZoomEye、Shodan 和 Censys；是否可用取决于对应凭据和接口配置。
-- FOFA 查询支持直接语法、自然语言意图和自动判断。
-- 单站协作支持完整深挖与轻量入口盘点；轻量模式保留路由能力，但限制站点地图阶段预算。
-- 可为任务选择漏洞类型、指定挖掘方向、SRC 规则、Worker 并发数和任务专用模型。
-- 目标队列支持人工排序、移除、状态查看；失败或跳过的目标进入硬骨头视图。
-- 任务状态、队列、证据和运行事件持久化；默认在进程重启后恢复运行中的任务。
-
-### Agent 工作流
-
-- `Collector`：搜索、探活、预筛、评分、归属标注、聚类与入队。
-- `Worker`：以单个目标为边界，按 `recon → locate → verify → evidence` 分阶段工作。
-- `Reviewer`：校验证据、范围、重复性和危害等级，可采纳、忽略或打回定向深挖。
-- `Killsweep`：围绕已确认线索建立通杀案例，记录事件、验证结果和人工复核状态。
-- `Missed Signals`：保留尚未形成正式 Finding 的高价值信号，支持恢复、深挖和草稿处理。
-- `Intel`：保存经验证、可复用的凭据、端点或目标画像，供后续 Worker 使用。
-- `Report Assistant`：围绕 Finding 整理和编辑报告，并支持把结构化证据交给下一轮深挖。
-
-### 模型与搜索凭据
-
-- 全局 LLM Provider 池支持加权首选和单次请求内故障转移。
-- 支持 `OpenAI Chat Completions`、`Anthropic Messages` 和 `OpenAI Responses` 三种协议适配。
-- Provider 可独立启停、排序、设置权重和健康检测；健康检测会验证基础请求及工具调用协议。
-- FOFA Key 池支持独立启停、排序、检测、限流冷却、日额度冷却、临时故障退避和运行状态持久化。
-- API 与界面中的密钥采用脱敏显示，脱敏占位不会覆盖已保存的真实密钥。
-
-### 控制台与运维
-
-- Vue 3 控制台提供任务、指挥台、全局复审、疑似信号、通杀、设置等主要视图。
-- 额外提供硬骨头、情报库、漏洞库和运行日志视图。
-- 支持全权限、只读和观摩三种访问角色；观摩角色会隐藏敏感字段。
-- 内置应用层 WAF、安全响应头、请求体大小限制和可选反向代理信任配置。
-- Docker watchdog 定期检查 `/health`；应用无响应时输出诊断并交由 Docker 重启。
-- 提供数据备份、服务器更新、健康检查和旧镜像回滚脚本。
-
 ## 工具链与边界
 
 Docker 镜像内包含以下主要工具：
@@ -110,7 +60,8 @@ Docker 镜像内包含以下主要工具：
 
 扫描器命中只作为候选线索，不能替代真实请求、响应和影响证据。企业 SRC 模式会限制自动化漏洞扫描器；Nuclei 和 Dalfox 不会作为企业模式的可用结构化工具，命令执行同样受企业策略检查。
 
-SRC CLI 输出是**候选地图而不是漏洞**。CLI 结果会先转换为带来源、优先级和验证动作的候选，再通过 HTTP 单请求验证。实时看板用 `tool_src_cli_started` 记录工具、轮次和阶段，用 `tool_src_cli_result` 记录执行状态、解析状态和脱敏后的候选摘要；完整输出只进入私有证据存储。工具和 HTTP 请求只跟随**同主机重定向**，跨主机地址仅记录，不自动跟随。
+Worker 以单个目标为边界，按 `recon → locate → verify → evidence` 分阶段工作。SRC CLI 输出是**候选地图而不是漏洞**：实时看板用 `tool_src_cli_started` 记录工具、轮次和阶段，用 `tool_src_cli_result` 记录执行、解析状态和脱敏摘要。工具和 HTTP 请求只跟随**同主机重定向**，跨主机地址仅记录，不自动跟随。
+
 
 | 场景 | 首选链路 | 结束条件 |
 | --- | --- | --- |
@@ -121,7 +72,8 @@ SRC CLI 输出是**候选地图而不是漏洞**。CLI 结果会先转换为带�
 | 登录与越权 | `http_request → analyze_auth_material → session_set → compare_http_responses` | 不同身份或对象的响应差异已经验证 |
 | 企业 SRC | `crawl_endpoints → discover_parameters → http_request` | 通过有界侦察、单请求和本地分析完成取证 |
 
-企业 SRC **严禁使用** Nuclei、Dalfox 等自动化漏洞扫描器。项目策略同时禁止破坏性写入、删除、密码重置、批量导出、全端口宽扫、压力测试等操作。即使工具存在于镜像中，也不代表所有任务模式都允许调用。
+企业 SRC **严禁使用** Nuclei、Dalfox 等自动化漏洞扫描器。项目策略同时禁止破坏性写入、删除、密码重置、批量导出、全端口宽扫和压力测试。
+
 
 ## 快速部署
 
@@ -141,8 +93,6 @@ git clone https://github.com/ZBHD/AutoHunter.git autohunter
 cd autohunter
 bash scripts/install.sh
 ```
-
-安装脚本会检查 Docker，交互式采集 LLM 和 FOFA 配置，生成 `.env`，构建镜像并启动服务。首次构建需要下载前后端依赖及安全工具，耗时取决于网络环境。
 
 启动后访问：
 
@@ -168,26 +118,6 @@ curl http://127.0.0.1:18800/health
 
 > 公网或可达网络部署时，务必设置 `AUTOHUNTER_API_TOKEN`。未配置任何访问令牌时，受保护的 `/api` 接口不会启用身份认证。
 
-## 首次配置
-
-### 最小配置
-
-`.env.example` 是应用环境变量的主要参考；Compose 还支持少量部署变量。首次部署重点检查：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 兼容回退 Provider 的 API 基址 |
-| `LLM_API_KEY` | 空 | 兼容回退 Provider 的 API Key |
-| `LLM_MODEL` | `deepseek-chat` | 兼容回退模型名 |
-| `LLM_PROTOCOL` | `openai_chat` | 模型协议适配器 |
-| `FOFA_KEY` | 空 | FOFA 单 Key 兼容回退配置 |
-| `AUTOHUNTER_API_TOKEN` | 空 | 全权限令牌，生产部署必须设置 |
-| `AUTOHUNTER_READ_TOKEN` | 空 | 只读令牌，可查看复审等敏感页面但不能写入 |
-| `AUTOHUNTER_OBSERVER_TOKEN` | 空 | 观摩令牌，只返回脱敏信息 |
-| `AUTOHUNTER_HOST_PORT` | `18800` | Compose 使用的宿主机端口（可自行加入 `.env`） |
-| `AUTOHUNTER_RESTORE_ON_STARTUP` | `1` | 重启后恢复运行中任务 |
-
-可在控制台“设置”页维护 LLM Provider 池、FOFA Key 池、其他搜索引擎凭据、默认并发和 Worker 提示词版本。数据库配置会持久化在 `ah_data` 卷中。
 
 ### 配置优先级
 
@@ -251,39 +181,6 @@ bash scripts/update-server.sh
 
 更新脚本要求工作区没有未提交改动。它会快进拉取 `main`、验证 Compose 配置、构建新镜像、停止旧容器、备份数据、启动并检查 `/health`；新版本未通过健康检查时会尝试回滚旧镜像。脚本也支持通过 `SOURCE_BUNDLE` 使用离线 Git bundle 更新。
 
-## 本地开发与测试
-
-完整运行环境建议继续使用 Docker。本地开发可分别启动后端和前端；本机未安装 Dockerfile 中的外部工具时，与 CLI 工具有关的 Worker 能力不会完整可用。
-
-```powershell
-# Python 3.12 环境
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
-
-# 后端开发服务
-python -m uvicorn app.main:app --reload --port 8000
-```
-
-另开终端：
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-Vite 开发服务器会把 `/api` 代理到 `http://localhost:8000`。
-
-运行测试：
-
-```powershell
-python -m pytest
-cd frontend
-npm test
-npm run build
-```
-
 ## 安全与使用限制
 
 - 本项目仅供已经取得明确授权的安全测试、漏洞研究和教学使用。
@@ -293,15 +190,21 @@ npm run build
 - LLM 会产生费用，也可能输出错误判断；漏洞结论必须经过人工复核。
 - 目标数、FOFA 页数、Worker 轮数和并发都会影响 API 成本、内存和子进程数量。
 - 数据库存放目标、证据、报告和密钥配置；备份文件和 Docker 卷应按敏感数据保护。
-- 原作者及维护者不对未授权使用、误报、漏报、数据损失或其他使用后果承担责任；完整免责声明见 [LICENSE](./LICENSE)。
+- 原作者及维护者不对未授权使用、误报、漏报、数据损失或其他使用后果承担责任；详细说明见下文“免责声明”及 [LICENSE](./LICENSE)。
 
-## 技术栈
 
-- 后端：Python 3.12、FastAPI、SQLAlchemy 2、SQLite、asyncio
-- 前端：Vue 3、Vue Router、Vite 5
-- 模型接入：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses
-- 部署：Docker 多阶段构建、Docker Compose、Uvicorn、watchdog
-- 测试：pytest、pytest-asyncio、Node.js test runner
+## 免责声明
+
+请在下载、安装、配置或使用本项目之前完整阅读并理解以下内容：
+
+1. **授权与合规责任**：本项目仅供已取得目标所有者明确授权的安全测试、漏洞研究和教学使用。使用者应自行确认测试对象、时间、方式和影响范围均在授权边界内，并遵守所在地适用的法律法规、行业规范及目标方规则。
+2. **自动化结果不保证**：本项目依赖自动化工具、第三方接口和大语言模型，可能产生误报、漏报、错误判断、不完整证据或非预期请求。任何扫描结果、漏洞结论和报告均应由具备相应能力的人员复核，不应直接作为处置、披露或提交依据。
+3. **运行与业务风险**：网络请求、目录发现、参数探测和漏洞验证可能对目标系统或使用者自身环境造成负载、告警、封禁、数据变更、服务中断或其他影响。使用者应在执行前完成风险评估、备份和恢复准备，并自行承担操作风险。
+4. **费用与第三方服务**：模型 API、搜索引擎、代理、云服务及其他第三方组件可能产生费用，并受各自服务条款、隐私政策和可用性约束。使用者应自行管理凭据、额度、账单和第三方合规要求。
+5. **数据与凭据保护**：任务数据库、运行日志、证据、报告、Cookie、Token、账号密码及备份文件可能包含敏感信息。使用者应采取访问控制、加密、脱敏、最小化留存和安全销毁措施，并承担因配置不当、泄露或保管不善造成的后果。
+6. **责任限制**：在适用法律允许的最大范围内，原作者、维护者及贡献者不对使用或无法使用本项目所产生的直接或间接损失承担责任，包括但不限于数据损失、业务中断、账号封禁、费用支出、第三方索赔或法律责任。使用本项目即表示使用者理解并接受上述风险。
+
+本节是面向使用者的风险提示，不构成法律意见，也不改变 [LICENSE](./LICENSE) 中的版权归属和许可条件；如本节与许可证文本存在不一致，以许可证文本为准。
 
 ## 许可证
 
