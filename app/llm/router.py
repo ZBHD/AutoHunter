@@ -9,6 +9,7 @@ from typing import Any, Callable
 from app.config import LLMProviderConfig
 from app.llm.client import LLMClient, LLMError, _classify_error
 from app.llm.protocols import LLMResponse
+from app.llm.usage import UsageContext
 
 logger = logging.getLogger("autohunter.llm.router")
 
@@ -36,7 +37,7 @@ class LLMRouter:
     def __init__(
         self,
         providers: list[LLMProviderConfig],
-        usage_key: str | None = None,
+        usage_key: str | UsageContext | None = None,
         on_provider_disabled: Callable[[str, str], None] | None = None,
         client_factory: Callable[..., LLMClient] = LLMClient,
         rng: random.Random | None = None,

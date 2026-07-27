@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import re
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +12,13 @@ from app.agents.prompt_releases import (
     COMPILED_STABLE_RELEASE_ID,
     resolve_prompt_release,
 )
-from app.db.models import PromptExperiment, SystemSettings, Target, Task
+from app.db.models import (
+    PromptExperiment,
+    PromptExperimentSample,
+    SystemSettings,
+    Target,
+    Task,
+)
 from app.settings_service import resolve_stable_prompt_release_id
 
 _ACTIVE_ASSIGNMENT_STATUSES = ("live", "promoted")
@@ -25,6 +32,7 @@ _MANUAL_ALIASES = frozenset({
 })
 _HOLDBACK_DURATION = timedelta(hours=48)
 _HOLDBACK_PERCENT = 10.0
+_ROUTE_REASON_RE = re.compile(r"(?:^|\s|·)route:([^/\s]+)")
 
 
 @dataclass(frozen=True)
@@ -126,8 +134,94 @@ async def assignment_for_target(
     return PromptAssignment(experiment.candidate_release_id)
 
 
+def _sample_route_id(target: Target, result: dict) -> str:
+    explicit = str(result.get("route_id") or "").strip()
+    if explicit:
+        return explicit[:80]
+    match = _ROUTE_REASON_RE.search(str(target.priority_reason or ""))
+    return match.group(1)[:80] if match else ""
+
+
+def _evidence_complete(findings: list) -> bool:
+    if not findings:
+        return False
+    for finding in findings:
+        if not isinstance(finding, dict):
+            return False
+        evidence = finding.get("evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            return False
+    return True
+
+
+async def finalize_live_sample(
+    session: AsyncSession,
+    target: Target,
+    result: dict,
+    usage: dict,
+) -> PromptExperimentSample | None:
+    experiment_id = str(target.prompt_experiment_id or "")
+    if not experiment_id or not target.prompt_release_id:
+        return None
+
+    sample = await session.scalar(
+        select(PromptExperimentSample).where(
+            PromptExperimentSample.experiment_id == experiment_id,
+            PromptExperimentSample.target_id == target.id,
+        )
+    )
+    if sample is None:
+        sample = PromptExperimentSample(
+            experiment_id=experiment_id,
+            phase="holdback" if target.prompt_cohort == "holdback" else "live",
+            cohort=str(target.prompt_cohort or "stable"),
+            release_id=target.prompt_release_id,
+            task_id=target.task_id,
+            target_id=target.id,
+        )
+        session.add(sample)
+
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    findings = result.get("findings") if isinstance(result.get("findings"), list) else []
+    sample.release_id = target.prompt_release_id
+    sample.cohort = str(target.prompt_cohort or "stable")
+    sample.src_type = str(result.get("src_type") or "")[:20]
+    sample.route_id = _sample_route_id(target, result)
+    sample.terminal_verdict = str(result.get("verdict") or target.verdict or "")[:30]
+    sample.rounds = max(0, int(result.get("rounds") or 0))
+    sample.tool_calls = max(0, int(metrics.get("tool_calls") or 0))
+    sample.tool_errors = max(0, int(metrics.get("tool_errors") or 0))
+    sample.agent_terminated_by_tool = bool(
+        result.get("failure_kind") == "tool_exception"
+        or metrics.get("agent_terminated_by_tool")
+    )
+    sample.prompt_tokens = max(0, int(usage.get("prompt_tokens") or 0))
+    sample.completion_tokens = max(0, int(usage.get("completion_tokens") or 0))
+    sample.total_tokens = max(0, int(usage.get("total_tokens") or 0))
+    sample.usage_complete = int(usage.get("requests") or 0) > 0
+    sample.finding_count = len(findings)
+    sample.evidence_complete = _evidence_complete(findings)
+    sample.forbidden_action_count = max(
+        0,
+        int(metrics.get("forbidden_action_count") or 0),
+    )
+    sample.metrics = {
+        "protocol_error_count": max(
+            0,
+            int(metrics.get("protocol_error_count") or 0),
+        ),
+        "evidence_crossing_count": max(
+            0,
+            int(metrics.get("evidence_crossing_count") or 0),
+        ),
+    }
+    sample.finished_at = _utc_naive()
+    return sample
+
+
 __all__ = [
     "PromptAssignment",
     "assignment_for_target",
     "cohort_bucket",
+    "finalize_live_sample",
 ]

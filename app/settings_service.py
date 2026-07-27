@@ -44,6 +44,7 @@ from app.fofa.router import FofaKeyRouter, FofaKeyStateChange, fofa_credential_f
 from app.llm.client import LLMClient, LLMError, _sanitize_error_detail
 from app.llm.protocols import ADAPTER_REGISTRY
 from app.llm.router import LLMRouter
+from app.llm.usage import UsageContext
 
 SETTINGS_ID = "global"
 
@@ -2173,7 +2174,11 @@ def _provider_disable_callback(
     return callback
 
 
-def llm_router_for_task(task: Task | None = None) -> LLMRouter:
+def llm_router_for_task(
+    task: Task | None = None,
+    *,
+    usage_context: UsageContext | None = None,
+) -> LLMRouter:
     """构造任务 Router；仅全局池 Router 会持久化自动禁用。"""
     providers = resolve_llm_providers(task)
     callback = None
@@ -2190,7 +2195,7 @@ def llm_router_for_task(task: Task | None = None) -> LLMRouter:
             logger.warning("当前线程没有运行中的事件循环，Provider 自动禁用将不持久化")
     return LLMRouter(
         providers,
-        usage_key=task.id if task else None,
+        usage_key=usage_context or (task.id if task else None),
         on_provider_disabled=callback,
     )
 

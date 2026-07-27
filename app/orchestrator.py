@@ -62,6 +62,7 @@ from app.killsweep_service import (
     recover_attempts as recover_killsweep_attempts,
 )
 from app.llm.router import LLMRouter
+from app.llm.usage import UsageContext, pop_target_usage, target_usage_snapshot
 from app.settings_service import (
     fofa_router_for_task,
     llm_router_for_task,
@@ -81,7 +82,7 @@ from app.missed_signals import (
     upsert_signal,
 )
 from app.queue_targets import queue_dispatch_order
-from app.prompt_experiments import assignment_for_target
+from app.prompt_experiments import assignment_for_target, finalize_live_sample
 from app.raw_evidence import import_capture
 from app.tools.src_toolkit import SRC_TOOL_NAMES
 from app.gateway_hunt import service as gateway_service
@@ -673,7 +674,10 @@ def _probe_target_liveness(url: str, host: str, timeout: float) -> dict:
 
 
 def _llm_for_task(task: Task) -> LLMRouter:
-    return llm_router_for_task(task)
+    return llm_router_for_task(
+        task,
+        usage_context=getattr(task, "_prompt_usage_context", None),
+    )
 
 
 class TaskRunner:
@@ -2515,6 +2519,14 @@ class TaskRunner:
                     self._live[target_id]["action"] = "🔁 定向深挖启动中…"
                 duplicate_history = await self._build_duplicate_history(session, task_id, tgt)
                 await session.commit()
+            usage_context = UsageContext(
+                task_id=task_id,
+                target_id=target_id,
+                experiment_id=str(tgt.prompt_experiment_id or "") if tgt else "",
+                release_id=prompt_release_id,
+                cohort=prompt_cohort,
+            )
+            task_obj._prompt_usage_context = usage_context
             llm = _llm_for_task(task_obj)
             prompt_version = resolve_worker_prompt_version(task_obj)
 
@@ -3483,7 +3495,17 @@ class TaskRunner:
             # 目标已离开「持续临时错误」状态（成功/无果/置dead），清理回队计数避免泄漏累积。
             if not transient_llm_error:
                 self._transient_llm_requeue.pop(target_id, None)
+            terminal = tgt.status in {"done", "dead", "skipped"}
+            if terminal:
+                await finalize_live_sample(
+                    session,
+                    tgt,
+                    result,
+                    target_usage_snapshot(target_id),
+                )
             await session.commit()
+            if terminal:
+                pop_target_usage(target_id)
             await self._reconcile_pending_signal_deepening(
                 task_id,
                 target_id,
