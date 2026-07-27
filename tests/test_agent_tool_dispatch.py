@@ -1,4 +1,46 @@
+import json
+
+from app.agents import escalate as escalate_module
 from app.agents.tool_dispatch import dispatch_tool_safely
+from app.llm.protocols import LLMResponse, ToolCall
+
+
+class _FakeExecutor:
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.cancelled = False
+
+    def cancel_running(self) -> None:
+        self.cancelled = True
+
+
+class _SequenceLLM:
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = responses
+        self.calls: list[list[dict]] = []
+
+    def chat(self, messages, **_kwargs) -> LLMResponse:
+        self.calls.append(messages)
+        return self.responses[len(self.calls) - 1]
+
+
+def _tool_response(call_id: str, name: str) -> LLMResponse:
+    return LLMResponse(
+        tool_calls=[ToolCall(id=call_id, name=name, arguments=json.dumps({}))]
+    )
+
+
+def _escalate_hunter(monkeypatch, llm: _SequenceLLM, *, max_rounds: int):
+    monkeypatch.setattr(escalate_module, "ToolExecutor", _FakeExecutor)
+    return escalate_module.EscalateHunter(
+        {
+            "severity": "high",
+            "title": "Finding",
+            "vuln_type": "idor",
+            "target_url": "https://example.test",
+        },
+        llm=llm,
+        max_rounds=max_rounds,
+    )
 
 
 def test_dispatch_tool_safely_returns_success_unchanged() -> None:
@@ -49,3 +91,82 @@ def test_dispatch_tool_safely_truncates_long_error() -> None:
     )
 
     assert len(outcome.result["error"]["message"]) <= 400
+
+
+def test_escalate_continues_after_tool_exception_with_paired_response(
+    monkeypatch,
+) -> None:
+    llm = _SequenceLLM(
+        [
+            _tool_response("call-failed", "lookup"),
+            _tool_response("call-abandon", "abandon_escalation"),
+        ]
+    )
+    hunter = _escalate_hunter(monkeypatch, llm, max_rounds=2)
+
+    def dispatch(name, _args):
+        if name == "lookup":
+            raise RuntimeError("temporary tool failure")
+        hunter._result = {"escalated": False, "reason": "done"}
+        return {"ok": True}
+
+    monkeypatch.setattr(hunter, "_dispatch", dispatch)
+
+    result = hunter.run().model_dump()
+
+    assert result["escalated"] is False
+    assert any(
+        item.get("role") == "tool" and item.get("tool_call_id") == "call-failed"
+        for item in llm.calls[1]
+    )
+
+
+def test_escalate_injects_correction_after_three_consecutive_tool_exceptions(
+    monkeypatch,
+) -> None:
+    llm = _SequenceLLM(
+        [
+            _tool_response("call-1", "lookup"),
+            _tool_response("call-2", "lookup"),
+            _tool_response("call-3", "lookup"),
+            _tool_response("call-abandon", "abandon_escalation"),
+        ]
+    )
+    hunter = _escalate_hunter(monkeypatch, llm, max_rounds=4)
+
+    def dispatch(name, _args):
+        if name == "lookup":
+            raise RuntimeError("temporary tool failure")
+        hunter._result = {"escalated": False, "reason": "done"}
+        return {"ok": True}
+
+    monkeypatch.setattr(hunter, "_dispatch", dispatch)
+
+    hunter.run()
+
+    assert any(
+        "连续 3 次" in item.get("content", "")
+        for item in llm.calls[3]
+        if item.get("role") == "user"
+    )
+
+
+def test_escalate_stops_after_five_consecutive_tool_exceptions(monkeypatch) -> None:
+    llm = _SequenceLLM(
+        [_tool_response(f"call-{index}", "lookup") for index in range(1, 6)]
+    )
+    hunter = _escalate_hunter(monkeypatch, llm, max_rounds=6)
+    monkeypatch.setattr(
+        hunter,
+        "_dispatch",
+        lambda _name, _args: (_ for _ in ()).throw(
+            RuntimeError("temporary tool failure")
+        ),
+    )
+
+    result = hunter.run().model_dump()
+
+    assert result["escalated"] is False
+    assert result["failure_kind"] == "tool_exception"
+    assert "连续 5 次工具执行异常" in result["reason"]
+    assert len(llm.calls) == 5
