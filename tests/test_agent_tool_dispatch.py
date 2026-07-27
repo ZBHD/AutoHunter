@@ -1,6 +1,7 @@
 import json
 
 from app.agents import escalate as escalate_module
+from app.agents import killsweep as killsweep_module
 from app.agents.tool_dispatch import dispatch_tool_safely
 from app.llm.protocols import LLMResponse, ToolCall
 
@@ -29,6 +30,15 @@ def _tool_response(call_id: str, name: str) -> LLMResponse:
     )
 
 
+def _tool_responses(*calls: tuple[str, str]) -> LLMResponse:
+    return LLMResponse(
+        tool_calls=[
+            ToolCall(id=call_id, name=name, arguments=json.dumps({}))
+            for call_id, name in calls
+        ]
+    )
+
+
 def _escalate_hunter(monkeypatch, llm: _SequenceLLM, *, max_rounds: int):
     monkeypatch.setattr(escalate_module, "ToolExecutor", _FakeExecutor)
     return escalate_module.EscalateHunter(
@@ -40,6 +50,20 @@ def _escalate_hunter(monkeypatch, llm: _SequenceLLM, *, max_rounds: int):
         },
         llm=llm,
         max_rounds=max_rounds,
+    )
+
+
+def _killsweep_hunter(monkeypatch, llm: _SequenceLLM, *, max_rounds: int):
+    monkeypatch.setattr(killsweep_module, "ToolExecutor", _FakeExecutor)
+    monkeypatch.setattr(killsweep_module, "_MAX_ROUNDS", max_rounds)
+    return killsweep_module.KillsweepHunter(
+        {
+            "title": "Finding",
+            "vuln_type": "idor",
+            "target_url": "https://example.test",
+        },
+        fofa_key="",
+        llm=llm,
     )
 
 
@@ -169,4 +193,90 @@ def test_escalate_stops_after_five_consecutive_tool_exceptions(monkeypatch) -> N
     assert result["escalated"] is False
     assert result["failure_kind"] == "tool_exception"
     assert "连续 5 次工具执行异常" in result["reason"]
+    assert len(llm.calls) == 5
+
+
+def test_killsweep_pairs_all_tool_responses_when_first_call_raises(
+    monkeypatch,
+) -> None:
+    llm = _SequenceLLM(
+        [
+            _tool_responses(
+                ("call-failed", "lookup"),
+                ("call-success", "lookup_backup"),
+            ),
+            _tool_response("call-submit", "submit_killsweep"),
+        ]
+    )
+    hunter = _killsweep_hunter(monkeypatch, llm, max_rounds=2)
+
+    def dispatch(name, _args):
+        if name == "lookup":
+            raise RuntimeError("temporary tool failure")
+        if name == "submit_killsweep":
+            hunter._result = {"is_killsweep": False, "reason": "done"}
+        return {"ok": True}
+
+    monkeypatch.setattr(hunter, "_dispatch", dispatch)
+
+    result = hunter.run().model_dump()
+    tool_messages = [
+        item for item in llm.calls[1] if item.get("role") == "tool"
+    ]
+
+    assert [item["tool_call_id"] for item in tool_messages] == [
+        "call-failed",
+        "call-success",
+    ]
+    assert result["is_killsweep"] is False
+
+
+def test_killsweep_injects_correction_after_three_consecutive_tool_exceptions(
+    monkeypatch,
+) -> None:
+    llm = _SequenceLLM(
+        [
+            _tool_response("call-1", "lookup"),
+            _tool_response("call-2", "lookup"),
+            _tool_response("call-3", "lookup"),
+            _tool_response("call-submit", "submit_killsweep"),
+        ]
+    )
+    hunter = _killsweep_hunter(monkeypatch, llm, max_rounds=4)
+
+    def dispatch(name, _args):
+        if name == "lookup":
+            raise RuntimeError("temporary tool failure")
+        hunter._result = {"is_killsweep": False, "reason": "done"}
+        return {"ok": True}
+
+    monkeypatch.setattr(hunter, "_dispatch", dispatch)
+
+    hunter.run()
+
+    assert any(
+        "连续 3 次" in item.get("content", "")
+        for item in llm.calls[3]
+        if item.get("role") == "user"
+    )
+
+
+def test_killsweep_stops_after_five_consecutive_tool_exceptions(monkeypatch) -> None:
+    llm = _SequenceLLM(
+        [_tool_response(f"call-{index}", "lookup") for index in range(1, 6)]
+    )
+    hunter = _killsweep_hunter(monkeypatch, llm, max_rounds=6)
+    monkeypatch.setattr(
+        hunter,
+        "_dispatch",
+        lambda _name, _args: (_ for _ in ()).throw(
+            RuntimeError("temporary tool failure")
+        ),
+    )
+
+    result = hunter.run().model_dump()
+
+    assert result["failure_kind"] == "tool_exception"
+    assert result["is_killsweep"] is False
+    assert "连续 5 次工具执行异常" in result["error"]
     assert len(llm.calls) == 5

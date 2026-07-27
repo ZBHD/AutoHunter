@@ -21,8 +21,9 @@ import threading
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import parse_qsl, urljoin, urlparse
 
-from app.agents.history import compact_messages
+from app.agents.history import bounded_tool_content, compact_messages
 from app.agents.prompts import is_enterprise_src, killsweep_system_prompt
+from app.agents.tool_dispatch import dispatch_tool_safely
 from app.dedup import normalize_vuln_type
 from app.llm.router import LLMRouter
 from app.missed_signals import detect_tool_signals
@@ -579,6 +580,7 @@ class KillsweepHunter:
             {"role": "user", "content": self._brief()},
         ]
         rounds = 0
+        consecutive_tool_errors = 0
         while _MAX_ROUNDS <= 0 or rounds < _MAX_ROUNDS:
             if self.cancel_event.is_set():
                 self.executor.cancel_running()
@@ -606,10 +608,35 @@ class KillsweepHunter:
                     args = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                result = self._dispatch(tc.name, args)
+                outcome = dispatch_tool_safely(
+                    self._dispatch,
+                    tc.name,
+                    args,
+                    emit=self._emit,
+                )
+                result = outcome.result
+                if outcome.failed:
+                    consecutive_tool_errors += 1
+                else:
+                    consecutive_tool_errors = 0
                 messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "content": json.dumps(result, ensure_ascii=False),
+                                 "content": bounded_tool_content(result, tc.name),
                                  "_round": rounds, "_tool": tc.name})
+
+            if consecutive_tool_errors >= 5:
+                return KillsweepResult({
+                    "error": "连续 5 次工具执行异常，已停止通杀分析",
+                    "failure_kind": "tool_exception",
+                    "is_killsweep": False,
+                })
+            if consecutive_tool_errors == 3:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "工具已连续 3 次执行异常，请切换工具、缩小参数，"
+                        "或调用 submit_killsweep 收尾。"
+                    ),
+                })
 
             if self._result is not None:
                 break
