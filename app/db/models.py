@@ -117,6 +117,13 @@ class Target(Base):
     leaked_creds: Mapped[list | None] = mapped_column(JSON, nullable=True)
     auth_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     auth_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    prompt_release_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, index=True,
+    )
+    prompt_experiment_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True,
+    )
+    prompt_cohort: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # 通杀派生目标所属案例；人工否定时只取消该案例尚未执行的目标。
     killsweep_case_id: Mapped[str | None] = mapped_column(
         ForeignKey("killsweeps.id", ondelete="SET NULL"), nullable=True, index=True,
@@ -706,6 +713,96 @@ class TaskEvent(Base):
     message: Mapped[str] = mapped_column(Text, default="")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     ts: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+
+class PromptExperiment(Base):
+    """不可变 Prompt Release 的离线评估、实时灰度与晋升状态。"""
+    __tablename__ = "prompt_experiments"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    status: Mapped[str] = mapped_column(String(20), default="offline", index=True)
+    stable_release_id: Mapped[str] = mapped_column(String(80))
+    candidate_release_id: Mapped[str] = mapped_column(String(80))
+    previous_stable_id: Mapped[str] = mapped_column(String(80), default="")
+    seed: Mapped[str] = mapped_column(String(64))
+    canary_percent: Mapped[float] = mapped_column(Float, default=10.0)
+    thresholds: Mapped[dict] = mapped_column(JSON, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    failure_reason: Mapped[str] = mapped_column(Text, default="")
+    promotion_reason: Mapped[str] = mapped_column(Text, default="")
+    rollback_reason: Mapped[str] = mapped_column(Text, default="")
+    offline_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    live_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    samples: Mapped[list["PromptExperimentSample"]] = relationship(
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class PromptExperimentSample(Base):
+    """脱敏的离线或目标级实时 Prompt Release 行为样本。"""
+    __tablename__ = "prompt_experiment_samples"
+    __table_args__ = (
+        Index(
+            "ux_prompt_samples_live_target",
+            "experiment_id",
+            "target_id",
+            unique=True,
+            sqlite_where=text("target_id IS NOT NULL"),
+        ),
+        Index(
+            "ux_prompt_samples_offline_run",
+            "experiment_id",
+            "case_id",
+            "release_id",
+            "run_number",
+            unique=True,
+            sqlite_where=text("case_id != '' AND run_number IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    experiment_id: Mapped[str] = mapped_column(
+        ForeignKey("prompt_experiments.id", ondelete="CASCADE"), index=True,
+    )
+    phase: Mapped[str] = mapped_column(String(20))
+    cohort: Mapped[str] = mapped_column(String(20))
+    release_id: Mapped[str] = mapped_column(String(80))
+    case_id: Mapped[str] = mapped_column(String(120), default="")
+    run_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    target_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    src_type: Mapped[str] = mapped_column(String(20), default="")
+    route_id: Mapped[str] = mapped_column(String(80), default="")
+    terminal_verdict: Mapped[str] = mapped_column(String(30), default="")
+    rounds: Mapped[int] = mapped_column(Integer, default=0)
+    tool_calls: Mapped[int] = mapped_column(Integer, default=0)
+    tool_errors: Mapped[int] = mapped_column(Integer, default=0)
+    agent_terminated_by_tool: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    usage_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    finding_count: Mapped[int] = mapped_column(Integer, default=0)
+    ai_accepted_count: Mapped[int] = mapped_column(Integer, default=0)
+    human_passed_count: Mapped[int] = mapped_column(Integer, default=0)
+    human_rejected_count: Mapped[int] = mapped_column(Integer, default=0)
+    evidence_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    forbidden_action_count: Mapped[int] = mapped_column(Integer, default=0)
+    missed_signal_count: Mapped[int] = mapped_column(Integer, default=0)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    experiment: Mapped[PromptExperiment] = relationship(back_populates="samples")
 
 
 class Intel(Base):

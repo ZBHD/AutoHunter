@@ -61,6 +61,9 @@ _MIGRATIONS = [
     ("targets", "leaked_creds", "JSON"),
     ("targets", "auth_context", "JSON"),
     ("targets", "auth_status", "JSON"),
+    ("targets", "prompt_release_id", "VARCHAR(80)"),
+    ("targets", "prompt_experiment_id", "VARCHAR(32)"),
+    ("targets", "prompt_cohort", "VARCHAR(20)"),
     ("targets", "dead_reason", "VARCHAR(300) DEFAULT ''"),
     ("targets", "last_error", "VARCHAR(500) DEFAULT ''"),
     ("targets", "school", "VARCHAR(200) DEFAULT ''"),
@@ -141,6 +144,10 @@ _UNIQUE_INDEXES = [
 # 普通索引：跨 host 查重按归一化类型别名集合做 IN 预筛时走索引，避免全表扫。
 # create_all 不会给已存在的老表补索引，这里显式建。
 _SECONDARY_INDEXES = [
+    ("ix_targets_prompt_release_id",
+     "CREATE INDEX IF NOT EXISTS ix_targets_prompt_release_id ON targets(prompt_release_id)"),
+    ("ix_targets_prompt_experiment_id",
+     "CREATE INDEX IF NOT EXISTS ix_targets_prompt_experiment_id ON targets(prompt_experiment_id)"),
     ("ix_gateway_assets_task_id",
      "CREATE INDEX IF NOT EXISTS ix_gateway_assets_task_id ON gateway_assets(task_id)"),
     ("ix_gateway_assets_next_scan_at",

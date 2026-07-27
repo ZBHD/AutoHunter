@@ -10,6 +10,62 @@ from app.db.models import Base, MissedSignal, RawEvidence, Target, Task
 from app.db.session import _auto_migrate, _ensure_secondary_indexes, _ensure_unique_indexes
 
 
+def test_old_targets_table_gains_prompt_release_columns_without_data_loss() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+            async with engine.begin() as conn:
+                other_tables = [
+                    table for table in Base.metadata.sorted_tables
+                    if table.name != "targets"
+                ]
+                await conn.run_sync(
+                    lambda sync_conn: Base.metadata.create_all(
+                        sync_conn,
+                        tables=other_tables,
+                    )
+                )
+                await conn.exec_driver_sql(
+                    """
+                    CREATE TABLE targets (
+                        id VARCHAR(32) PRIMARY KEY,
+                        status VARCHAR(20) NOT NULL
+                    )
+                    """
+                )
+                await conn.exec_driver_sql(
+                    "INSERT INTO targets (id, status) VALUES ('legacy-target', 'queued')"
+                )
+
+                await _auto_migrate(conn)
+                await _auto_migrate(conn)
+
+                columns = await conn.exec_driver_sql("PRAGMA table_info(targets)")
+                names = {row[1] for row in columns.fetchall()}
+                row = await conn.exec_driver_sql(
+                    """SELECT id, status, prompt_release_id,
+                                      prompt_experiment_id, prompt_cohort
+                       FROM targets WHERE id='legacy-target'"""
+                )
+
+                assert {
+                    "prompt_release_id",
+                    "prompt_experiment_id",
+                    "prompt_cohort",
+                }.issubset(names)
+                assert row.one() == (
+                    "legacy-target",
+                    "queued",
+                    None,
+                    None,
+                    None,
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_old_tasks_table_gains_mode_config_idempotently_without_data_loss() -> None:
     async def scenario() -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
