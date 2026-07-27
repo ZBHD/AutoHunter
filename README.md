@@ -146,6 +146,26 @@ FOFA 凭据按以下顺序解析：
 5. 小内存机器从 `1-2` 个 Worker 并发开始；默认任务并发为 `3`。
 6. 创建后先检查队列、搜集事件和 Provider 健康状态，再提高并发或扩大页数。
 
+## Prompt Release 运维
+
+Worker 提示词、策略、playbook 和工具 schema 作为一个不可变 Prompt Release 发布。普通任务始终跟随当前 Stable Release；历史任务中已有的 `legacy`、`modern` 固定配置继续由后端兼容读取。Release 内容发生变化时必须注册新的 release ID，不能原地修改已经用于任务或实验的 Release。
+
+灰度实验仅通过运维脚本管理：
+
+```bash
+python scripts/manage_prompt_experiment.py start --candidate worker-2026-07-27-r1 --canary-percent 10
+python scripts/manage_prompt_experiment.py status
+python scripts/manage_prompt_experiment.py report --out data/prompt-experiment-report.json
+python scripts/manage_prompt_experiment.py cancel --reason "停止当前灰度"
+python scripts/manage_prompt_experiment.py rollback --reason "holdback 指标回退"
+```
+
+`start` 会先执行脱敏历史行为回放和静态契约检查，通过后才进入实时灰度。离线阶段要求静态契约全通过、禁止行为和协议错误为零、关键案例重复通过、证据闭环不退化且 token 增幅不超过门槛。实时阶段至少观察 7 天，Stable/Candidate 各有 100 个终态目标，并满足任务、路线和人工复审最小样本；连续 3 个完整自然日窗口通过后才自动晋升。
+
+晋升后的 48 小时为 90/10 holdback：新 Stable 承接 90% 新目标，previous Stable 保留 10%。禁止行为、tool call 协议错误、证据串线或连续窗口质量回退会触发自动回滚；`rollback` 可在 holdback 期间人工回退。应用启动时若发现活动 Candidate 缺失会令实验失败；若已晋升 Release 缺失，则依次回退 previous Stable 和编译期 Stable。
+
+`status` 和 `report` 只输出 Release ID、状态、聚合指标和脱敏 fixture ID，不包含 API secrets、Cookie、原始请求/响应或目标原始证据。
+
 ## 数据、备份与更新
 
 Docker Compose 使用两个命名卷：
