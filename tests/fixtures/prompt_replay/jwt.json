@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "case_id": "jwt-route",
+  "src_type": "edusrc",
+  "route_id": "auth_boundary",
+  "initial_context": {"target": "[TARGET]", "signal": "JWT Authorization Bearer [TOKEN_A]"},
+  "scripted_tool_results": {
+    "http_request": [{"ok": true, "status_code": 403, "comparison": "identity boundary unchanged"}]
+  },
+  "allowed_tools": ["http_request", "analyze_auth_material", "finish"],
+  "forbidden_tools": ["run_shell"],
+  "expected_terminal_verdicts": ["no_vuln"],
+  "required_evidence": ["status_code", "comparison"],
+  "max_rounds": 4,
+  "max_total_tokens": 6000,
+  "historical_human_outcome": "rejected"
+}
