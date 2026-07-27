@@ -21,6 +21,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import FofaKeyConfig, LLMConfig, LLMProviderConfig
+from app.agents.prompt_releases import (
+    COMPILED_STABLE_RELEASE_ID,
+    PromptRelease,
+    UnknownPromptReleaseError,
+    get_prompt_release,
+    resolve_prompt_release,
+)
 from app.agents.prompts import normalize_worker_prompt_version
 from app.db.models import SystemSettings, Task, to_cst_iso
 from app.db.session import SessionLocal
@@ -174,6 +181,8 @@ def _env_defaults() -> dict[str, Any]:
         "concurrency": 3,
         "skip_score_threshold": float(os.environ.get("SKIP_SCORE_THRESHOLD", "-10")),
         "worker_prompt_version": normalize_worker_prompt_version(os.environ.get("WORKER_PROMPT_VERSION", "current")),
+        "worker_prompt_channel": "stable",
+        "stable_prompt_release_id": COMPILED_STABLE_RELEASE_ID,
         "engine": os.environ.get("SEARCH_ENGINE", get_default_engine()),
     }
 
@@ -605,10 +614,36 @@ def resolve_skip_score_threshold() -> float:
 
 
 def resolve_worker_prompt_version(task: Task | None = None) -> str:
-    mc = (task.model_config_json or {}) if task else {}
-    if mc.get("prompt_version"):
-        return normalize_worker_prompt_version(mc.get("prompt_version"))
-    return normalize_worker_prompt_version(effective_settings()["defaults"].get("worker_prompt_version"))
+    return normalize_worker_prompt_version(
+        resolve_worker_prompt_release(task).base_profile
+    )
+
+
+def resolve_stable_prompt_release_id(
+    defaults: dict[str, Any] | None = None,
+) -> str:
+    source = defaults if defaults is not None else effective_settings()["defaults"]
+    release_id = str(
+        source.get("stable_prompt_release_id") or COMPILED_STABLE_RELEASE_ID
+    ).strip()
+    try:
+        return get_prompt_release(release_id).release_id
+    except UnknownPromptReleaseError:
+        logger.error(
+            "configured stable prompt release is not registered: %s; fallback=%s",
+            release_id,
+            COMPILED_STABLE_RELEASE_ID,
+        )
+        return COMPILED_STABLE_RELEASE_ID
+
+
+def resolve_worker_prompt_release(task: Task | None = None) -> PromptRelease:
+    model_config = (task.model_config_json or {}) if task else {}
+    alias = str(model_config.get("prompt_version") or "current")
+    return resolve_prompt_release(
+        alias,
+        stable_release_id=resolve_stable_prompt_release_id(),
+    )
 
 
 def _public_provider(provider: LLMProviderConfig) -> dict[str, Any]:
@@ -871,6 +906,8 @@ def public_settings_view() -> dict[str, Any]:
             "concurrency": int(defaults.get("concurrency") or 3),
             "skip_score_threshold": float(defaults.get("skip_score_threshold", -10)),
             "worker_prompt_version": normalize_worker_prompt_version(defaults.get("worker_prompt_version")),
+            "worker_prompt_channel": "stable",
+            "stable_prompt_release_id": resolve_stable_prompt_release_id(defaults),
             "engine": defaults.get("engine", get_default_engine()),
         },
         "available_engines": list_engines(),
