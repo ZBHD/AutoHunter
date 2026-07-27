@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import re
+import secrets
 from typing import Any, Sequence
 
 from sqlalchemy import select, update
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.prompt_releases import (
     COMPILED_STABLE_RELEASE_ID,
+    get_prompt_release,
     require_promotable_release,
     resolve_prompt_release,
 )
@@ -22,6 +24,7 @@ from app.db.models import (
     Task,
 )
 from app.settings_service import refresh_cache, resolve_stable_prompt_release_id
+from app.prompt_replay import build_replay_schedule
 
 _ACTIVE_ASSIGNMENT_STATUSES = ("live", "promoted")
 _MANUAL_ALIASES = frozenset({
@@ -50,6 +53,10 @@ class GateDecision:
     reason: str
     metrics: dict[str, Any]
     insufficient: list[str]
+
+
+class PromptExperimentConflictError(RuntimeError):
+    pass
 
 
 def cohort_bucket(seed: str, target_id: str) -> int:
@@ -487,6 +494,183 @@ def _rollback_regression(stable: dict[str, Any], candidate: dict[str, Any]) -> b
 
 
 class PromptExperimentService:
+    async def start(
+        self,
+        session: AsyncSession,
+        *,
+        candidate_release_id: str,
+        canary_percent: float = 10.0,
+        seed: str | None = None,
+        now: datetime | None = None,
+    ) -> PromptExperiment:
+        candidate = require_promotable_release(candidate_release_id)
+        percent = float(canary_percent)
+        if not 0 < percent < 100:
+            raise ValueError("canary_percent must be greater than 0 and less than 100")
+        active = await session.scalar(
+            select(PromptExperiment)
+            .where(PromptExperiment.status.in_(("offline", "live", "promoted")))
+            .limit(1)
+        )
+        if active is not None:
+            raise PromptExperimentConflictError(
+                f"an active prompt experiment already exists: {active.id} ({active.status})"
+            )
+        stable = await _stable_release_id(session)
+        if stable == candidate.release_id:
+            raise PromptExperimentConflictError(
+                "candidate release is already the Stable release"
+            )
+        current = _utc_naive(now)
+        experiment = PromptExperiment(
+            status="offline",
+            stable_release_id=stable,
+            candidate_release_id=candidate.release_id,
+            seed=str(seed or secrets.token_hex(24))[:64],
+            canary_percent=percent,
+            thresholds={
+                "offline_repeat": 3,
+                "minimum_live_days": 7,
+                "minimum_targets_per_arm": 100,
+                "minimum_candidate_tasks": 5,
+                "minimum_candidate_routes": 3,
+                "minimum_human_reviews": 20,
+                "promotion_windows": 3,
+                "holdback_hours": 48,
+            },
+            offline_started_at=current,
+        )
+        session.add(experiment)
+        await session.commit()
+        return experiment
+
+    async def run_offline(
+        self,
+        session: AsyncSession,
+        experiment: PromptExperiment,
+        runner: Any,
+        fixtures: Sequence[Any],
+        *,
+        static_contract_pass_rate: float,
+        repeat: int = 3,
+    ) -> GateDecision:
+        if experiment.status != "offline":
+            raise PromptExperimentConflictError(
+                f"offline replay requires offline status, got {experiment.status}"
+            )
+        schedule = build_replay_schedule(
+            fixtures,
+            stable_release_id=experiment.stable_release_id,
+            candidate_release_id=experiment.candidate_release_id,
+            repeat=repeat,
+            seed=experiment.seed,
+        )
+        stable_rows: list[PromptExperimentSample] = []
+        candidate_rows: list[PromptExperimentSample] = []
+        for item in schedule:
+            cohort = (
+                "candidate"
+                if item.release_id == experiment.candidate_release_id
+                else "stable"
+            )
+            sample = runner.run_case(
+                item.fixture,
+                get_prompt_release(item.release_id),
+                experiment_id=experiment.id,
+                run_number=item.run_number,
+                cohort=cohort,
+            )
+            session.add(sample)
+            if cohort == "candidate":
+                candidate_rows.append(sample)
+            else:
+                stable_rows.append(sample)
+        await session.flush()
+
+        stable = aggregate_samples(stable_rows)
+        candidate = aggregate_samples(candidate_rows)
+        case_passes: dict[str, int] = {}
+        for row in candidate_rows:
+            if (row.metrics or {}).get("expected_terminal"):
+                case_passes[row.case_id] = case_passes.get(row.case_id, 0) + 1
+        candidate["static_contract_pass_rate"] = float(static_contract_pass_rate)
+        candidate["critical_cases_passed"] = all(
+            case_passes.get(fixture.case_id, 0) >= 2
+            for fixture in fixtures
+        )
+        candidate["agent_crash_count"] = sum(
+            row.terminal_verdict == "incomplete"
+            or bool((row.metrics or {}).get("agent_crash"))
+            for row in candidate_rows
+        )
+        decision = evaluate_offline_gate(stable, candidate)
+        experiment.metrics = {"offline": decision.metrics}
+        if decision.passed:
+            experiment.status = "live"
+            experiment.live_started_at = _utc_naive()
+            experiment.failure_reason = ""
+        else:
+            experiment.status = "failed"
+            experiment.failure_reason = decision.reason
+        await session.commit()
+        return decision
+
+    async def cancel(
+        self,
+        session: AsyncSession,
+        reason: str,
+    ) -> PromptExperiment:
+        experiment = await session.scalar(
+            select(PromptExperiment)
+            .where(PromptExperiment.status.in_(("offline", "live")))
+            .order_by(PromptExperiment.created_at.desc())
+            .limit(1)
+        )
+        if experiment is None:
+            raise PromptExperimentConflictError("no cancellable prompt experiment")
+        experiment.status = "cancelled"
+        experiment.failure_reason = str(reason or "operator cancelled")
+        await session.commit()
+        return experiment
+
+    async def latest(self, session: AsyncSession) -> PromptExperiment | None:
+        return await session.scalar(
+            select(PromptExperiment)
+            .order_by(PromptExperiment.created_at.desc())
+            .limit(1)
+        )
+
+    async def report(
+        self,
+        session: AsyncSession,
+        experiment_id: str | None = None,
+    ) -> dict[str, Any]:
+        experiment = (
+            await session.get(PromptExperiment, experiment_id)
+            if experiment_id
+            else await self.latest(session)
+        )
+        if experiment is None:
+            raise PromptExperimentConflictError("no prompt experiment found")
+        fixture_ids = sorted(set(await session.scalars(
+            select(PromptExperimentSample.case_id).where(
+                PromptExperimentSample.experiment_id == experiment.id,
+                PromptExperimentSample.case_id != "",
+            )
+        )))
+        return {
+            "id": experiment.id,
+            "status": experiment.status,
+            "stable_release_id": experiment.stable_release_id,
+            "candidate_release_id": experiment.candidate_release_id,
+            "canary_percent": experiment.canary_percent,
+            "metrics": dict(experiment.metrics or {}),
+            "fixture_ids": fixture_ids,
+            "failure_reason": experiment.failure_reason,
+            "promotion_reason": experiment.promotion_reason,
+            "rollback_reason": experiment.rollback_reason,
+        }
+
     async def promote(
         self,
         session: AsyncSession,
@@ -682,6 +866,7 @@ __all__ = [
     "PromptAssignment",
     "GateDecision",
     "PromptExperimentService",
+    "PromptExperimentConflictError",
     "aggregate_samples",
     "assignment_for_target",
     "cohort_bucket",
