@@ -17,6 +17,46 @@ CANDIDATE_RELEASE_ID = "worker-2026-07-27-r1"
 CONTROL_SURFACE_VERSION = "worker-control-v1"
 RELEASE_ID_RE = re.compile(r"worker-\d{4}-\d{2}-\d{2}-r[1-9]\d*")
 
+CANDIDATE_ROUTE_POLICIES = (
+    {
+        "route": "SSRF",
+        "pattern": re.compile(
+            r"(?i)(callback[_-]?url|webhook|proxy(?:[_-]?url)?|preview(?:[_-]?url)?|"
+            r"image[_-]?url|import[_-]?url|url\s*[=:])"
+        ),
+        "steps": (
+            "先做基线与单变量 URL 参数对照，再验证是否由服务端发起请求。",
+            "最低证据：受控目标或允许范围内资源的服务端请求差异；错误文本不算访问成功。",
+        ),
+    },
+    {
+        "route": "XXE/解析",
+        "pattern": re.compile(r"(?i)(\bxml\b|soap|office|docx|xlsx|富文本导入|xml导入)"),
+        "steps": (
+            "先确认解析器确实处理 XML/Office 内容，再做单变量实体或引用对照。",
+            "最低证据：解析行为差异或允许范围内的受控资源读取；单纯接收 XML 不成立。",
+        ),
+    },
+    {
+        "route": "反序列化",
+        "pattern": re.compile(
+            r"(?i)(shiro|fastjson|java\s*seriali[sz]ation|viewstate|dubbo|反序列化)"
+        ),
+        "steps": (
+            "先确认组件与数据格式，再使用无害、可重复的解析对照验证。",
+            "最低证据：可重复的解析或执行证据；指纹和报错只能作为线索。",
+        ),
+    },
+    {
+        "route": "Token/身份边界",
+        "pattern": re.compile(r"(?i)(\bjwt\b|authorization|bearer\s|access[_-]?token)"),
+        "steps": (
+            "对声明、算法或身份材料做单变量对照，并请求同一受限资源确认边界。",
+            "最低证据：声明或算法变化必须实际获得不同身份或受限资源；只解码 payload 不成立。",
+        ),
+    },
+)
+
 
 class UnknownPromptReleaseError(LookupError):
     pass
@@ -138,6 +178,24 @@ def render_worker_prompt(
     return worker_system_prompt(src_type, release.base_profile)
 
 
+def render_candidate_route_block(release: PromptRelease, signal_text: str) -> str:
+    if release.release_id != CANDIDATE_RELEASE_ID:
+        return ""
+    text = str(signal_text or "")
+    matched = [
+        policy
+        for policy in CANDIDATE_ROUTE_POLICIES
+        if policy["pattern"].search(text)
+    ]
+    if not matched:
+        return ""
+    lines = ["# Candidate 条件化验证路线（仅执行命中项）"]
+    for policy in matched:
+        lines.append(f"## {policy['route']}")
+        lines.extend(f"- {step}" for step in policy["steps"])
+    return "\n".join(lines) + "\n\n"
+
+
 def _playbook_control_surface() -> dict[str, Any]:
     routes = [asdict(route) for route in playbook_router._ROUTES]
     return {
@@ -169,6 +227,14 @@ def prompt_release_fingerprint(release: PromptRelease) -> str:
             "edusrc": render_worker_prompt(release, "edusrc"),
             "enterprise": render_worker_prompt(release, "enterprise"),
         },
+        "candidate_route_policies": [
+            {
+                "route": policy["route"],
+                "pattern": policy["pattern"].pattern,
+                "steps": policy["steps"],
+            }
+            for policy in CANDIDATE_ROUTE_POLICIES
+        ],
         "playbook": _playbook_control_surface(),
         "tool_schemas": _tool_control_surface(),
     }
@@ -183,6 +249,7 @@ def prompt_release_fingerprint(release: PromptRelease) -> str:
 
 __all__ = [
     "CANDIDATE_RELEASE_ID",
+    "CANDIDATE_ROUTE_POLICIES",
     "COMPILED_STABLE_RELEASE_ID",
     "CONTROL_SURFACE_VERSION",
     "LEGACY_RELEASE_ID",
@@ -194,6 +261,7 @@ __all__ = [
     "UnknownPromptReleaseError",
     "get_prompt_release",
     "prompt_release_fingerprint",
+    "render_candidate_route_block",
     "render_worker_prompt",
     "require_promotable_release",
     "resolve_prompt_release",

@@ -18,6 +18,13 @@ from pydantic import ValidationError
 from app.agents import site_collab
 from app.agents.auth_bootstrap import bootstrap_auth, user_auth_prompt_block
 from app.agents.history import bounded_tool_content, compact_messages
+from app.agents.prompt_releases import (
+    COMPILED_STABLE_RELEASE_ID,
+    get_prompt_release,
+    render_candidate_route_block,
+    render_worker_prompt,
+    resolve_prompt_release,
+)
 from app.agents.src_leads import (
     Lead,
     SrcCandidate,
@@ -27,7 +34,7 @@ from app.agents.src_leads import (
     resolve_lead,
 )
 from app.deepen_context import render_deepen_brief
-from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version, worker_system_prompt
+from app.agents.prompts import is_enterprise_src, normalize_worker_prompt_version
 from app.config import worker_config
 from app import dedup
 from app.llm.router import LLMRouter
@@ -67,6 +74,8 @@ class Worker:
         fofa_base_url: str = "",
         fofa_router: FofaKeyRouter | None = None,
         prompt_version: str | None = None,
+        prompt_release_id: str | None = None,
+        prompt_cohort: str = "",
         auth_context: Optional[dict] = None,
     ):
         self.target = target
@@ -74,7 +83,16 @@ class Worker:
         self.cancel_event = cancel_event or threading.Event()
         self.src_type = src_type
         self._enterprise = is_enterprise_src(src_type)
-        self.prompt_version = normalize_worker_prompt_version(prompt_version or worker_config.prompt_version)
+        if prompt_release_id:
+            self.prompt_release = get_prompt_release(prompt_release_id)
+        else:
+            self.prompt_release = resolve_prompt_release(
+                prompt_version or worker_config.prompt_version,
+                stable_release_id=COMPILED_STABLE_RELEASE_ID,
+            )
+        self.prompt_release_id = self.prompt_release.release_id
+        self.prompt_cohort = str(prompt_cohort or "")
+        self.prompt_version = normalize_worker_prompt_version(self.prompt_release.base_profile)
         self.auth_context = dict(auth_context or {}) or None
         self.executor = ToolExecutor(
             target, cancel_event=self.cancel_event,
@@ -417,7 +435,21 @@ class Worker:
 
     def _playbook_block(self) -> str:
         """目标打法路由：编排层生成的短路线块。"""
-        return (self.target_meta or {}).get("playbook_block") or ""
+        meta = self.target_meta or {}
+        route = meta.get("playbook_route") or {}
+        signal_text = "\n".join([
+            self.target,
+            str(meta.get("title") or ""),
+            str(meta.get("priority_reason") or ""),
+            str(route.get("route_id") or ""),
+            " ".join(route.get("tags") or []),
+            str(meta.get("playbook_block") or ""),
+            json.dumps(self.deepen_context or {}, ensure_ascii=False),
+        ])
+        return (
+            (meta.get("playbook_block") or "")
+            + render_candidate_route_block(self.prompt_release, signal_text)
+        )
 
     def _site_collab_block(self) -> str:
         """单站协作路线块：当前 worker 的分工和已有覆盖摘要。"""
@@ -473,7 +505,12 @@ class Worker:
         )
 
     def run(self) -> WorkerResult:
-        start_event = {"target": self.target, "prompt_version": self.prompt_version}
+        start_event = {
+            "target": self.target,
+            "prompt_version": self.prompt_version,
+            "prompt_release_id": self.prompt_release_id,
+            "prompt_cohort": self.prompt_cohort,
+        }
         start_event.update(self._site_event_metadata())
         auth_block = ""
         if self.auth_context:
@@ -501,7 +538,7 @@ class Worker:
             )
         self._emit("worker_start", **start_event)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": worker_system_prompt(self.src_type, self.prompt_version)},
+            {"role": "system", "content": render_worker_prompt(self.prompt_release, self.src_type)},
             {"role": "user", "content": _WORKER_STATIC_PREFIX},
             {"role": "user", "content": user_content},
         ]
