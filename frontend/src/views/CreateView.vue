@@ -30,7 +30,6 @@ const form = reactive({
   src_rules: "",
   use_global_pool: true,
   base_url: "", api_key: "", model: "", protocol: "openai_chat", temperature: 0.3,
-  prompt_version: "current",
   fofa_key: "", fofa_key_mode: "global", fofa_base_url: "", max_pages: 20, concurrency: 3,
   site_recon_mode: "full",
   ...litellmFormFromTask({}),
@@ -73,7 +72,6 @@ async function submit() {
   }
   const modelConfig = {
     use_global_pool: form.use_global_pool,
-    prompt_version: form.prompt_version,
   };
   if (!form.use_global_pool) {
     modelConfig.base_url = form.base_url.trim();
@@ -134,7 +132,6 @@ onMounted(async () => {
     if (!form.model) form.model = provider.model || "";
     form.protocol = provider.protocol || form.protocol;
     form.temperature = provider.temperature ?? form.temperature;
-    form.prompt_version = s.defaults?.worker_prompt_version || form.prompt_version;
     form.max_pages = s.fofa?.max_pages ?? form.max_pages;
     if (!form.intent_mode) form.intent_mode = s.fofa?.default_intent_mode || "";
     if (!form.fofa_base_url) form.fofa_base_url = s.fofa?.base_url || "";
@@ -309,13 +306,6 @@ onMounted(async () => {
           </label>
           <label class="full">模型名 <input v-model="form.model" placeholder="gpt-4.1-mini" required /></label>
         </div>
-        <label>Worker 提示词
-          <select v-model="form.prompt_version">
-            <option value="current">current（当前省 token 版）</option>
-            <option value="legacy">legacy（旧版 23/25 风格）</option>
-            <option value="modern">modern（当前完整版）</option>
-          </select>
-        </label>
         <template v-if="isFofaMode">
           <div class="model-mode-switch" role="group" aria-label="FOFA Key 来源">
             <button type="button" :class="{ active: form.fofa_key_mode === 'global' }"
