@@ -27,6 +27,7 @@ const fofaKeyPanel = ref(null);
 const healthChecking = ref(false);
 const healthResponse = ref(null);
 const healthError = ref("");
+const stableReleaseId = ref("");
 const fofaNowMs = ref(Date.now());
 let fofaClock = null;
 const systemLoaded = ref(false);
@@ -50,7 +51,6 @@ const form = reactive({
   default_intent_mode: "",
   concurrency: 3,
   skip_score_threshold: -10,
-  worker_prompt_version: "current",
 });
 
 function toast(m) {
@@ -103,7 +103,7 @@ async function load() {
     form.default_intent_mode = s.fofa?.default_intent_mode || "";
     form.concurrency = s.defaults?.concurrency ?? 3;
     form.skip_score_threshold = s.defaults?.skip_score_threshold ?? -10;
-    form.worker_prompt_version = s.defaults?.worker_prompt_version || "current";
+    stableReleaseId.value = s.defaults?.stable_prompt_release_id || "";
     systemLoaded.value = true;
   } finally {
     loading.value = false;
@@ -131,7 +131,6 @@ async function save() {
       defaults: {
         concurrency: Number(form.concurrency),
         skip_score_threshold: Number(form.skip_score_threshold),
-        worker_prompt_version: form.worker_prompt_version,
       },
     };
     const s = await api.updateSettings(body);
@@ -263,8 +262,8 @@ onUnmounted(() => {
             <dd>{{ form.skip_score_threshold }}</dd>
           </div>
           <div>
-            <dt>Worker 提示词</dt>
-            <dd>{{ form.worker_prompt_version }}</dd>
+            <dt>Stable Release</dt>
+            <dd>{{ stableReleaseId || "-" }}</dd>
           </div>
         </dl>
         <p class="settings-note">
@@ -362,13 +361,6 @@ onUnmounted(() => {
               <label>新建任务默认并发 <input v-model="form.concurrency" type="number" min="1" max="32" /></label>
               <label>低分跳过阈值
                 <input v-model="form.skip_score_threshold" type="number" step="1" />
-              </label>
-              <label class="full">Worker 提示词版本
-                <select v-model="form.worker_prompt_version">
-                  <option value="current">current（当前省 token 版）</option>
-                  <option value="modern">modern（当前完整版）</option>
-                  <option value="legacy">legacy（旧版 23/25 风格）</option>
-                </select>
               </label>
               <p class="field-hint full">Collector 评分低于此值的目标直接跳过，避免 worker 消耗在垃圾资产上。</p>
             </div>

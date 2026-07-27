@@ -78,7 +78,6 @@ const form = reactive({
   model: "",
   protocol: "openai_chat",
   temperature: 0.3,
-  prompt_version: "current",
   fofa_key: "",
   fofa_key_mode: "global",
   fofa_base_url: "",
@@ -152,7 +151,6 @@ function fill(task) {
   form.model = modelCfg.model || "";
   form.protocol = modelCfg.protocol || "openai_chat";
   form.temperature = Number(modelCfg.temperature ?? 0.3);
-  form.prompt_version = modelCfg.prompt_version || "current";
   form.fofa_key = "";
   const initialIsFofa = isFofaPoolMode(form.target_source, form.engine);
   const initialHasTaskKey = fofaCfg.key_source === "task";
@@ -193,7 +191,6 @@ async function save() {
   }
   const modelConfig = {
     use_global_pool: form.use_global_pool,
-    prompt_version: form.prompt_version,
   };
   if (!form.use_global_pool) {
     modelConfig.base_url = form.base_url.trim();
@@ -433,13 +430,6 @@ async function save() {
             </div>
             <small v-if="modelsError" class="model-hint">{{ modelsError }}</small>
             <small v-else-if="models.length" class="model-hint">已获取 {{ models.length }} 个可用模型</small>
-          </label>
-          <label class="full">Worker 提示词
-            <select v-model="form.prompt_version">
-              <option value="current">current（当前省 token 版）</option>
-              <option value="legacy">legacy（旧版 23/25 风格）</option>
-              <option value="modern">modern（当前完整版）</option>
-            </select>
           </label>
           <label v-if="!form.use_global_pool" class="full">模型 api_key
             <input v-model="form.api_key" type="password" autocomplete="new-password"

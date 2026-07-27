@@ -18,7 +18,7 @@ from app.llm.protocols import (
     OpenAIChatAdapter, AnthropicMessagesAdapter, OpenAIResponsesAdapter,
     coerce_response_payload,
 )
-from app.llm.usage import record_usage
+from app.llm.usage import UsageContext, record_usage
 
 logger = logging.getLogger("autohunter.llm")
 
@@ -258,7 +258,11 @@ class LLMClient:
     不负责：协议逻辑（→ ProtocolAdapter）、重试（→ LLMRouter 切换 provider）。
     """
 
-    def __init__(self, config: LLMProviderConfig | None = None, usage_key: str | None = None):
+    def __init__(
+        self,
+        config: LLMProviderConfig | None = None,
+        usage_key: str | UsageContext | None = None,
+    ):
         self.config = config or LLMProviderConfig()
         self._usage_key = usage_key
         if not self.config.api_key:

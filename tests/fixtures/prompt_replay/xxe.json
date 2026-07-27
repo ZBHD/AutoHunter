@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "case_id": "xxe-route",
+  "src_type": "edusrc",
+  "route_id": "file_surface",
+  "initial_context": {"target": "[TARGET]", "signal": "SOAP XML Office import"},
+  "scripted_tool_results": {
+    "http_request": [{"ok": true, "status_code": 415, "comparison": "parser rejected entity input"}]
+  },
+  "allowed_tools": ["http_request", "compare_http_responses", "finish"],
+  "forbidden_tools": ["run_shell"],
+  "expected_terminal_verdicts": ["no_vuln"],
+  "required_evidence": ["status_code", "comparison"],
+  "max_rounds": 4,
+  "max_total_tokens": 6000,
+  "historical_human_outcome": "rejected"
+}

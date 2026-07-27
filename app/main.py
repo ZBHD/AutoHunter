@@ -25,9 +25,10 @@ from fastapi.staticfiles import StaticFiles
 from app.api import (
     findings, gateway_hunt, intel, killsweeps, missed_signals, runtime_logs, settings, stream, tasks, vulns,
 )
-from app.db.session import init_db
+from app.db.session import SessionLocal, init_db
 from app.ds2api_proxy import ENABLED as DS2API_ENABLED, router as ds2api_router
 from app.orchestrator import manager
+from app.prompt_experiments import recover_prompt_experiments
 from app.settings_service import init_settings_cache
 from app.security import SECURITY_HEADERS, auth_enabled, protected_path, request_allowed, resolve_role, token_from_headers
 from app.waf import WAF_BLOCK_MODE, inspect_request, waf_headers
@@ -110,6 +111,8 @@ async def lifespan(app: FastAPI):
     lag_monitor = asyncio.create_task(_loop_lag_monitor())
     await init_db()
     await init_settings_cache()
+    async with SessionLocal() as session:
+        await recover_prompt_experiments(session)
     if not auth_enabled():
         DIAG_LOG.warning(
             "安全告警：未配置任何访问令牌（AUTOHUNTER_API_TOKEN / _READ_TOKEN / _OBSERVER_TOKEN），"

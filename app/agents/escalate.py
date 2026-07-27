@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from app.agents.depth_policy import depth_policy_for
 from app.agents.history import bounded_tool_content, compact_messages
 from app.agents.prompts import escalate_system_prompt, is_enterprise_src
+from app.agents.tool_dispatch import dispatch_tool_safely
 from app.dedup import normalize_vuln_type
 from app.llm.router import LLMRouter
 from app.tools.executor import ToolExecutor
@@ -113,6 +114,7 @@ class EscalateHunter:
             {"role": "user", "content": self._brief()},
         ]
         rounds = 0
+        consecutive_tool_errors = 0
         while rounds < self.max_rounds:
             if self.cancel_event.is_set():
                 self.executor.cancel_running()
@@ -140,10 +142,35 @@ class EscalateHunter:
                     args = json.loads(tc.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                result = self._dispatch(tc.name, args)
+                outcome = dispatch_tool_safely(
+                    self._dispatch,
+                    tc.name,
+                    args,
+                    emit=self._emit,
+                )
+                result = outcome.result
+                if outcome.failed:
+                    consecutive_tool_errors += 1
+                else:
+                    consecutive_tool_errors = 0
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": bounded_tool_content(result, tc.name),
                                  "_round": rounds, "_tool": tc.name})
+
+            if consecutive_tool_errors >= 5:
+                return EscalateResult({
+                    "escalated": False,
+                    "reason": "连续 5 次工具执行异常，已停止扩大危害深挖",
+                    "failure_kind": "tool_exception",
+                })
+            if consecutive_tool_errors == 3:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "工具已连续 3 次执行异常，请切换工具、缩小参数，"
+                        "或调用 abandon_escalation 收尾。"
+                    ),
+                })
 
             if self._result is not None:
                 break

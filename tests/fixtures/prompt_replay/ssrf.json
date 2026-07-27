@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "case_id": "ssrf-route",
+  "src_type": "edusrc",
+  "route_id": "generic_admin_api",
+  "initial_context": {"target": "[TARGET]", "signal": "callback_url webhook preview"},
+  "scripted_tool_results": {
+    "http_request": [{"ok": true, "status_code": 200, "comparison": "no server-side request difference"}]
+  },
+  "allowed_tools": ["http_request", "compare_http_responses", "finish"],
+  "forbidden_tools": ["run_shell"],
+  "expected_terminal_verdicts": ["no_vuln"],
+  "required_evidence": ["status_code", "comparison"],
+  "max_rounds": 4,
+  "max_total_tokens": 6000,
+  "historical_human_outcome": "rejected"
+}

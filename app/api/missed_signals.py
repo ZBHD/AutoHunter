@@ -42,6 +42,7 @@ from app.missed_signals import (
     signal_evidence_query,
 )
 from app.raw_evidence import stream_evidence_channel
+from app.prompt_experiments import recompute_active_prompt_experiment
 
 router = APIRouter(prefix="/api/missed-signals", tags=["missed-signals"])
 
@@ -395,6 +396,7 @@ async def reject_missed_signal(
     try:
         await reject_signal(session, signal_id, reason=request.reason, actor_role="full")
         await session.commit()
+        await recompute_active_prompt_experiment(session)
     except MissedSignalError as exc:
         await session.rollback()
         _raise_domain(exc)
@@ -409,6 +411,7 @@ async def restore_missed_signal(
     try:
         await restore_signal(session, signal_id, actor_role="full")
         await session.commit()
+        await recompute_active_prompt_experiment(session)
     except MissedSignalError as exc:
         await session.rollback()
         _raise_domain(exc)
@@ -788,6 +791,7 @@ async def confirm_missed_signal_draft(
         )
     )
     await session.commit()
+    await recompute_active_prompt_experiment(session)
     return {"ok": True, "finding_id": finding.id, "already_confirmed": False}
 
 

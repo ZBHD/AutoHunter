@@ -60,6 +60,40 @@ def test_partial_task_model_config_supports_pool_switch() -> None:
     }
 
 
+def test_legacy_clients_can_create_and_patch_prompt_profiles(task_api) -> None:
+    client, session_maker = task_api
+    created = client.post(
+        "/api/tasks",
+        json={
+            "name": "Legacy prompt client",
+            "model_config_data": {
+                "use_global_pool": True,
+                "prompt_version": "legacy",
+            },
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    assert created.json()["model_config_data"]["prompt_version"] == "legacy"
+    assert asyncio.run(_stored_model_config(session_maker, task_id)) == {
+        "use_global_pool": True,
+        "prompt_version": "legacy",
+    }
+
+    patched = client.patch(
+        f"/api/tasks/{task_id}",
+        json={"model_config_data": {"prompt_version": "modern"}},
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["model_config_data"]["prompt_version"] == "modern"
+    assert asyncio.run(_stored_model_config(session_maker, task_id)) == {
+        "use_global_pool": True,
+        "prompt_version": "modern",
+    }
+
+
 @pytest.fixture
 def task_api(tmp_path, monkeypatch):
     from app import settings_service

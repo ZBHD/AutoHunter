@@ -25,6 +25,7 @@ from app.deepen_context import handoff_audit_metadata
 from app.events import bus
 from app.killsweep_service import apply_manual_verdict, queue_initial_attempt
 from app.llm.router import AllProvidersExhaustedError, LLMRouter
+from app.prompt_experiments import recompute_active_prompt_experiment
 from app.tools.executor import ToolExecutor
 
 
@@ -502,6 +503,7 @@ async def restore_archived(finding_id: str, session: AsyncSession = Depends(get_
     if f and f.status != "superseded":
         f.status = "reviewed"
     await session.commit()
+    await recompute_active_prompt_experiment(session)
     return {"ok": True, "id": finding_id}
 
 
@@ -1217,6 +1219,7 @@ async def user_review(finding_id: str, req: UserReviewRequest,
             trigger_killsweep = False
             killsweep_skipped_reason = "源漏洞不存在，无法创建通杀案例"
     await session.commit()
+    await recompute_active_prompt_experiment(session)
     killsweep_triggered = False
     if trigger_killsweep and killsweep_attempt_id:
         # case + attempt 已与人工通过同事务提交；此处只唤醒持久化 attempt。

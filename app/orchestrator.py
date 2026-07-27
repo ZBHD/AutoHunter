@@ -62,6 +62,7 @@ from app.killsweep_service import (
     recover_attempts as recover_killsweep_attempts,
 )
 from app.llm.router import LLMRouter
+from app.llm.usage import UsageContext, pop_target_usage, target_usage_snapshot
 from app.settings_service import (
     fofa_router_for_task,
     llm_router_for_task,
@@ -81,6 +82,11 @@ from app.missed_signals import (
     upsert_signal,
 )
 from app.queue_targets import queue_dispatch_order
+from app.prompt_experiments import (
+    assignment_for_target,
+    finalize_live_sample,
+    recompute_active_prompt_experiment,
+)
 from app.raw_evidence import import_capture
 from app.tools.src_toolkit import SRC_TOOL_NAMES
 from app.gateway_hunt import service as gateway_service
@@ -672,7 +678,10 @@ def _probe_target_liveness(url: str, host: str, timeout: float) -> dict:
 
 
 def _llm_for_task(task: Task) -> LLMRouter:
-    return llm_router_for_task(task)
+    return llm_router_for_task(
+        task,
+        usage_context=getattr(task, "_prompt_usage_context", None),
+    )
 
 
 class TaskRunner:
@@ -1270,6 +1279,9 @@ class TaskRunner:
 
     async def _pop_queued(self, session: AsyncSession) -> Target | None:
         queue_revision = self._queue_revision
+        task_obj = await session.get(Task, self.task_id)
+        if task_obj is None:
+            return None
         # 按 EduSRC 优先级评分降序派发：高价值目标先挖。
         # 多取一批是为了遇到同款系统正在跑/已冷却时，能跳到其它 cluster。
         loop = asyncio.get_running_loop()
@@ -1393,6 +1405,11 @@ class TaskRunner:
 
         if selected:
             target, probe = selected
+            prompt_assignment = await assignment_for_target(
+                session,
+                task_obj,
+                target,
+            )
             self._queue_prefilter_retry_after.pop(target.id, None)
             alive_url = probe.get("url") or ""
             expected_position = candidate_positions.get(target.id)
@@ -1407,6 +1424,9 @@ class TaskRunner:
                 "heartbeat_at": _now(),
                 "dead_reason": "",
                 "last_error": "",
+                "prompt_release_id": prompt_assignment.release_id,
+                "prompt_experiment_id": prompt_assignment.experiment_id,
+                "prompt_cohort": prompt_assignment.cohort,
             }
             if alive_url and alive_url != target.url:
                 values["url"] = alive_url
@@ -2406,6 +2426,8 @@ class TaskRunner:
         fofa_base_url = ""
         fofa_router = None
         auth_context: dict | None = None
+        prompt_release_id = ""
+        prompt_cohort = ""
         async with SessionLocal() as session:
             tgt = await session.get(Target, target_id)
             task_obj = await session.get(Task, task_id)
@@ -2414,6 +2436,18 @@ class TaskRunner:
                 hunt_direction = (task_obj.hunt_direction or "").strip()
                 fofa_router = fofa_router_for_task(task_obj)
             if tgt:
+                if task_obj:
+                    prompt_assignment = await assignment_for_target(
+                        session,
+                        task_obj,
+                        tgt,
+                    )
+                    if not tgt.prompt_release_id:
+                        tgt.prompt_release_id = prompt_assignment.release_id
+                        tgt.prompt_experiment_id = prompt_assignment.experiment_id
+                        tgt.prompt_cohort = prompt_assignment.cohort
+                    prompt_release_id = str(tgt.prompt_release_id or "")
+                    prompt_cohort = str(tgt.prompt_cohort or "")
                 tgt.status = "scanning"
                 self._live[target_id]["score"] = tgt.priority_score
                 self._live[target_id]["score_reason"] = tgt.priority_reason
@@ -2489,6 +2523,14 @@ class TaskRunner:
                     self._live[target_id]["action"] = "🔁 定向深挖启动中…"
                 duplicate_history = await self._build_duplicate_history(session, task_id, tgt)
                 await session.commit()
+            usage_context = UsageContext(
+                task_id=task_id,
+                target_id=target_id,
+                experiment_id=str(tgt.prompt_experiment_id or "") if tgt else "",
+                release_id=prompt_release_id,
+                cohort=prompt_cohort,
+            )
+            task_obj._prompt_usage_context = usage_context
             llm = _llm_for_task(task_obj)
             prompt_version = resolve_worker_prompt_version(task_obj)
 
@@ -2501,9 +2543,11 @@ class TaskRunner:
                             duplicate_history=duplicate_history,
                             cancel_event=cancel_event, src_type=src_type,
                             fofa_key=fofa_key, fofa_base_url=fofa_base_url,
-                            fofa_router=fofa_router,
-                            prompt_version=prompt_version,
-                            auth_context=auth_context)
+                             fofa_router=fofa_router,
+                             prompt_version=prompt_version,
+                             prompt_release_id=prompt_release_id,
+                             prompt_cohort=prompt_cohort,
+                             auth_context=auth_context)
             worker_holder["worker"] = worker
             try:
                 return worker.run().model_dump(mode="json")
@@ -3455,7 +3499,18 @@ class TaskRunner:
             # 目标已离开「持续临时错误」状态（成功/无果/置dead），清理回队计数避免泄漏累积。
             if not transient_llm_error:
                 self._transient_llm_requeue.pop(target_id, None)
+            terminal = tgt.status in {"done", "dead", "skipped"}
+            if terminal:
+                await finalize_live_sample(
+                    session,
+                    tgt,
+                    result,
+                    target_usage_snapshot(target_id),
+                )
             await session.commit()
+            if terminal:
+                pop_target_usage(target_id)
+                await recompute_active_prompt_experiment(session)
             await self._reconcile_pending_signal_deepening(
                 task_id,
                 target_id,
