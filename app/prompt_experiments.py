@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import logging
 import re
 import secrets
 from typing import Any, Sequence
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.prompt_releases import (
     COMPILED_STABLE_RELEASE_ID,
+    PROMPT_RELEASES,
     get_prompt_release,
     require_promotable_release,
     resolve_prompt_release,
@@ -38,6 +40,7 @@ _MANUAL_ALIASES = frozenset({
 _HOLDBACK_DURATION = timedelta(hours=48)
 _HOLDBACK_PERCENT = 10.0
 _ROUTE_REASON_RE = re.compile(r"(?:^|\s|·)route:([^/\s]+)")
+logger = logging.getLogger("autohunter.prompt_experiments")
 
 
 @dataclass(frozen=True)
@@ -862,6 +865,61 @@ class PromptExperimentService:
         return experiment
 
 
+async def recompute_active_prompt_experiment(session: AsyncSession) -> None:
+    """Recompute experiment gates without affecting a committed business action."""
+    try:
+        await PromptExperimentService().recompute(session)
+    except Exception:
+        logger.exception("failed to recompute active prompt experiment")
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("failed to roll back prompt experiment hook transaction")
+
+
+async def recover_prompt_experiments(session: AsyncSession) -> None:
+    """Repair active experiments whose immutable releases are absent at startup."""
+    experiment = await session.scalar(
+        select(PromptExperiment)
+        .where(PromptExperiment.status.in_(("offline", "live", "promoted")))
+        .order_by(PromptExperiment.created_at.desc())
+        .limit(1)
+    )
+    if experiment is None or experiment.candidate_release_id in PROMPT_RELEASES:
+        return
+
+    missing_release_id = experiment.candidate_release_id
+    if experiment.status in {"offline", "live"}:
+        experiment.status = "failed"
+        experiment.failure_reason = (
+            f"启动恢复失败：Candidate Release 不存在：{missing_release_id}"
+        )
+        logger.error(experiment.failure_reason)
+        await session.commit()
+        return
+
+    fallback_release_id = experiment.previous_stable_id
+    if fallback_release_id not in PROMPT_RELEASES:
+        fallback_release_id = COMPILED_STABLE_RELEASE_ID
+    settings = await session.get(SystemSettings, "global")
+    if settings is None:
+        settings = SystemSettings(id="global", defaults={})
+        session.add(settings)
+    defaults = dict(settings.defaults or {})
+    defaults["worker_prompt_channel"] = "stable"
+    defaults["stable_prompt_release_id"] = fallback_release_id
+    settings.defaults = defaults
+    experiment.status = "rolled_back"
+    experiment.rollback_reason = (
+        f"启动恢复：已晋升 Release 不存在：{missing_release_id}；"
+        f"Stable 已回退到 {fallback_release_id}"
+    )
+    experiment.rolled_back_at = _utc_naive()
+    logger.error(experiment.rollback_reason)
+    await session.commit()
+    await refresh_cache(session)
+
+
 __all__ = [
     "PromptAssignment",
     "GateDecision",
@@ -875,4 +933,6 @@ __all__ = [
     "evaluate_offline_gate",
     "finalize_live_sample",
     "has_consecutive_passing_windows",
+    "recompute_active_prompt_experiment",
+    "recover_prompt_experiments",
 ]

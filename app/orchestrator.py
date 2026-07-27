@@ -82,7 +82,11 @@ from app.missed_signals import (
     upsert_signal,
 )
 from app.queue_targets import queue_dispatch_order
-from app.prompt_experiments import assignment_for_target, finalize_live_sample
+from app.prompt_experiments import (
+    assignment_for_target,
+    finalize_live_sample,
+    recompute_active_prompt_experiment,
+)
 from app.raw_evidence import import_capture
 from app.tools.src_toolkit import SRC_TOOL_NAMES
 from app.gateway_hunt import service as gateway_service
@@ -3506,6 +3510,7 @@ class TaskRunner:
             await session.commit()
             if terminal:
                 pop_target_usage(target_id)
+                await recompute_active_prompt_experiment(session)
             await self._reconcile_pending_signal_deepening(
                 task_id,
                 target_id,
