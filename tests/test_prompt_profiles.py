@@ -7,7 +7,11 @@ from app.agents.prompt_profiles import (
     normalize_prompt_version,
     trim_policy_text,
 )
-from app.agents.prompts import reviewer_system_prompt, worker_system_prompt
+from app.agents.prompts import (
+    escalate_system_prompt,
+    reviewer_system_prompt,
+    worker_system_prompt,
+)
 from app.config import WorkerConfig
 
 
@@ -44,6 +48,24 @@ def test_reviewer_policy_trims_custom_rules_before_composition() -> None:
 
 def test_worker_runtime_default_uses_current_profile() -> None:
     assert WorkerConfig().prompt_version == "current"
+
+
+def test_all_education_worker_profiles_keep_evidence_led_handoff_guard() -> None:
+    for version in ("current", "modern", "legacy"):
+        prompt = worker_system_prompt("edusrc", version)
+
+        assert "经验先验 / 高产方向" in prompt
+        assert "连续 2~3 轮原地打转" in prompt
+        assert "finish.deepen_lead" in prompt
+
+
+def test_escalation_and_reviewer_prompts_do_not_anchor_on_fixed_examples() -> None:
+    escalation = escalate_system_prompt("edusrc")
+    reviewer = reviewer_system_prompt("edusrc")
+
+    assert "不是唯一路线" in escalation
+    assert "不是系统名黑名单" in reviewer
+    assert "同一把尺子" in reviewer
 
 
 def test_write_actions_require_independent_readback_evidence() -> None:
